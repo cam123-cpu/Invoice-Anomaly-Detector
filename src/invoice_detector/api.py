@@ -222,13 +222,12 @@ def create_app(settings: Settings | None = None, db: Database | None = None) -> 
     @app.post("/invoices/bulk")
     def add_invoices(invoices: list[InvoiceIn],
                      user: dict = Depends(require("admin", "accountant"))) -> dict:
-        """Load up to 1,000 invoices per call (for ERP exports). Existing ids are skipped."""
+        """Load up to 1,000 invoices per call (for ERP exports). Ids already stored, or repeated
+        within the request, are skipped and listed."""
         if len(invoices) > MAX_BULK:
             raise HTTPException(413, f"At most {MAX_BULK} invoices per request")
         rows = [{"id": i.id, "vendor": i.vendor, "amount": i.amount, "date": i.date.isoformat(),
                  "bank_account": i.bank_account} for i in invoices]
-        if len({r["id"] for r in rows}) != len(rows):
-            raise HTTPException(422, "The same invoice id appears twice in this request")
         skipped = db.add_invoices(user["org"], rows, user["sub"])
         added = len(rows) - len(skipped)
         db.audit(user["org"], user["sub"], "invoices_imported", f"{added} added, {len(skipped)} skipped")
