@@ -11,6 +11,7 @@
   python -m invoice_detector.cli detect COMPANY                 # run detection, print the review queue
   python -m invoice_detector.cli evaluate                       # score the detector on synthetic data
   python -m invoice_detector.cli gen-keys                       # print fresh secrets (for a secrets manager)
+  python -m invoice_detector.cli init-deploy DIR                # secret files for docker-compose.prod.yml
 """
 import base64
 import getpass
@@ -22,7 +23,7 @@ from dataclasses import replace
 from datetime import date
 
 from .config import Settings
-from .db import ROLES, Conflict, Database
+from .db import ROLES, Conflict, Database, KeyMismatch
 from .demo import generate_demo
 from .detection import DEFAULT_CONFIG, detect, learned_weights, review_queue
 from .evaluate import evaluate, format_report
@@ -30,10 +31,13 @@ from .importer import FileProblem, convert, preview, read_table
 
 
 @contextmanager
-def _db():
-    """The CLI is an operator tool, so it uses the owner connection when one is set."""
+def _db(check_keys: bool = True):
+    """The CLI is an operator tool, so it uses the owner connection when one is set.
+    It refuses to work with encryption keys that don't match the database."""
     db = Database.from_settings(Settings.from_env(), admin=True)
     try:
+        if check_keys:
+            db.check_keys()
         yield db
     finally:
         db.close()
@@ -46,6 +50,40 @@ def _fresh_secrets() -> str:
     return (f"SECRET_KEY={secrets.token_urlsafe(48)}\n"
             f"ENCRYPTION_KEYS=1:{key()}\n"
             f"INDEX_KEY={key()}\n")
+
+
+def _init_deploy(folder: str) -> int:
+    """One file per secret, as Docker secrets expect, with matching database passwords."""
+    def key() -> str:
+        return base64.b64encode(secrets.token_bytes(32)).decode()
+    owner, app_pw = secrets.token_urlsafe(24), secrets.token_urlsafe(24)
+    files = {
+        "secret_key": secrets.token_urlsafe(48),
+        "encryption_keys": f"1:{key()}",
+        "index_key": key(),
+        "postgres_password": owner,
+        "app_db_password": app_pw,
+        "database_url": f"postgresql://invoice_app:{app_pw}@db:5432/invoices",
+        "database_admin_url": f"postgresql://postgres:{owner}@db:5432/invoices",
+    }
+    existing = [n for n in files if os.path.exists(os.path.join(folder, n))]
+    if existing:
+        print(f"{folder} already has secrets ({', '.join(existing)}); leaving them alone. "
+              "Replacing encryption keys would make stored bank details unreadable.")
+        return 1
+    os.makedirs(folder, exist_ok=True)
+    for name, value in files.items():
+        path = os.path.join(folder, name)
+        with open(path, "w", encoding="utf-8", newline="\n") as f:
+            f.write(value + "\n")
+        try:
+            os.chmod(path, 0o600)
+        except OSError:
+            pass
+    print(f"Wrote {len(files)} secret files to {folder}.")
+    print("Back up this folder now (a password manager or an offline copy). Without encryption_keys "
+          "and index_key, the bank details in your database and backups can never be read again.")
+    return 0
 
 
 def _init() -> int:
@@ -160,13 +198,16 @@ def main(argv: list[str]) -> int:
     cmd, args = (argv[0], argv[1:]) if argv else ("", [])
     if cmd == "init" and not args:
         return _init()
+    if cmd == "init-deploy" and len(args) == 1:
+        return _init_deploy(args[0])
     if cmd == "gen-keys" and not args:
         print(_fresh_secrets(), end="")
     elif cmd == "evaluate" and not args:
         print(format_report(evaluate()))
     elif cmd == "migrate" and not args:
-        with _db() as db:
+        with _db(check_keys=False) as db:
             db.migrate()
+            db.check_keys()
         print("Database is up to date." if db.is_postgres
               else "Nothing to do: SQLite tables are created automatically.")
     elif cmd == "create-org" and len(args) == 1:
@@ -204,5 +245,14 @@ def main(argv: list[str]) -> int:
     return 0
 
 
+def run(argv: list[str]) -> int:
+    """main(), with configuration problems shown as one clear line instead of a traceback."""
+    try:
+        return main(argv)
+    except (RuntimeError, KeyMismatch) as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 2
+
+
 if __name__ == "__main__":
-    sys.exit(main(sys.argv[1:]))
+    sys.exit(run(sys.argv[1:]))

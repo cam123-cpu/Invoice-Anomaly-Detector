@@ -254,13 +254,38 @@ into another company, and refuses to let the role switch the protection off.
 | `DATABASE_ADMIN_URL` (owner) | An operator's machine or deploy job only | Migrate, create companies, bypass row-level security |
 | `SECRET_KEY`, `ENCRYPTION_KEYS`, `INDEX_KEY` | A secrets manager | Sign logins and decrypt bank accounts. Losing them makes bank data unreadable |
 
-### 7. Production checklist
+### 7. Putting it on a server
 
-- Serve over HTTPS behind a reverse proxy, and start uvicorn with `--proxy-headers`.
-- Keep all secrets in a secrets manager, not a `.env` file on disk.
-- Back up the database and, separately, the encryption keys.
-- Run one web server, or move the login rate limiter to Redis before running several.
-- Add single sign-on and multi-factor authentication before giving it to a finance team.
+[DEPLOYMENT.md](DEPLOYMENT.md) is the full guide. In short, on a Linux server with Docker and
+a domain name pointing at it:
+
+```bash
+python3 -m invoice_detector.cli init-deploy deploy/secrets   # then back this folder up!
+DOMAIN=invoices.yourcompany.com docker compose -f docker-compose.prod.yml up -d --build
+```
+
+That gives you HTTPS with an automatic certificate, PostgreSQL with row-level security,
+secrets read from files instead of `.env`, and a database backup every night. It runs one web
+server; to run several, the sign-in rate limiter would need to move to a shared store such as
+Redis first.
+
+### 8. Sign-in for a finance team
+
+Try these on your own computer first; they work the same once hosted.
+
+1. **Two-factor:** open **Your account → Turn on two-factor**, scan the QR code with an
+   authenticator app (Microsoft Authenticator, Google Authenticator, 1Password…), type the
+   6-digit code, and **save the recovery codes** it shows you. Sign out and back in: after your
+   password it asks for a code.
+2. **Require it for everyone:** **Settings → Everyone must use two-factor authentication**.
+   (You have to have it on yourself first, so you can't lock yourself out.)
+3. **Password reset by email:** for a test, add `MAIL_DIR=outbox` to `.env` and restart. Add a
+   person whose username is an email address, click *Forgot your password?* on the sign-in
+   page, and the email appears as a `.eml` file in `outbox/`. In production you set `SMTP_*`
+   instead.
+4. **Microsoft or Google sign-in:** needs an app registration with Microsoft or Google and a
+   public `https://` address, so it is set up when hosting; see
+   [DEPLOYMENT.md](DEPLOYMENT.md#single-sign-on-with-microsoft-entra-id--office-365).
 
 ---
 
@@ -308,6 +333,10 @@ for item in api.get("/review-queue").json():
 | "Your session expired" | Sign-ins last one hour. Sign in again |
 | "Too many attempts" on sign-in | Five wrong passwords. Wait 15 minutes or restart the app |
 | Forgot a password | `python -m invoice_detector.cli reset-password alice` (nothing shows while you type the new one) |
+| `The encryption keys don't match this database` | The `.env` (or secrets) were replaced. Put back the keys the database was created with, or for a throwaway test database delete `invoices.db` |
+| Lost the phone with the authenticator app | Sign in with a recovery code, or ask an admin: Settings → *Turn off two-factor* for you |
+| Two-factor code always "not right" | The phone's clock is off. Turn on automatic date and time on the phone |
+| *Forgot your password?* sends nothing | Email isn't set up (`SMTP_*` or `MAIL_DIR`), or the username isn't an email address. An admin can reset it in Settings |
 | "Username ... is already taken" | That login already exists. Sign in with it, or reset its password as above |
 | An upload says ".xls isn't supported" | In Excel, use File > Save As and choose .xlsx or .csv |
 | A package fails to build during install | Use Python 3.11 to 3.13. The newest Python release may not have builds for every library yet |

@@ -1,0 +1,7 @@
+# Caddy gets and renews an HTTPS certificate automatically (Let's Encrypt) for DOMAIN, and
+# redirects plain HTTP to HTTPS. With DOMAIN=localhost it uses its own local certificate.
+{$DOMAIN} {
+	encode zstd gzip
+	reverse_proxy app:8000
+	header -Server
+}

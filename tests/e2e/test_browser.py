@@ -25,7 +25,11 @@ SHOTS = os.environ.get("E2E_SCREENSHOTS", "e2e-shots")
 USERS = {"alice": ("Acme Inc", "admin", "alice-password-123"),
          "audrey": ("Acme Inc", "auditor", "audrey-password-123"),
          "bob": ("Globex", "admin", "bob-password-12345"),
-         "carmen": ("Initech", "accountant", "carmen-password-123")}
+         "carmen": ("Initech", "accountant", "carmen-password-123"),
+         "erin@acme.example": ("Acme Inc", "accountant", "erin-password-1234"),
+         "frank@acme.example": ("Acme Inc", "auditor", "frank-password-1234"),
+         "sso.user@acme.example": ("Acme Inc", "auditor", None)}  # single sign-on only
+MAIL_DIR = os.environ.get("E2E_MAIL_DIR")
 XSS_VENDOR = '<img src=x onerror="window.__pwned=1">Evil Vendor'
 
 
@@ -69,7 +73,8 @@ class BrowserTest(unittest.TestCase):
     def setUpClass(cls):
         os.makedirs(SHOTS, exist_ok=True)
         cls.tmp = tempfile.TemporaryDirectory()
-        cls.server = None
+        cls.server = cls.idp = None
+        cls.mail_dir = MAIL_DIR
         cls.base = os.environ.get("E2E_BASE_URL")
         if not cls.base:
             cls._start_server()
@@ -77,6 +82,24 @@ class BrowserTest(unittest.TestCase):
 
         cls.pw = sync_playwright().start()
         cls.browser = cls.pw.chromium.launch()
+
+    @classmethod
+    def _start_idp(cls):
+        port = free_port()
+        cls.idp = subprocess.Popen([sys.executable, os.path.join(os.path.dirname(__file__), "fake_idp_server.py"),
+                                    str(port)])
+        cls.idp_url = f"http://127.0.0.1:{port}"
+        cls._wait(cls.idp_url + "/.well-known/openid-configuration")
+
+    @staticmethod
+    def _wait(url):
+        for _ in range(100):
+            try:
+                urllib.request.urlopen(url, timeout=1)
+                return
+            except OSError:
+                time.sleep(0.2)
+        raise RuntimeError(f"{url} did not start")
 
     @classmethod
     def _start_server(cls):
@@ -92,7 +115,7 @@ class BrowserTest(unittest.TestCase):
             db = Database.from_settings(Settings.from_env())
             orgs = {name: db.create_org(name) for name in ("Acme Inc", "Globex", "Initech")}
             for user, (company, role, password) in USERS.items():
-                db.create_user(orgs[company], user, password, role)
+                db.create_user(orgs[company], user, password, role)  # password None: single sign-on only
             rows, _ = generate_demo()
             db.add_invoices(orgs["Acme Inc"], rows, "seed")
             db.close()
@@ -100,32 +123,35 @@ class BrowserTest(unittest.TestCase):
             os.chdir(old)
         port = free_port()
         cls.base = f"http://127.0.0.1:{port}"
+        cls._start_idp()
+        cls.mail_dir = os.path.join(cls.tmp.name, "mail")
+        env = {**os.environ, "PUBLIC_URL": cls.base, "MAIL_DIR": cls.mail_dir, "OIDC_ISSUER": cls.idp_url,
+               "OIDC_CLIENT_ID": "test-client", "OIDC_CLIENT_SECRET": "test-secret", "OIDC_LABEL": "Test IdP",
+               "OIDC_ALLOW_HTTP": "1"}
         cls.server = subprocess.Popen(
             [sys.executable, "-m", "uvicorn", "invoice_detector.api:create_app", "--factory",
-             "--port", str(port), "--log-level", "warning"], cwd=cls.tmp.name)
-        for _ in range(100):
-            try:
-                urllib.request.urlopen(cls.base + "/health", timeout=1)
-                return
-            except OSError:
-                time.sleep(0.2)
-        raise RuntimeError("server did not start")
+             "--port", str(port), "--log-level", "warning"], cwd=cls.tmp.name, env=env)
+        cls._wait(cls.base + "/health")
 
     @classmethod
     def tearDownClass(cls):
         cls.browser.close()
         cls.pw.stop()
-        if cls.server:
-            cls.server.terminate()
-            cls.server.wait(10)
+        for process in (cls.server, cls.idp):
+            if process:
+                process.terminate()
+                process.wait(10)
         cls.tmp.cleanup()
 
     def setUp(self):
         self.context = self.browser.new_context(viewport={"width": 1360, "height": 900}, device_scale_factor=1)
         self.page = self.context.new_page()
         self.errors = []
-        # The browser logs every non-2xx response; the deliberate wrong-password attempt is expected.
-        self.page.on("console", lambda m: m.type == "error" and "status of 401" not in m.text
+        # The browser logs every non-2xx response as a console error. The tests make deliberate
+        # mistakes (wrong password, wrong code, used link), so 4xx responses are expected;
+        # anything else in the console, such as a JavaScript error, fails the test.
+        self.page.on("console", lambda m: m.type == "error"
+                     and "Failed to load resource: the server responded with a status of 4" not in m.text
                      and self.errors.append(m.text))
         self.page.on("pageerror", lambda e: self.errors.append(str(e)))
         self.page.on("dialog", lambda d: (self.errors.append("dialog: " + d.message), d.dismiss()))
@@ -359,6 +385,97 @@ class BrowserTest(unittest.TestCase):
         self.assertEqual(p.inner_text(".kpi:has-text('Invoices added') .value"), "260")
         p.click("a:text('Open review queue')")
         p.wait_for_selector("td.mono:text('RE-2026-0251')")
+        self.assertEqual(self.errors, [])
+
+    def test_two_factor_set_up_and_sign_in(self):
+        from invoice_detector import totp
+        p = self.page
+        self.login("erin@acme.example")
+        p.click("nav a[href='#/security']")
+        p.click("button:text('Set up two-factor')")
+        p.wait_for_selector("img.qr")
+        self.assertTrue(p.get_attribute("img.qr", "src").startswith("data:image/svg+xml;base64,"))
+        secret = p.inner_text("#tf-secret").replace(" ", "")
+        self.shot("12-two-factor-setup")
+        p.fill("#tf-confirm", "000000")
+        p.click("button:text('Turn on')")
+        p.wait_for_selector("text=That code isn't right")
+        p.fill("#tf-confirm", totp.code_at(secret, totp.current_step()))
+        p.click("button:text('Turn on')")
+        p.wait_for_selector("text=Save your recovery codes")
+        codes = p.locator("ol.codes li").all_inner_texts()
+        self.assertEqual(len(codes), 10)
+        with p.expect_download() as dl:
+            p.click("button:text('Download as a text file')")
+        with open(dl.value.path(), encoding="utf-8") as f:
+            self.assertIn(codes[0], f.read())
+        self.shot("13-recovery-codes")
+        p.click("button:text(\"I've saved them\")")
+        p.wait_for_selector("text=recovery codes left")
+
+        p.click("text=Sign out")
+        p.wait_for_selector("text=Sign in to your company")
+        p.fill("#username", "erin@acme.example")
+        p.fill("#password", USERS["erin@acme.example"][2])
+        p.click("button[type=submit]")
+        p.wait_for_selector("#code")
+        p.fill("#code", "000000")
+        p.click("button:text('Verify')")
+        p.wait_for_selector("text=That code isn't right")
+        p.fill("#code", codes[0])  # a recovery code also works, once
+        p.click("button:text('Verify')")
+        p.wait_for_selector("h1:text('Dashboard')")
+        self.assertEqual(self.errors, [])
+
+    def test_single_sign_on(self):
+        p = self.page
+        p.goto(self.base + "/")
+        p.wait_for_selector("a:text('Sign in with Test IdP')")
+        self.shot("14-sign-in-with-sso")
+        p.click("a:text('Sign in with Test IdP')")
+        p.wait_for_selector("#idp-email")  # now on the identity provider's own page
+        p.fill("#idp-email", "nobody@acme.example")
+        p.click("button:text('Continue')")
+        p.wait_for_selector("text=There's no account for nobody@acme.example")
+        p.click("a:text('Sign in with Test IdP')")
+        p.fill("#idp-email", "SSO.User@acme.example")
+        p.click("button:text('Continue')")
+        p.wait_for_selector("h1:text('Dashboard')")
+        self.assertIn("sso.user@acme.example", p.inner_text(".who"))
+        self.assertNotIn("token=", p.url)  # the session token isn't left in the address bar
+        self.assertEqual(self.errors, [])
+
+    def test_password_reset_by_email(self):
+        import email
+        import glob
+        p = self.page
+        p.goto(self.base + "/")
+        p.click("text=Forgot your password?")
+        p.wait_for_selector("text=Enter the email address you sign in with.")
+        p.fill("#username", "frank@acme.example")
+        p.click("button:text('Email me a reset link')")
+        p.wait_for_selector("text=we've sent a link")
+        files = glob.glob(os.path.join(self.mail_dir, "*frank*.eml"))
+        self.assertEqual(len(files), 1)
+        with open(files[0], "rb") as f:
+            body = email.message_from_bytes(f.read()).get_payload(decode=True).decode()
+        link = next(line for line in body.splitlines() if "#/reset?token=" in line)
+        p.goto(link.strip())
+        p.fill("#new-password", "frank-new-password-1")
+        p.fill("#new-password-again", "frank-new-password-1")
+        p.click("button:text('Set new password')")
+        p.wait_for_selector("text=Your password has been changed")
+        p.goto(link.strip())  # the link only works once
+        p.fill("#new-password", "frank-third-password")
+        p.fill("#new-password-again", "frank-third-password")
+        p.click("button:text('Set new password')")
+        p.wait_for_selector("text=already used")
+        p.goto(self.base + "/#/login")
+        p.wait_for_selector("text=Sign in to your company")
+        p.fill("#username", "frank@acme.example")
+        p.fill("#password", "frank-new-password-1")
+        p.click("button[type=submit]")
+        p.wait_for_selector("h1:text('Dashboard')")
         self.assertEqual(self.errors, [])
 
     def test_security_headers(self):

@@ -83,15 +83,45 @@ on every push. SQLite, used for local runs, has the first two layers and the las
   help if an attacker can run arbitrary SQL as the app role, because the role sets the current
   company itself. Parameterized queries everywhere are the defence against that.
 - Role checks (admin, accountant, auditor) are enforced in the application, not the database.
-- No single sign-on or multi-factor login yet, and the login rate limiter is per server.
+- The sign-in rate limiter lives in each server's memory, so run one web server (or move it to Redis).
+- Microsoft, Google and SMTP setups are tested against stand-ins in CI, not the real services; check them with one real account when you set them up.
 - One database connection per server process. Add a connection pool for real load.
 - Amounts are stored as floating-point numbers, which is fine for detection but not for ledgers.
 
+## Signing in
+
+- **Single sign-on** with Microsoft (Entra ID / Office 365), Google Workspace, or any OpenID
+  Connect provider (Okta, Auth0, Keycloak…). Authorization-code flow with PKCE; ID tokens are
+  verified (signature, issuer, audience, expiry, nonce). Only people an admin has added can
+  sign in, and SSO-only accounts have no password at all.
+- **Two-factor authentication** with any authenticator app (TOTP, RFC 6238), shown as a QR code
+  drawn by the app itself, plus ten single-use recovery codes. Admins can require it for the
+  whole company; codes can't be replayed.
+- **Self-service password reset** by email (30-minute, single-use link; same answer whether or
+  not the account exists), and change-password in *Your account*. Changing a password signs
+  out every other session.
+
+## Hosting
+
+[`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md) covers running it for a company:
+
+- **One server:** `docker-compose.prod.yml` runs HTTPS (Caddy, automatic Let's Encrypt
+  certificates), PostgreSQL with row-level security, the app and nightly backups.
+  `cli init-deploy` creates the secret files. CI starts this whole stack on every push and checks
+  HTTPS, sign-in, and a backup → wipe → restore cycle.
+- **Cloud:** Azure, AWS or Google Cloud with managed PostgreSQL (automatic backups,
+  point-in-time restore) and the cloud's secrets manager.
+- Every secret can come from an environment variable or a file (`NAME_FILE`), so nothing
+  secret lives in `.env`, the image or the compose file. The app refuses to start with keys that
+  don't match the database, and the guide covers backing up the keys separately from the data.
+
 ## Other security features
 
-- **Secrets in environment variables** (`.env` is git-ignored; `.env.example` is the template)
+- **Secrets from a secrets manager or files** (`NAME` or `NAME_FILE`); `.env` only for local use
+- **HTTPS enforced** in production: HTTP redirects to HTTPS, plus HSTS
 - **Passwords hashed** with salted scrypt; constant-time comparison
-- **Rate-limited login**: 5 failures per 15 minutes per IP + username, then a lockout
+- **Rate-limited sign-in**: 5 failures per 15 minutes per IP + username, then a lockout; the
+  same for two-factor codes and reset requests
 - **Parameterized SQL everywhere**; sort columns go through an allow-list
 - **Bank accounts encrypted** with AES-256-GCM (key rotation supported) plus a keyed blind
   index, so detection compares accounts without ever decrypting them
@@ -125,7 +155,8 @@ payment process. The raw API is documented at http://127.0.0.1:8000/docs.
 | Upload invoices | Excel (.xlsx) or CSV; suggested column matching, date-format detection, per-row error report, remembered mappings |
 | Invoices | Search and sort; admins can reveal a bank account (logged) |
 | Activity log | The company's audit trail |
-| Settings | Approval threshold, people and roles |
+| Your account | Two-factor authentication, recovery codes, change password |
+| Settings | Approval threshold, require two-factor, people and roles, reset a person's password or two-factor |
 
 ### Excel in, Excel out
 
@@ -150,8 +181,13 @@ role restrictions, company isolation and a phone-sized screen.
 
 | Endpoint | Who | What |
 |---|---|---|
-| `POST /login` | anyone | Returns a bearer token (rate limited) |
-| `GET /me` | any role | Your username, role and company |
+| `POST /login`, `POST /login/2fa` | anyone | Bearer token, or a second step asking for a two-factor code (rate limited) |
+| `GET /auth/providers`, `GET /auth/{provider}/start` | anyone | Single sign-on (Microsoft, Google, OpenID Connect) |
+| `POST /password/forgot`, `POST /password/reset` | anyone | Email a reset link; set a new password with it |
+| `GET /me`, `POST /me/password` | any role | Your account; change your password |
+| `GET /me/2fa`, `POST /me/2fa/setup` · `enable` · `disable` · `recovery-codes` | any role | Two-factor authentication |
+| `POST /users/{name}/password`, `POST /users/{name}/2fa/reset` | admin | Help someone who is locked out |
+| `GET /health`, `GET /health/ready` | anyone | Up; database reachable (for load balancers) |
 | `POST /import/preview`, `POST /import` | admin, accountant | Read an Excel/CSV file and suggest a column mapping; import it |
 | `POST /invoices`, `POST /invoices/bulk` | admin, accountant | Add one invoice, or up to 1,000 |
 | `GET /summary` | any role | Dashboard numbers |
@@ -166,7 +202,7 @@ role restrictions, company isolation and a phone-sized screen.
 | `POST /review/{id}` | admin, accountant | Confirm or dismiss; optional payment action and note |
 | `GET /metrics` | any role | Measured precision per rule and the weights in use |
 | `GET /anomalies` | any role | Every individual flag |
-| `GET`, `PUT /settings` | any role, admin | The company's approval threshold |
+| `GET`, `PUT /settings` | any role, admin | Approval threshold; require two-factor |
 | `GET`, `POST /users` | admin | List or add users in your own company |
 | `GET /audit` | admin, auditor | The company's audit trail |
 | `POST /explain` | any role | Plain-English summary (uses Claude if a key is set) |
@@ -188,19 +224,26 @@ Excel/CSV parsing, the API and the web app in a real browser. To include the Pos
 ## Layout
 
 ```
-src/invoice_detector/   detection, decisions, evaluate, demo, importer, excel_out, samples, api, cli, db, schema, crypto, security, config, explain
+src/invoice_detector/   detection, decisions, evaluate, demo, importer, excel_out, samples, api, accounts, oidc, totp, qr, mailer, cli, db, schema, crypto, security, config, explain
 src/invoice_detector/web/  the web app (index.html, app.js, app.css)
 tests/                  unit tests (unittest style, run by pytest); tests/e2e is the browser test
 docs/TUTORIAL.md        step-by-step guide
 docs/HOW-IT-WORKS.md    how the code works, in depth
+docs/DEPLOYMENT.md      hosting for a company: HTTPS, PostgreSQL, secrets, backups, SSO, email
+deploy/                 Caddyfile, container start-up script, backup script
+docker-compose.prod.yml production stack
 samples/                sample Excel files (regenerate with scripts/make_samples.py)
 prototypes/             the original Gleam version
-.github/workflows/      CI: lint, tests on Linux, Windows and PostgreSQL, browser test, Docker build, dependency audit
+.github/workflows/      CI: lint, tests on Linux, Windows and PostgreSQL, browser test (incl. SSO, 2FA, reset email), production stack, dependency audit
 ```
 
 ## Docker
+
+Quick local try-out with SQLite:
 
 ```bash
 docker build -t invoice-detector .
 docker run -p 8000:8000 --env-file .env -v invoice-data:/data invoice-detector
 ```
+
+For a real deployment use `docker-compose.prod.yml`; see [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md).

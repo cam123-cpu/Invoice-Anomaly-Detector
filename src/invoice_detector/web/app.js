@@ -22,6 +22,9 @@ const ACTIONS = {
   report_exported: "Downloaded a report", workbook_exported: "Downloaded a checked workbook",
   invoices_imported: "Imported invoices", detection_run: "Ran detection", invoice_reviewed: "Reviewed an invoice",
   bank_account_viewed: "Viewed a bank account", user_created: "Added a user", settings_changed: "Changed settings",
+  two_factor_enabled: "Turned on two-factor", two_factor_disabled: "Turned off two-factor",
+  recovery_codes_replaced: "Made new recovery codes", password_changed: "Changed password",
+  password_reset: "Reset a password", password_reset_requested: "Asked for a reset link",
 };
 const CAN_EDIT = ["admin", "accountant"];
 const DECISIONS = {
@@ -96,7 +99,35 @@ function toast(message, isError) {
 }
 
 /* ------------------------------------------------------------ API */
-let session = null; // { token, username, role, company }
+let session = null; // { token, username, role, company, needs2fa }
+// Requests where a 401 means "wrong password or code", not "session expired".
+const AUTH_PATHS = ["/login", "/password/", "/me/password", "/me/2fa/disable", "/me/2fa/recovery-codes"];
+
+function saveSession() { store.set("session", JSON.stringify(session)); }
+
+/* Finish signing in with an access token: load the profile and remember the session. */
+async function startSession(token) {
+  session = { token };
+  const me = await api("GET", "/me");
+  session = { token, username: me.username, role: me.role, company: me.company,
+    needs2fa: me.two_factor_required && !me.signed_in_with_two_factor };
+  saveSession();
+  await refreshCount();
+  go(session.needs2fa ? "#/security" : "#/dashboard");
+}
+
+/* Go to a page. Changing the address fires "hashchange", which redraws; only redraw here
+ * when the address is already right. (Doing both would redraw twice, and the second
+ * redraw would wipe anything typed in between.) */
+function go(hash) {
+  if (location.hash === hash) render();
+  else location.hash = hash;
+}
+
+function hashParams() {
+  const q = location.hash.split("?")[1] || "";
+  return new URLSearchParams(q);
+}
 
 class ApiError extends Error {
   constructor(status, message) { super(message); this.status = status; }
@@ -114,9 +145,15 @@ async function api(method, path, body) {
   }
   let data = null;
   try { data = await res.json(); } catch { /* empty body */ }
-  if (res.status === 401 && session && path !== "/login") {
+  if (res.status === 401 && session && !AUTH_PATHS.some((p) => path.startsWith(p))) {
     signOut("Your session expired. Please sign in again.");
     throw new ApiError(401, "Signed out");
+  }
+  if (res.status === 403 && res.headers.get("X-Requires-2FA") && session) {
+    session.needs2fa = true;
+    saveSession();
+    if (location.hash !== "#/security") location.hash = "#/security";
+    throw new ApiError(403, "Your company requires two-factor authentication. Set it up to continue.");
   }
   if (!res.ok) {
     let msg = data && data.detail;
@@ -177,8 +214,7 @@ function signOut(message) {
   session = null;
   store.del("session");
   if (message) toast(message, true);
-  location.hash = "#/login";
-  render();
+  go("#/login");
 }
 
 /* ------------------------------------------------------------ shell */
@@ -189,6 +225,7 @@ const PAGES = [
   { id: "invoices", label: "Invoices", view: invoicesView },
   { id: "audit", label: "Activity log", view: auditView, roles: ["admin", "auditor"] },
   { id: "settings", label: "Settings", view: settingsView },
+  { id: "security", label: "Your account", view: securityView },
 ];
 let openCount = null;
 
@@ -231,9 +268,11 @@ async function render() {
   const root = $("#app");
   const route = (location.hash.replace(/^#\/?/, "") || "dashboard").split("?")[0];
   if (!session) {
-    put(root, loginView());
+    document.title = "Sign in · Invoice Review";
+    put(root, route === "forgot" ? forgotView() : route === "reset" ? resetView() : loginView());
     return;
   }
+  if (session.needs2fa && route !== "security") { location.hash = "#/security"; return; }
   const page = PAGES.find((p) => p.id === route && (!p.roles || p.roles.includes(session.role)));
   if (!page) { location.hash = "#/dashboard"; return; }
   const holder = h("div", {}, loading());
@@ -255,42 +294,260 @@ async function refreshCount() {
 }
 
 /* ------------------------------------------------------------ login */
+function authCard(subtitle, ...content) {
+  return h("div", { class: "login-wrap" },
+    h("div", { class: "card login" },
+      h("div", { class: "brand" }, h("div", { class: "logo", "aria-hidden": "true" }, "IR"),
+        h("div", {}, h("div", { class: "brand-name" }, "Invoice Review"),
+          h("div", { class: "brand-org" }, subtitle))),
+      content));
+}
+
 function loginView() {
-  document.title = "Sign in · Invoice Review";
   const err = h("div", { class: "error-box hidden", role: "alert" });
+  const fromSso = hashParams().get("error");
+  if (fromSso) { err.textContent = fromSso; err.classList.remove("hidden"); }
   const user = h("input", { id: "username", name: "username", autocomplete: "username", required: true, autofocus: true });
   const pass = h("input", { id: "password", name: "password", type: "password", autocomplete: "current-password", required: true });
   const submit = h("button", { class: "btn primary", type: "submit" }, "Sign in");
+  const ssoBox = h("div", { class: "sso" });
+  const body = h("div", { class: "form" });
+
+  function fail(ex) {
+    err.textContent = ex.message;
+    err.classList.remove("hidden");
+  }
+
+  function codeStep(mfaToken) {
+    // Second step: a code from the authenticator app, or a recovery code.
+    const code = h("input", { id: "code", name: "code", autocomplete: "one-time-code", inputmode: "text",
+      required: true, autofocus: true, maxlength: "40", placeholder: "123 456" });
+    const go = h("button", { class: "btn primary", type: "submit" }, "Verify");
+    err.classList.add("hidden");
+    put(body, h("form", { class: "form", onsubmit: async (e) => {
+      e.preventDefault();
+      go.disabled = true;
+      err.classList.add("hidden");
+      try {
+        const r = await api("POST", "/login/2fa", { mfa_token: mfaToken, code: code.value.trim() });
+        if (r.recovery_codes_left !== undefined && r.recovery_codes_left < 3) {
+          toast(`Only ${r.recovery_codes_left} recovery codes left. Make new ones under Your account.`, true);
+        }
+        await startSession(r.access_token);
+      } catch (ex) {
+        fail(ex);
+        go.disabled = false;
+        if (/timed out/i.test(ex.message)) setTimeout(() => render(), 2500);
+      }
+    } },
+      h("p", {}, "Enter the 6-digit code from your authenticator app."),
+      h("label", { class: "field", for: "code" }, "Code", code),
+      h("p", { class: "muted small" }, "Lost your phone? Enter one of your recovery codes instead."),
+      err, go,
+      h("button", { class: "btn link small", type: "button", onclick: () => render() }, "Back")));
+    code.focus();
+  }
+
   const form = h("form", { class: "form", onsubmit: async (e) => {
     e.preventDefault();
     submit.disabled = true;
     err.classList.add("hidden");
     try {
-      const tok = await api("POST", "/login", { username: user.value.trim(), password: pass.value });
-      session = { token: tok.access_token };
-      const me = await api("GET", "/me");
-      session = { token: tok.access_token, username: me.username, role: me.role, company: me.company };
-      store.set("session", JSON.stringify(session));
-      await refreshCount();
-      if (!location.hash || location.hash === "#/login") location.hash = "#/dashboard";
-      else render();
+      const r = await api("POST", "/login", { username: user.value.trim(), password: pass.value });
+      if (r.mfa_required) { codeStep(r.mfa_token); return; }
+      await startSession(r.access_token);
     } catch (ex) {
       session = null;
-      err.textContent = ex.status === 401 ? "Wrong username or password." : ex.message;
-      err.classList.remove("hidden");
+      fail(ex);
       submit.disabled = false;
     }
   } },
-    h("label", { class: "field", for: "username" }, "Username", user),
+    h("label", { class: "field", for: "username" }, "Username or email", user),
     h("label", { class: "field", for: "password" }, "Password", pass),
-    err, submit);
-  return h("div", { class: "login-wrap" },
-    h("div", { class: "card login" },
-      h("div", { class: "brand" }, h("div", { class: "logo", "aria-hidden": "true" }, "IR"),
-        h("div", {}, h("div", { class: "brand-name" }, "Invoice Review"),
-          h("div", { class: "brand-org" }, "Sign in to your company"))),
-      form,
-      h("p", { class: "muted small" }, "Flags are signals for review, not proof of fraud.")));
+    err, submit,
+    h("a", { class: "small", href: "#/forgot" }, "Forgot your password?"));
+  put(body, ssoBox, form);
+
+  api("GET", "/auth/providers").then((providers) => {
+    if (!providers.length) return;
+    put(ssoBox, providers.map((p) => h("a", { class: "btn sso-btn", href: `/auth/${encodeURIComponent(p.name)}/start` },
+      `Sign in with ${p.label}`)), h("div", { class: "divider" }, h("span", {}, "or")));
+  }).catch(() => { /* sign-in still works without the buttons */ });
+
+  return authCard("Sign in to your company", body,
+    h("p", { class: "muted small" }, "Flags are signals for review, not proof of fraud."));
+}
+
+function forgotView() {
+  const user = h("input", { id: "username", autocomplete: "username", required: true, autofocus: true, placeholder: "you@company.com" });
+  const err = h("div", { class: "error-box hidden", role: "alert" });
+  const box = h("div", { class: "form" });
+  const go = h("button", { class: "btn primary", type: "submit" }, "Email me a reset link");
+  put(box, h("form", { class: "form", onsubmit: async (e) => {
+    e.preventDefault();
+    go.disabled = true;
+    try {
+      const r = await api("POST", "/password/forgot", { username: user.value.trim() });
+      put(box, r.email_enabled
+        ? h("div", { class: "note", role: "status" }, "If that account exists and its username is an email address, we've sent a link to it. The link works for 30 minutes.")
+        : h("div", { class: "note", role: "status" }, "Password reset by email isn't set up on this server. Ask your company's admin to give you a temporary password."),
+        h("a", { href: "#/login" }, "Back to sign in"));
+    } catch (ex) { err.textContent = ex.message; err.classList.remove("hidden"); go.disabled = false; }
+  } },
+    h("p", {}, "Enter the email address you sign in with."),
+    h("label", { class: "field", for: "username" }, "Email", user), err, go,
+    h("a", { class: "small", href: "#/login" }, "Back to sign in")));
+  return authCard("Reset your password", box);
+}
+
+function resetView() {
+  const token = hashParams().get("token") || "";
+  const pw = h("input", { id: "new-password", type: "password", autocomplete: "new-password", required: true, minlength: "12", autofocus: true });
+  const again = h("input", { id: "new-password-again", type: "password", autocomplete: "new-password", required: true });
+  const err = h("div", { class: "error-box hidden", role: "alert" });
+  const box = h("div", { class: "form" });
+  const go = h("button", { class: "btn primary", type: "submit" }, "Set new password");
+  put(box, h("form", { class: "form", onsubmit: async (e) => {
+    e.preventDefault();
+    err.classList.add("hidden");
+    if (pw.value !== again.value) { err.textContent = "The two passwords don't match."; err.classList.remove("hidden"); return; }
+    go.disabled = true;
+    try {
+      await api("POST", "/password/reset", { token, new_password: pw.value });
+      history.replaceState(null, "", "#/login");
+      put(box, h("div", { class: "note", role: "status" }, "Your password has been changed, and any other sessions were signed out."),
+        h("a", { class: "btn primary", href: "#/login" }, "Sign in"));
+    } catch (ex) { err.textContent = ex.message; err.classList.remove("hidden"); go.disabled = false; }
+  } },
+    h("label", { class: "field", for: "new-password" }, "New password (12+ characters)", pw),
+    h("label", { class: "field", for: "new-password-again" }, "Type it again", again), err, go));
+  return authCard("Choose a new password", box);
+}
+
+/* ------------------------------------------------------------ your account */
+function downloadText(name, text) {
+  const url = URL.createObjectURL(new Blob([text], { type: "text/plain" }));
+  const a = h("a", { href: url, download: name, class: "hidden" });
+  document.body.append(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 10000);
+}
+
+function recoveryCodesBox(codes, onDone) {
+  return h("div", { class: "card recovery" },
+    h("h2", {}, "Save your recovery codes"),
+    h("p", {}, "If you lose your phone, each of these codes lets you sign in once. Keep them somewhere safe, such as a password manager. They won't be shown again."),
+    h("ol", { class: "codes mono" }, codes.map((c) => h("li", {}, c))),
+    h("div", { class: "row" },
+      h("button", { class: "btn", onclick: () => downloadText("invoice-review-recovery-codes.txt",
+        `Invoice Review recovery codes for ${session.username}\nEach code works once.\n\n${codes.join("\n")}\n`) }, "Download as a text file"),
+      h("button", { class: "btn primary", onclick: onDone }, "I've saved them")));
+}
+
+async function securityView() {
+  const [me, tf] = await Promise.all([api("GET", "/me"), api("GET", "/me/2fa")]);
+
+  function updateToken(token, needs2fa) {
+    session.token = token;
+    session.needs2fa = needs2fa;
+    saveSession();
+  }
+
+  // ----- two-factor -----
+  const twoFactor = h("div", { class: "card" });
+  function drawTwoFactor(state) {
+    const err = h("div", { class: "error-box hidden", role: "alert" });
+    const show = (ex) => { err.textContent = ex.message; err.classList.remove("hidden"); };
+    if (state.enabled) {
+      const code = h("input", { id: "tf-code", autocomplete: "one-time-code", maxlength: "40", placeholder: "Code from the app" });
+      const password = me.sso_only ? null : h("input", { id: "tf-password", type: "password", autocomplete: "current-password", placeholder: "Your password" });
+      put(twoFactor, h("h2", {}, "Two-factor authentication"),
+        h("p", {}, h("span", { class: "pill d-pay" }, "On"), ` · ${state.recovery_codes_left} recovery code${state.recovery_codes_left === 1 ? "" : "s"} left`),
+        h("p", { class: "muted small" }, "Signing in asks for a code from your authenticator app after your password."),
+        h("div", { class: "form" }, password ? h("label", { class: "field", for: "tf-password" }, "Password", password) : null,
+          h("label", { class: "field", for: "tf-code" }, "Code from your app", code), err,
+          h("div", { class: "row" },
+            h("button", { class: "btn", onclick: async () => {
+              try {
+                const r = await api("POST", "/me/2fa/recovery-codes", { code: code.value.trim() });
+                put(twoFactor, recoveryCodesBox(r.recovery_codes, () => render()));
+              } catch (ex) { show(ex); }
+            } }, "Make new recovery codes"),
+            state.required_by_company ? h("span", { class: "muted small" }, "Your company requires two-factor, so it can't be turned off.")
+              : h("button", { class: "btn danger", onclick: async () => {
+                try {
+                  const r = await api("POST", "/me/2fa/disable", { password: password ? password.value : null, code: code.value.trim() });
+                  updateToken(r.access_token, false);
+                  toast("Two-factor authentication is off");
+                  render();
+                } catch (ex) { show(ex); }
+              } }, "Turn off"))));
+      return;
+    }
+    put(twoFactor, h("h2", {}, "Two-factor authentication"),
+      state.required_by_company ? h("div", { class: "note", role: "note" }, "Your company requires two-factor authentication. Set it up to continue using the app.") : null,
+      h("p", {}, "Protect your account with a code from an authenticator app (Microsoft Authenticator, Google Authenticator, 1Password, Authy and others) as well as your password."),
+      err,
+      h("button", { class: "btn primary", onclick: async () => {
+        try { setupStep(await api("POST", "/me/2fa/setup")); } catch (ex) { show(ex); }
+      } }, "Set up two-factor"));
+  }
+
+  function setupStep(setup) {
+    const err = h("div", { class: "error-box hidden", role: "alert" });
+    const code = h("input", { id: "tf-confirm", autocomplete: "one-time-code", inputmode: "numeric", maxlength: "7", placeholder: "123456", autofocus: true });
+    const qr = h("img", { src: setup.qr, alt: "QR code for your authenticator app", class: "qr", width: "228", height: "228" });
+    put(twoFactor, h("h2", {}, "Set up two-factor authentication"),
+      h("ol", { class: "steps-list" },
+        h("li", {}, "Open your authenticator app and add an account."),
+        h("li", {}, "Scan this QR code. On a phone, or if you can't scan, type the key below instead."),
+        h("li", {}, "Enter the 6-digit code the app shows.")),
+      h("div", { class: "setup-grid" }, qr,
+        h("div", {}, h("div", { class: "muted small" }, "Key"), h("div", { class: "mono secret", id: "tf-secret" }, setup.secret),
+          h("a", { class: "small", href: setup.uri }, "Open in an authenticator app on this device"))),
+      h("form", { class: "form", onsubmit: async (e) => {
+        e.preventDefault();
+        err.classList.add("hidden");
+        try {
+          const r = await api("POST", "/me/2fa/enable", { code: code.value.trim() });
+          updateToken(r.access_token, false);
+          put(twoFactor, recoveryCodesBox(r.recovery_codes, () => { toast("Two-factor authentication is on"); render(); }));
+        } catch (ex) { err.textContent = ex.message; err.classList.remove("hidden"); }
+      } }, h("label", { class: "field", for: "tf-confirm" }, "Code from the app", code), err,
+        h("div", { class: "row" }, h("button", { class: "btn primary", type: "submit" }, "Turn on"),
+          h("button", { class: "btn", type: "button", onclick: () => drawTwoFactor(tf) }, "Cancel"))));
+  }
+  drawTwoFactor(tf);
+
+  // ----- password -----
+  const passwordCard = h("div", { class: "card" }, h("h2", {}, "Password"));
+  if (me.sso_only) {
+    passwordCard.append(h("p", {}, "You sign in with single sign-on, so there's no password to manage here."));
+  } else {
+    const cur = h("input", { id: "pw-current", type: "password", autocomplete: "current-password", required: true });
+    const nw = h("input", { id: "pw-new", type: "password", autocomplete: "new-password", required: true, minlength: "12" });
+    const again = h("input", { id: "pw-again", type: "password", autocomplete: "new-password", required: true });
+    const err = h("div", { class: "error-box hidden", role: "alert" });
+    passwordCard.append(h("form", { class: "form", onsubmit: async (e) => {
+      e.preventDefault();
+      err.classList.add("hidden");
+      if (nw.value !== again.value) { err.textContent = "The two new passwords don't match."; err.classList.remove("hidden"); return; }
+      try {
+        const r = await api("POST", "/me/password", { current_password: cur.value, new_password: nw.value });
+        updateToken(r.access_token, session.needs2fa);
+        cur.value = nw.value = again.value = "";
+        toast("Password changed. Any other sessions were signed out.");
+      } catch (ex) { err.textContent = ex.message; err.classList.remove("hidden"); }
+    } },
+      h("label", { class: "field", for: "pw-current" }, "Current password", cur),
+      h("label", { class: "field", for: "pw-new" }, "New password (12+ characters)", nw),
+      h("label", { class: "field", for: "pw-again" }, "New password again", again), err,
+      h("div", {}, h("button", { class: "btn primary", type: "submit" }, "Change password"))));
+  }
+
+  return h("div", {}, pageHead("Your account", `${me.username} · ${me.role} · ${me.company}`),
+    h("div", { class: "grid grid-2" }, twoFactor, passwordCard));
 }
 
 /* ------------------------------------------------------------ dashboard */
@@ -759,47 +1016,95 @@ async function auditView() {
 /* ------------------------------------------------------------ settings */
 async function settingsView() {
   const isAdmin = session.role === "admin";
-  const cfg = await api("GET", "/settings");
+  const [cfg, me] = await Promise.all([api("GET", "/settings"), api("GET", "/me")]);
   const threshold = h("input", { id: "threshold", type: "number", min: "1", step: "1", value: cfg.approval_threshold, disabled: !isAdmin });
+  const require2fa = h("input", { id: "require-2fa", type: "checkbox", checked: cfg.require_2fa,
+    disabled: !isAdmin || (!me.two_factor_enabled && !cfg.require_2fa) });
   const company = h("div", { class: "card" }, h("h2", {}, "Company settings"),
     h("form", { class: "form", onsubmit: async (e) => {
       e.preventDefault();
       try {
-        await api("PUT", "/settings", { approval_threshold: Number(threshold.value) });
-        toast("Saved. Run detection to apply it to existing invoices.");
+        await api("PUT", "/settings", { approval_threshold: Number(threshold.value), require_2fa: require2fa.checked });
+        toast("Saved. Run detection to apply a new threshold to existing invoices.");
       } catch (err) { toast(err.message, true); }
     } },
       h("label", { class: "field", for: "threshold" }, "Approval threshold", threshold),
       h("p", { class: "muted small" }, "Invoices at or above this amount need extra sign-off at your company. Used to spot invoices just under the limit and bills split to avoid it."),
-      isAdmin ? h("div", {}, h("button", { class: "btn primary", type: "submit" }, "Save")) : h("p", { class: "muted small" }, "Only admins can change this.")));
+      h("label", { class: "row", for: "require-2fa" }, require2fa, "Require two-factor authentication for everyone"),
+      h("p", { class: "muted small" }, isAdmin && !me.two_factor_enabled && !cfg.require_2fa
+        ? h("span", {}, "Turn on two-factor for your own account first (", h("a", { href: "#/security" }, "Your account"), "), so you can't lock yourself out.")
+        : "People without it are asked to set it up the next time they sign in. Single sign-on users are covered by their provider's own two-factor."),
+      isAdmin ? h("div", {}, h("button", { class: "btn primary", type: "submit" }, "Save")) : h("p", { class: "muted small" }, "Only admins can change these.")));
 
   const you = h("div", { class: "card" }, h("h2", {}, "Your account"),
     h("p", {}, h("strong", {}, session.username), ` · ${session.role} · ${session.company}`),
-    h("p", { class: "muted small" }, roleHelp(session.role)));
+    h("p", { class: "muted small" }, roleHelp(session.role)),
+    h("a", { class: "btn", href: "#/security" }, "Password and two-factor"));
 
   if (!isAdmin) return h("div", {}, pageHead("Settings"), h("div", { class: "grid grid-2" }, company, you));
 
   const users = await api("GET", "/users");
+  function userActions(u) {
+    const cell = h("td", { class: "user-actions" });
+    function menu() {
+      put(cell, h("div", { class: "row" },
+        u.sso_only ? null : h("button", { class: "btn link small", onclick: resetForm }, "Reset password"),
+        u.two_factor && u.username !== session.username ? h("button", { class: "btn link small", onclick: async () => {
+          try {
+            await api("POST", `/users/${encodeURIComponent(u.username)}/2fa/reset`);
+            toast(`Two-factor turned off for ${u.username}. They can set it up again.`);
+            render();
+          } catch (ex) { toast(ex.message, true); }
+        } }, "Turn off two-factor") : null));
+    }
+    function resetForm() {
+      const temp = h("input", { type: "password", minlength: "12", required: true, autocomplete: "new-password",
+        placeholder: "Temporary password", "aria-label": `Temporary password for ${u.username}` });
+      put(cell, h("form", { class: "row", onsubmit: async (e) => {
+        e.preventDefault();
+        try {
+          await api("POST", `/users/${encodeURIComponent(u.username)}/password`, { new_password: temp.value });
+          toast(`Temporary password set for ${u.username}. Their other sessions were signed out.`);
+          menu();
+        } catch (ex) { toast(ex.message, true); }
+      } }, temp, h("button", { class: "btn sm primary", type: "submit" }, "Set"),
+        h("button", { class: "btn sm", type: "button", onclick: menu }, "Cancel")));
+      temp.focus();
+    }
+    menu();
+    return cell;
+  }
+
   const name = h("input", { id: "new-username", autocomplete: "off", required: true, placeholder: "e.g. maria@company.com" });
   const pw = h("input", { id: "new-password", type: "password", autocomplete: "new-password", required: true, minlength: "12" });
+  const pwField = h("label", { class: "field", for: "new-password" }, "Temporary password (12+ characters)", pw);
+  const ssoOnly = h("input", { id: "new-sso-only", type: "checkbox", onchange: () => {
+    pwField.classList.toggle("hidden", ssoOnly.checked);
+    pw.required = !ssoOnly.checked;
+  } });
   const role = h("select", { id: "new-role" }, h("option", { value: "accountant" }, "Accountant"),
     h("option", { value: "auditor" }, "Auditor"), h("option", { value: "admin" }, "Admin"));
   const err = h("div", { class: "error-box hidden", role: "alert" });
   const team = h("div", { class: "card" }, h("h2", {}, "People in your company"),
-    h("div", { class: "table-wrap" }, h("table", {}, h("thead", {}, h("tr", {}, h("th", {}, "Username"), h("th", {}, "Role"))),
-      h("tbody", {}, users.map((u) => h("tr", {}, h("td", {}, u.username), h("td", {}, u.role)))))),
+    h("div", { class: "table-wrap" }, h("table", {},
+      h("thead", {}, h("tr", {}, h("th", {}, "Username"), h("th", {}, "Role"), h("th", {}, "Sign-in"), h("th", {}, ""))),
+      h("tbody", {}, users.map((u) => h("tr", {}, h("td", {}, u.username), h("td", {}, u.role),
+        h("td", {}, u.sso_only ? "Single sign-on" : "Password", " ",
+          u.two_factor ? h("span", { class: "pill d-pay" }, "2FA") : null),
+        userActions(u)))))),
     spacer(16), h("h2", {}, "Add a person"),
     h("form", { class: "form", onsubmit: async (e) => {
       e.preventDefault();
       err.classList.add("hidden");
       try {
-        await api("POST", "/users", { username: name.value.trim(), password: pw.value, role: role.value });
+        await api("POST", "/users", { username: name.value.trim(), password: ssoOnly.checked ? null : pw.value, role: role.value });
         toast(`Added ${name.value.trim()}`);
         render();
       } catch (ex) { err.textContent = ex.message; err.classList.remove("hidden"); }
     } },
-      h("label", { class: "field", for: "new-username" }, "Username", name),
-      h("label", { class: "field", for: "new-password" }, "Temporary password (12+ characters)", pw),
+      h("label", { class: "field", for: "new-username" }, "Email address", name),
+      h("label", { class: "row", for: "new-sso-only" }, ssoOnly, "Signs in with single sign-on only (no password)"),
+      pwField,
       h("label", { class: "field", for: "new-role" }, "Role", role),
       h("p", { class: "muted small" }, roleHelp(null)),
       err, h("div", {}, h("button", { class: "btn primary", type: "submit" }, "Add person"))));
@@ -818,6 +1123,13 @@ function roleHelp(role) {
 /* ------------------------------------------------------------ start */
 window.addEventListener("hashchange", render);
 document.addEventListener("DOMContentLoaded", async () => {
+  if (location.hash.startsWith("#/sso?")) {
+    // Back from single sign-on: the server put a new session token in the address
+    // fragment (never sent to servers or logged). Take it, then remove it from history.
+    const token = hashParams().get("token");
+    history.replaceState(null, "", "#/dashboard");
+    try { await startSession(token); return; } catch { session = null; }
+  }
   try { session = JSON.parse(store.get("session") || "null"); } catch { session = null; }
   if (session) await refreshCount();
   render();

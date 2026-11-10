@@ -11,13 +11,18 @@ _TABLES = """
 CREATE TABLE IF NOT EXISTS orgs (
   id TEXT PRIMARY KEY,
   name TEXT NOT NULL UNIQUE,
-  approval_threshold {REAL} NOT NULL DEFAULT 10000 CHECK (approval_threshold > 0)
+  approval_threshold {REAL} NOT NULL DEFAULT 10000 CHECK (approval_threshold > 0),
+  require_2fa INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS users (
   username TEXT PRIMARY KEY,
   org_id TEXT NOT NULL REFERENCES orgs(id),
   password_hash TEXT NOT NULL,
-  role TEXT NOT NULL CHECK (role IN ('admin', 'accountant', 'auditor'))
+  role TEXT NOT NULL CHECK (role IN ('admin', 'accountant', 'auditor')),
+  totp_secret TEXT,
+  totp_enabled INTEGER NOT NULL DEFAULT 0,
+  totp_last_step INTEGER,
+  recovery_codes TEXT
 );
 CREATE TABLE IF NOT EXISTS invoices (
   org_id TEXT NOT NULL REFERENCES orgs(id),
@@ -51,6 +56,10 @@ CREATE TABLE IF NOT EXISTS reviews (
   PRIMARY KEY (org_id, invoice_id),
   FOREIGN KEY (org_id, invoice_id) REFERENCES invoices(org_id, id)
 );
+CREATE TABLE IF NOT EXISTS meta (
+  key TEXT PRIMARY KEY,
+  value TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS audit_log (
   id {AUTO_ID},
   org_id TEXT NOT NULL REFERENCES orgs(id),
@@ -72,6 +81,11 @@ POSTGRES_TABLES = (_TABLES.replace("{REAL}", "DOUBLE PRECISION")
 ADDED_COLUMNS = [
     ("reviews", "action", "TEXT CHECK (action IN ('pay', 'hold', 'do_not_pay'))"),
     ("reviews", "note", "TEXT"),
+    ("orgs", "require_2fa", "INTEGER NOT NULL DEFAULT 0"),
+    ("users", "totp_secret", "TEXT"),
+    ("users", "totp_enabled", "INTEGER NOT NULL DEFAULT 0"),
+    ("users", "totp_last_step", "INTEGER"),
+    ("users", "recovery_codes", "TEXT"),
 ]
 
 # Idempotent: safe to run on every deploy.
@@ -87,11 +101,14 @@ CREATE OR REPLACE FUNCTION app_org_id() RETURNS text
 LANGUAGE sql STABLE AS $$ SELECT nullif(current_setting('app.org_id', true), '') $$;
 
 -- Login must find a user before the company is known. This one narrow function
--- runs with the owner's rights; nothing else can read across companies.
-CREATE OR REPLACE FUNCTION auth_lookup(p_username text)
-RETURNS TABLE (username text, password_hash text, role text, org_id text)
+-- runs with the owner's rights; nothing else can read across companies. It returns
+-- only what deciding "password OK? second factor needed?" requires.
+DROP FUNCTION IF EXISTS auth_lookup(text);
+CREATE FUNCTION auth_lookup(p_username text)
+RETURNS TABLE (username text, password_hash text, role text, org_id text, totp_enabled integer)
 LANGUAGE sql STABLE SECURITY DEFINER SET search_path = public, pg_temp AS $$
-  SELECT u.username, u.password_hash, u.role, u.org_id FROM users u WHERE u.username = p_username
+  SELECT u.username, u.password_hash, u.role, u.org_id, u.totp_enabled FROM users u
+  WHERE lower(u.username) = lower(p_username) ORDER BY u.username LIMIT 1
 $$;
 REVOKE ALL ON FUNCTION auth_lookup(text) FROM PUBLIC;
 GRANT EXECUTE ON FUNCTION auth_lookup(text) TO invoice_app;
@@ -99,10 +116,12 @@ GRANT EXECUTE ON FUNCTION app_org_id() TO invoice_app;
 
 -- Least privilege: the app cannot create companies, cannot edit or delete invoices,
 -- and cannot change or delete audit records.
-REVOKE ALL ON orgs, users, invoices, anomalies, reviews, audit_log FROM PUBLIC, invoice_app;
+REVOKE ALL ON orgs, users, invoices, anomalies, reviews, audit_log, meta FROM PUBLIC, invoice_app;
 GRANT SELECT ON orgs TO invoice_app;
-GRANT UPDATE (approval_threshold) ON orgs TO invoice_app;
+GRANT UPDATE (approval_threshold, require_2fa) ON orgs TO invoice_app;
 GRANT SELECT, INSERT ON users TO invoice_app;
+GRANT UPDATE (password_hash, totp_secret, totp_enabled, totp_last_step, recovery_codes) ON users TO invoice_app;
+GRANT SELECT, INSERT ON meta TO invoice_app;  -- holds only the encryption-key check
 GRANT SELECT, INSERT ON invoices TO invoice_app;
 GRANT SELECT, INSERT, DELETE ON anomalies TO invoice_app;
 GRANT SELECT, INSERT, UPDATE ON reviews TO invoice_app;

@@ -54,7 +54,8 @@ class DatabaseTests(DbTestCase):
         user = self.app.auth_lookup("alice")
         self.assertNotIn("a-long-password", user["password_hash"])
         self.assertEqual((user["role"], user["org_id"]), ("admin", self.a))
-        self.assertEqual(self.app.list_users(self.a), [{"username": "alice", "role": "admin"}])
+        self.assertEqual(self.app.list_users(self.a),
+                         [{"username": "alice", "role": "admin", "two_factor": False, "sso_only": False}])
 
     def test_reviews_snapshot_rules_and_feed_back(self):
         self.add("A1")
@@ -106,6 +107,56 @@ class DatabaseTests(DbTestCase):
         self.assertTrue(self.admin.set_password("alice", "second-password-2"))
         self.assertTrue(verify_password("second-password-2", self.app.auth_lookup("alice")["password_hash"]))
         self.assertFalse(self.admin.set_password("nobody", "whatever-password"))
+
+    def test_two_factor_fields_and_sso_only_users(self):
+        self.app.create_user(self.a, "alice", "a-long-password", "admin")
+        self.app.create_user(self.a, "sso.user@acme.example", None, "auditor")
+        self.assertEqual(self.app.auth_lookup("sso.user@acme.example")["password_hash"], "!sso")
+        self.assertTrue(self.app.list_users(self.a)[1]["sso_only"])
+        self.app.update_user_security(self.a, "alice", totp_secret="enc", totp_enabled=True,
+                                      totp_last_step=5, recovery_codes=["h1", "h2"])
+        sec = self.app.user_security(self.a, "alice")
+        self.assertEqual((sec["totp_enabled"], sec["totp_last_step"], sec["recovery_codes"]), (True, 5, ["h1", "h2"]))
+        self.assertTrue(self.app.auth_lookup("alice")["totp_enabled"])
+        self.assertIsNone(self.app.user_security(self.b, "alice"))  # other company can't see it
+        with self.assertRaises(ValueError):
+            self.app.update_user_security(self.a, "alice", password_hash="x")  # not allow-listed
+        self.app.update_user_security(self.b, "alice", totp_enabled=False)  # wrong company: no effect
+        self.assertTrue(self.app.user_security(self.a, "alice")["totp_enabled"])
+        self.assertFalse(self.app.set_password("alice", "new-password-123", org_id=self.b))
+        self.assertTrue(self.app.set_password("alice", "new-password-123", org_id=self.a))
+
+    def test_company_settings(self):
+        self.assertFalse(self.app.get_org(self.a)["require_2fa"])
+        self.app.set_org_settings(self.a, require_2fa=True)
+        self.assertTrue(self.app.get_org(self.a)["require_2fa"])
+        self.assertFalse(self.app.get_org(self.b)["require_2fa"])
+
+    def test_key_check(self):
+        import secrets as s
+        from invoice_detector.db import Database, KeyMismatch
+        self.app.check_keys()  # first run records the check value
+        self.app.check_keys()  # later runs pass with the same keys
+        if self.app.is_postgres:
+            return
+        wrong = Database.__new__(Database)
+        wrong.__dict__.update(self.app.__dict__)
+        wrong._keys, wrong._index_key, wrong._vaults = {1: s.token_bytes(32)}, s.token_bytes(32), {}
+        with self.assertRaises(KeyMismatch):
+            wrong.check_keys()
+
+    def test_key_check_on_a_database_without_a_check_value(self):
+        if self.app.is_postgres:
+            self.skipTest("SQLite-specific")
+        import secrets as s
+        from invoice_detector.db import Database, KeyMismatch
+        self.add(bank="ACCT-1")  # encrypted before any check value existed (older version)
+        wrong = Database.__new__(Database)
+        wrong.__dict__.update(self.app.__dict__)
+        wrong._keys, wrong._index_key, wrong._vaults = {1: s.token_bytes(32)}, s.token_bytes(32), {}
+        with self.assertRaises(KeyMismatch):
+            wrong.check_keys()
+        self.app.check_keys()  # the right keys pass and record the check value
 
 
 class UpgradeTests(unittest.TestCase):

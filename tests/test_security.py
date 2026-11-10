@@ -25,7 +25,28 @@ class TokenTests(unittest.TestCase):
 
     def test_roundtrip(self):
         data = self.signer.read(self.signer.make("alice", "admin", "org-a"))
-        self.assertEqual(data, {"sub": "alice", "role": "admin", "org": "org-a"})
+        self.assertEqual(data, {"sub": "alice", "role": "admin", "org": "org-a", "mfa": False, "pwf": None})
+        strong = self.signer.read(self.signer.make("alice", "admin", "org-a", mfa=True, pwf="abc"))
+        self.assertEqual((strong["mfa"], strong["pwf"]), (True, "abc"))
+
+    def test_purposes_are_never_interchangeable(self):
+        reset = self.signer.issue({"sub": "alice"}, "reset", 600)
+        pending = self.signer.issue({"sub": "alice", "role": "admin", "org": "o"}, "mfa", 300)
+        for token in (reset, pending):
+            with self.assertRaises(AuthError):
+                self.signer.read(token)  # can't be used as a sign-in token
+        with self.assertRaises(AuthError):
+            self.signer.verify(reset, "mfa")
+        self.assertEqual(self.signer.verify(reset, "reset")["sub"], "alice")
+        access = self.signer.make("alice", "admin", "o")
+        with self.assertRaises(AuthError):
+            self.signer.verify(access, "reset")
+
+    def test_password_fingerprint(self):
+        from invoice_detector.security import password_fingerprint
+        a, b = hash_password("first-password"), hash_password("first-password")
+        self.assertNotEqual(password_fingerprint(a), password_fingerprint(b))
+        self.assertEqual(len(password_fingerprint(a)), 16)
 
     def test_tampered_token_rejected(self):
         _, sig = self.signer.make("alice", "auditor", "org-a").split(".")

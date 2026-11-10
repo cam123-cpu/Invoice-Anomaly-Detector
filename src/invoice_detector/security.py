@@ -72,19 +72,29 @@ def _b64(data: bytes) -> str:
     return base64.urlsafe_b64encode(data).decode().rstrip("=")
 
 
+def password_fingerprint(password_hash: str) -> str:
+    """A short, non-reversible tag of the stored password hash. Tokens carry it, so changing
+    the password ends every session and makes old reset links useless."""
+    return hashlib.sha256(password_hash.encode()).hexdigest()[:16]
+
+
 class TokenSigner:
+    """Signed, expiring tokens, each with a purpose. An access token, a "second factor
+    pending" token and a password-reset link are all signed with the same key, so the
+    purpose is checked on every read: a reset link can never be used to sign in."""
+
     def __init__(self, secret: str):
         self._key = secret.encode()
 
     def _sign(self, body: str) -> str:
         return _b64(hmac.new(self._key, body.encode(), hashlib.sha256).digest())
 
-    def make(self, user: str, role: str, org: str, ttl: int = 3600, now: float | None = None) -> str:
+    def issue(self, claims: dict, purpose: str, ttl: int, now: float | None = None) -> str:
         now = time.time() if now is None else now
-        body = _b64(json.dumps({"sub": user, "role": role, "org": org, "exp": now + ttl}).encode())
+        body = _b64(json.dumps({**claims, "purpose": purpose, "exp": now + ttl}).encode())
         return f"{body}.{self._sign(body)}"
 
-    def read(self, token: str, now: float | None = None) -> dict:
+    def verify(self, token: str, purpose: str, now: float | None = None) -> dict:
         now = time.time() if now is None else now
         try:
             body, sig = token.split(".")
@@ -93,6 +103,22 @@ class TokenSigner:
             data = json.loads(base64.urlsafe_b64decode(body + "=" * (-len(body) % 4)))
             if data["exp"] < now:
                 raise AuthError("Token expired")
-            return {"sub": data["sub"], "role": data["role"], "org": data["org"]}
-        except (ValueError, KeyError) as exc:
+            if data.get("purpose", "access") != purpose:
+                raise AuthError("Wrong kind of token")
+            return data
+        except (ValueError, KeyError, TypeError, AttributeError) as exc:
+            raise AuthError("Malformed token") from exc
+
+    # ----- access tokens (sent with every API request) -----
+    def make(self, user: str, role: str, org: str, ttl: int = 3600, now: float | None = None,
+             mfa: bool = False, pwf: str | None = None) -> str:
+        return self.issue({"sub": user, "role": role, "org": org, "mfa": mfa, "pwf": pwf},
+                          "access", ttl, now)
+
+    def read(self, token: str, now: float | None = None) -> dict:
+        data = self.verify(token, "access", now)
+        try:
+            return {"sub": data["sub"], "role": data["role"], "org": data["org"],
+                    "mfa": bool(data.get("mfa")), "pwf": data.get("pwf")}
+        except KeyError as exc:
             raise AuthError("Malformed token") from exc

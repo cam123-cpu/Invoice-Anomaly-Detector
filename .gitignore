@@ -17,3 +17,7 @@ venv/
 .ruff_cache/
 build/
 dist/
+
+# Production secrets and backups (docker-compose.prod.yml)
+deploy/secrets/
+backups/
