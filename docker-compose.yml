@@ -1,0 +1,16 @@
+# A local PostgreSQL for trying the production setup. See docs/TUTORIAL.md, part 2.
+# The password here is for local experiments only. Use a managed database and a
+# secrets manager for anything real.
+services:
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_PASSWORD: local-owner-password
+      POSTGRES_DB: invoices
+    ports:
+      - "5432:5432"
+    volumes:
+      - invoice-db:/var/lib/postgresql/data
+
+volumes:
+  invoice-db:
