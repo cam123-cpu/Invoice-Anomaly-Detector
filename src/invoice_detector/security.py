@@ -53,8 +53,20 @@ class RateLimiter:
         if self._locked_until.get(key, 0) > now:
             raise RateLimitError("Too many attempts")
 
+    MAX_KEYS = 50_000  # a bot trying many usernames can't grow memory without bound
+
+    def _prune(self, now: float) -> None:
+        self._locked_until = {k: t for k, t in self._locked_until.items() if t > now}
+        for k in [k for k, q in self._failures.items() if not q or q[-1] < now - self.window]:
+            del self._failures[k]
+        if len(self._failures) > self.MAX_KEYS:  # still too many: forget the oldest
+            for k in sorted(self._failures, key=lambda k: self._failures[k][-1])[:len(self._failures) // 2]:
+                del self._failures[k]
+
     def record_failure(self, key: str, now: float | None = None) -> None:
         now = time.time() if now is None else now
+        if len(self._failures) > self.MAX_KEYS or len(self._locked_until) > self.MAX_KEYS:
+            self._prune(now)
         q = self._failures[key]
         q.append(now)
         while q and q[0] < now - self.window:

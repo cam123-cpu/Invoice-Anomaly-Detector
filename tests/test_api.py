@@ -5,7 +5,7 @@ import unittest
 
 from openpyxl import load_workbook
 
-from support import DbTestCase, make_settings
+from support import DbTestCase, forget_cookies, make_settings
 
 HAVE_API_DEPS = all(importlib.util.find_spec(m) for m in ("fastapi", "httpx"))
 PW_A, PW_B = "alice-password-123", "bob-password-12345"
@@ -18,7 +18,7 @@ class ApiTests(DbTestCase):
         from fastapi.testclient import TestClient
         from invoice_detector.api import create_app
 
-        self.client = TestClient(create_app(make_settings(), db=self.app))
+        self.client = forget_cookies(TestClient(create_app(make_settings(), db=self.app)))
         self.app.create_user(self.a, "alice", PW_A, "admin")
         self.app.create_user(self.a, "audit1", "auditor-password-123", "auditor")
         self.app.create_user(self.b, "bob", PW_B, "admin")
@@ -329,6 +329,90 @@ class ApiTests(DbTestCase):
         self.assertIn("D2: confirmed, do_not_pay", actions)
 
 
+    def test_browser_session_cookie(self):
+        browser = self.TestClient(self.make_app(), base_url="https://testserver")
+        signed = browser.post("/login", json={"username": "alice@acme.example", "password": PW_A},
+                              headers={"X-Requested-With": "fetch"})
+        cookie = signed.headers["set-cookie"].lower()
+        for attribute in ("__host-iad_session=", "httponly", "secure", "samesite=strict", "path=/"):
+            self.assertIn(attribute, cookie)
+        self.assertEqual(browser.get("/me").json()["username"], "alice@acme.example")
+        # Changes signed only by the cookie need the header another site can't add...
+        change = "/me/2fa/setup"  # any change will do; this one is harmless
+        self.assertEqual(browser.post(change).status_code, 403)
+        fetch = {"X-Requested-With": "fetch"}
+        self.assertEqual(browser.post(change, headers=fetch).status_code, 200)
+        # ...and must not come from another site.
+        evil = {"X-Requested-With": "fetch", "Origin": "https://evil.example"}
+        self.assertEqual(browser.post(change, headers=evil).status_code, 403)
+        self.assertEqual(browser.post(change, headers={**fetch, "Origin": "https://testserver"}).status_code, 200)
+        # Programs using a bearer token aren't affected.
+        self.assertEqual(self.client.post(change, headers=self.h(self.token())).status_code, 200)
+        out = browser.post("/logout", headers=fetch)
+        self.assertIn("max-age=0", out.headers["set-cookie"].lower())
+        self.assertEqual(browser.get("/me").status_code, 401)
+
+    def test_unknown_fields_are_refused(self):
+        token = self.token()
+        tampered = {"username": "zed@acme.example", "role": "auditor", "password": "zed-password-1234",
+                    "org_id": "someone-else"}
+        r = self.client.post("/users", json=tampered, headers=self.h(token))
+        self.assertEqual(r.status_code, 422)
+        self.assertIn("org_id", r.text)
+        login = self.client.post("/login", json={"username": "alice@acme.example", "password": PW_A, "role": "admin"})
+        self.assertEqual(login.status_code, 422)
+
+    def test_security_headers_and_caching(self):
+        api = self.client.get("/me", headers=self.h(self.token()))
+        page = self.client.get("/")
+        for r in (api, page):
+            self.assertEqual(r.headers["x-content-type-options"], "nosniff")
+            self.assertEqual(r.headers["x-frame-options"], "DENY")
+            self.assertEqual(r.headers["cross-origin-opener-policy"], "same-origin")
+            self.assertIn("camera=()", r.headers["permissions-policy"])
+        self.assertEqual(api.headers["content-security-policy"], "default-src 'none'; frame-ancestors 'none'")
+        self.assertEqual(api.headers["cache-control"], "no-store")
+        self.assertIn("script-src 'self'", page.headers["content-security-policy"])
+
+    def test_request_size_limits(self):
+        from invoice_detector.api import MAX_BODY
+        big = self.client.post("/login", content=b"{" + b" " * (MAX_BODY + 1) + b"}",
+                               headers={"Content-Type": "application/json"})
+        self.assertEqual(big.status_code, 413)
+
+        def chunks():
+            yield b'{"username": "a", '
+            yield b'"password": "b"}'
+        chunked = self.client.post("/login", content=chunks(), headers={"Content-Type": "application/json"})
+        self.assertEqual(chunked.status_code, 411)
+
+    def test_api_docs_can_be_turned_off(self):
+        from dataclasses import replace
+        self.assertEqual(self.client.get("/openapi.json").status_code, 200)
+        closed = self.TestClient(self.make_app(replace(self.settings, api_docs=False)))
+        self.assertEqual(closed.get("/docs").status_code, 404)
+        self.assertEqual(closed.get("/openapi.json").status_code, 404)
+
+    def test_every_route_needs_sign_in_except_the_public_ones(self):
+        """A new route that forgets its sign-in check fails this test."""
+        public = {"/", "/app", "/app/{name}", "/samples", "/samples/{name}", "/health", "/health/ready",
+                  "/login", "/login/2fa", "/logout", "/auth/providers", "/auth/{name}/start",
+                  "/auth/{name}/callback", "/password/forgot", "/password/reset",
+                  "/docs", "/docs/oauth2-redirect", "/openapi.json"}
+        checked = 0
+        for route in self.make_app().routes:
+            path, methods = getattr(route, "path", None), getattr(route, "methods", None) or set()
+            if path in public or not methods:
+                continue
+            url = path
+            for param in ("{username}", "{invoice_id:path}", "{inv_id:path}", "{name}"):
+                url = url.replace(param, "x")
+            for method in methods - {"HEAD"}:
+                r = self.client.request(method, url, json={})
+                self.assertEqual(r.status_code, 401, f"{method} {path}")
+                checked += 1
+        self.assertGreater(checked, 25)
+
 if __name__ == "__main__":
     unittest.main()
 
@@ -357,7 +441,7 @@ class SignInApiTests(DbTestCase):
                             {"sso": OIDCClient(Provider("sso", "Okta", self.idp.issuer, self.idp.client_id, "s"),
                                                self.idp.get_json, self.idp.post_form)})
         self.make_app = lambda settings=self.settings: create_app(settings, db=self.app, accounts=accounts)
-        self.client = TestClient(self.make_app(), base_url="https://testserver")
+        self.client = forget_cookies(TestClient(self.make_app(), base_url="https://testserver"))
         self.TestClient = TestClient
         self.app.create_user(self.a, "alice@acme.example", PW_A, "admin")
         self.app.create_user(self.a, "dana@acme.example", "dana-password-1234", "accountant")
@@ -447,22 +531,22 @@ class SignInApiTests(DbTestCase):
         self.assertEqual(self.client.post("/users", json=sso_user, headers=self.h(admin)).status_code, 409)
 
     def test_single_sign_on(self):
-        from urllib.parse import parse_qs, unquote, urlparse
+        from urllib.parse import parse_qs, urlparse
         self.assertEqual(self.client.get("/auth/providers").json(), [{"name": "sso", "label": "Okta"}])
-        start = self.client.get("/auth/sso/start", follow_redirects=False)
+        browser = self.TestClient(self.make_app(), base_url="https://testserver")  # keeps cookies
+        start = browser.get("/auth/sso/start", follow_redirects=False)
         self.assertEqual(start.status_code, 302)
         cookie = start.headers["set-cookie"].lower()
         for attribute in ("httponly", "samesite=lax", "path=/auth/", "secure"):
             self.assertIn(attribute, cookie)
         q = parse_qs(urlparse(start.headers["location"]).query)
         code = self.idp.approve("alice@acme.example", q["nonce"][0])
-        back = self.client.get(f"/auth/sso/callback?code={code}&state={q['state'][0]}", follow_redirects=False)
-        self.assertEqual(back.status_code, 302)
-        where = back.headers["location"]
-        self.assertTrue(where.startswith("/#/sso?token="))
-        me = self.client.get("/me", headers=self.h(unquote(where.split("token=")[1]))).json()
+        back = browser.get(f"/auth/sso/callback?code={code}&state={q['state'][0]}", follow_redirects=False)
+        self.assertEqual((back.status_code, back.headers["location"]), (302, "/#/dashboard"))  # no token in the address
+        self.assertIn("__host-iad_session=", back.headers["set-cookie"].lower())
+        me = browser.get("/me").json()  # signed in by the session cookie alone
         self.assertEqual((me["username"], me["signed_in_with_two_factor"]), ("alice@acme.example", True))
-        replay = self.client.get(f"/auth/sso/callback?code={code}&state={q['state'][0]}", follow_redirects=False)
+        replay = browser.get(f"/auth/sso/callback?code={code}&state={q['state'][0]}", follow_redirects=False)
         self.assertTrue(replay.headers["location"].startswith("/#/login?error="))  # cookie cleared, code used
         self.assertEqual(self.client.get("/auth/google/start", follow_redirects=False).status_code, 404)
 

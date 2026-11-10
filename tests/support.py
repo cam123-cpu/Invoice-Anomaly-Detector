@@ -36,6 +36,21 @@ def make_dbs():
     return db, db
 
 
+def forget_cookies(client):
+    """Make a test client drop cookies after every response. Most API tests sign requests
+    with an Authorization header, as programs do; the browser's cookie session has its own
+    tests, which use an ordinary client."""
+    original = client.send
+
+    def send(request, **kwargs):
+        response = original(request, **kwargs)
+        client.cookies.clear()
+        return response
+
+    client.send = send
+    return client
+
+
 class DbTestCase(unittest.TestCase):
     """Gives each test a clean database with two companies, A and B."""
 

@@ -37,6 +37,7 @@ services:
       PUBLIC_URL: https://${DOMAIN:?set DOMAIN, e.g. invoices.example.com}
       FORCE_HTTPS: "1"
       FORWARDED_ALLOW_IPS: "*"   # the app is reachable only through Caddy on this network
+      API_DOCS: "0"              # no public /docs page in production
       # Optional: password-reset emails
       SMTP_HOST: ${SMTP_HOST:-}
       SMTP_PORT: ${SMTP_PORT:-587}

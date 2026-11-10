@@ -73,6 +73,19 @@ class TokenTests(unittest.TestCase):
 
 
 class RateLimiterTests(unittest.TestCase):
+    def test_memory_stays_bounded_when_a_bot_tries_many_usernames(self):
+        rl = RateLimiter(max_attempts=3, window=100, lockout=100)
+        rl.MAX_KEYS = 1000
+        for i in range(5000):
+            rl.record_failure(f"1.2.3.4:user{i}", now=i * 0.001)
+        self.assertLessEqual(len(rl._failures), 1001)
+        for _ in range(3):
+            rl.record_failure("locked", now=1)
+        for i in range(3000):  # long after the window: old entries are dropped
+            rl.record_failure(f"later{i}", now=500 + i * 0.001)
+        self.assertLessEqual(len(rl._failures), 1001)
+        rl.check("locked", now=600)  # its lockout expired and was cleaned up
+
     def test_lockout_after_max_failures(self):
         rl = RateLimiter(max_attempts=3, window=100, lockout=50)
         for t in (0, 1, 2):
