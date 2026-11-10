@@ -49,6 +49,8 @@ class Settings:
     encryption_keys: dict = field(repr=False)
     index_key: bytes = field(repr=False)
     db_path: str = "invoices.db"
+    database_url: str | None = field(default=None, repr=False)        # PostgreSQL, app role
+    database_admin_url: str | None = field(default=None, repr=False)  # PostgreSQL, owner (CLI only)
     anthropic_api_key: str | None = field(default=None, repr=False)
 
     @classmethod
@@ -65,5 +67,7 @@ class Settings:
             encryption_keys=parse_keys(_require("ENCRYPTION_KEYS")),
             index_key=index_key,
             db_path=os.environ.get("DB_PATH", "invoices.db"),
+            database_url=os.environ.get("DATABASE_URL") or None,
+            database_admin_url=os.environ.get("DATABASE_ADMIN_URL") or None,
             anthropic_api_key=os.environ.get("ANTHROPIC_API_KEY") or None,
         )
