@@ -71,13 +71,20 @@ def _init_deploy(folder: str) -> int:
         print(f"{folder} already has secrets ({', '.join(existing)}); leaving them alone. "
               "Replacing encryption keys would make stored bank details unreadable.")
         return 1
+    # The folder is private to you (700). The files inside are 644 so the app container, which
+    # runs as its own non-root user, can read them where Docker mounts them; nobody else on the
+    # server can reach them, because they can't enter the folder.
     os.makedirs(folder, exist_ok=True)
+    try:
+        os.chmod(folder, 0o700)
+    except OSError:
+        pass
     for name, value in files.items():
         path = os.path.join(folder, name)
         with open(path, "w", encoding="utf-8", newline="\n") as f:
             f.write(value + "\n")
         try:
-            os.chmod(path, 0o600)
+            os.chmod(path, 0o644)
         except OSError:
             pass
     print(f"Wrote {len(files)} secret files to {folder}.")

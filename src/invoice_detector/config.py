@@ -39,7 +39,7 @@ def env(name: str, default: str | None = None) -> str | None:
             with open(path, encoding="utf-8") as f:
                 return f.read().strip() or default
         except OSError as exc:
-            raise RuntimeError(f"{name}_FILE points to {path}, which can't be read") from exc
+            raise RuntimeError(f"{name}_FILE points to {path}, which can't be read ({exc.strerror})") from exc
     return default
 
 

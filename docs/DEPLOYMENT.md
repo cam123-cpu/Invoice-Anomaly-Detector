@@ -61,7 +61,7 @@ python3 -m pip install -e .            # Python 3.11+; only needed to create the
 python3 -m invoice_detector.cli init-deploy deploy/secrets
 ```
 
-This writes one file per secret into `deploy/secrets/` (readable only by you, git-ignored),
+This writes one file per secret into `deploy/secrets/` (a folder only you can open, git-ignored),
 with matching database passwords. It refuses to overwrite existing files, because new
 encryption keys would make the existing data unreadable.
 
