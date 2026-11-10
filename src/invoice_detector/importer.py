@@ -23,7 +23,7 @@ ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 _./#:-]{0,63}$")
 
 # Normalized header names (lowercase letters and digits only) for each field.
 SYNONYMS = {
-    "id": ["id", "invoice", "invoiceid", "invoiceno", "invoicenumber", "invoicenum", "invno",
+    "id": ["id", "invoice", "invoiceid", "invoiceno", "invoicenumber", "invoicenum", "invno", "num",
            "invnumber", "invoiceref", "invoicereference", "documentno", "documentnumber", "docno",
            "docnumber", "billno", "billnumber", "reference", "ref", "number", "no"],
     "vendor": ["vendor", "vendorname", "supplier", "suppliername", "payee", "payeename",
@@ -50,6 +50,7 @@ class Table:
     rows: list[list]                     # raw cell values: str, int, float, datetime or None
     first_row_number: int = 2            # spreadsheet row number of rows[0], for messages
     sheet: str | None = None
+    sheets: list[str] = field(default_factory=list)  # every sheet that has data (Excel only)
 
 
 @dataclass
@@ -57,6 +58,7 @@ class Converted:
     invoices: list[dict] = field(default_factory=list)
     errors: list[dict] = field(default_factory=list)  # {"row": n, "message": "..."}
     blank_rows: int = 0
+    lines: dict[str, int] = field(default_factory=dict)  # invoice id -> spreadsheet row number
 
 
 def normalize_header(value) -> str:
@@ -83,7 +85,22 @@ def _read_csv(data: bytes) -> list[list]:
     return [row for row in csv.reader(io.StringIO(text), dialect)]
 
 
-def _read_xlsx(data: bytes) -> tuple[list[list], str]:
+def _sheet_rows(ws) -> list[list]:
+    rows = []
+    for row in ws.iter_rows(values_only=True):
+        rows.append(list(row))
+        if len(rows) > MAX_ROWS + 20:
+            break
+    return rows
+
+
+def _has_data(rows: list[list]) -> bool:
+    return sum(1 for r in rows if sum(_present(v) for v in r) >= 2) >= 2
+
+
+def _read_xlsx(data: bytes, sheet: str | None = None) -> tuple[list[list], str | None, list[str]]:
+    """Rows of the chosen sheet (or the first sheet with a table, active sheet first),
+    its name, and the names of all sheets that contain a table."""
     from openpyxl import load_workbook
 
     try:
@@ -92,16 +109,21 @@ def _read_xlsx(data: bytes) -> tuple[list[list], str]:
         raise FileProblem("This Excel file could not be opened. If it is password-protected, "
                           "remove the password; otherwise re-save it as .xlsx or .csv.") from exc
     try:
-        sheets = [wb.active] + [ws for ws in wb.worksheets if ws is not wb.active]
-        for ws in sheets:
-            rows = []
-            for row in ws.iter_rows(values_only=True):
-                rows.append(list(row))
-                if len(rows) > MAX_ROWS + 20:
-                    break
-            if any(any(_present(v) for v in r) for r in rows):
-                return rows, ws.title
-        return [], sheets[0].title if sheets else None
+        ordered = [wb.active] + [ws for ws in wb.worksheets if ws is not wb.active]
+        tables = {}
+        for ws in ordered:
+            rows = _sheet_rows(ws)
+            if _has_data(rows):
+                tables[ws.title] = rows
+        if sheet is not None:
+            if sheet not in wb.sheetnames:
+                raise FileProblem(f"There is no sheet called '{sheet}' in this workbook.")
+            rows = tables.get(sheet) or _sheet_rows(wb[sheet])
+            return rows, sheet, list(tables)
+        if tables:
+            name = next(iter(tables))
+            return tables[name], name, list(tables)
+        return [], None, []
     finally:
         wb.close()
 
@@ -127,20 +149,20 @@ def _find_header(rows: list[list]) -> int:
                       "such as Invoice number, Vendor, Amount and Date.")
 
 
-def read_table(filename: str, data: bytes) -> Table:
+def read_table(filename: str, data: bytes, sheet: str | None = None) -> Table:
     if not data:
         raise FileProblem("The file is empty.")
     if len(data) > MAX_BYTES:
         raise FileProblem(f"The file is larger than {MAX_BYTES // (1024 * 1024)} MB. Split it into smaller files.")
     name = (filename or "").lower()
-    sheet = None
+    sheets: list[str] = []
     if name.endswith((".xlsx", ".xlsm")):
-        rows, sheet = _read_xlsx(data)
+        rows, sheet, sheets = _read_xlsx(data, sheet)
     elif name.endswith(".xls"):
         raise FileProblem("Old .xls files aren't supported. In Excel, use File > Save As and "
                           "choose .xlsx or .csv.")
     elif name.endswith((".csv", ".txt", ".tsv")):
-        rows = _read_csv(data)
+        rows, sheet = _read_csv(data), None
     else:
         raise FileProblem("Upload an Excel (.xlsx) or CSV (.csv) file.")
 
@@ -160,7 +182,7 @@ def read_table(filename: str, data: bytes) -> Table:
         body.pop()
     if len(body) > MAX_ROWS:
         raise FileProblem(f"The file has more than {MAX_ROWS:,} rows. Split it into smaller files.")
-    return Table(headers, body, first_row_number=header_at + 2, sheet=sheet)
+    return Table(headers, body, first_row_number=header_at + 2, sheet=sheet, sheets=sheets)
 
 
 # ------------------------------------------------------------------ column mapping
@@ -361,6 +383,7 @@ def convert(table: Table, mapping: dict, date_order: str = "MDY") -> Converted:
             out.errors.append({"row": line, "message": str(exc)})
             continue
         seen[inv_id] = line
+        out.lines[inv_id] = line
         out.invoices.append(invoice)
     return out
 
@@ -374,6 +397,7 @@ def preview(table: Table, sample: int = 8) -> dict:
     order, ambiguous = detect_date_order(date_values)
     return {
         "sheet": table.sheet,
+        "sheets": table.sheets,
         "headers": table.headers,
         "total_rows": len(table.rows),
         "mapping": mapping,

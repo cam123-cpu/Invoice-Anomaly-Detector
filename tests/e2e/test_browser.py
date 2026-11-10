@@ -18,11 +18,14 @@ import unittest
 import urllib.request
 from datetime import datetime
 
+from openpyxl import load_workbook
+
 RUN = os.environ.get("RUN_E2E") == "1"
 SHOTS = os.environ.get("E2E_SCREENSHOTS", "e2e-shots")
 USERS = {"alice": ("Acme Inc", "admin", "alice-password-123"),
          "audrey": ("Acme Inc", "auditor", "audrey-password-123"),
-         "bob": ("Globex", "admin", "bob-password-12345")}
+         "bob": ("Globex", "admin", "bob-password-12345"),
+         "carmen": ("Initech", "accountant", "carmen-password-123")}
 XSS_VENDOR = '<img src=x onerror="window.__pwned=1">Evil Vendor'
 
 
@@ -46,6 +49,12 @@ def messy_excel() -> bytes:
     buf = io.BytesIO()
     wb.save(buf)
     return buf.getvalue()
+
+
+def xlsx(path):
+    """Open a downloaded workbook (Playwright saves downloads without an extension)."""
+    with open(path, "rb") as f:
+        return load_workbook(io.BytesIO(f.read()))
 
 
 def free_port() -> int:
@@ -81,7 +90,7 @@ class BrowserTest(unittest.TestCase):
         try:
             cli.main(["init"])
             db = Database.from_settings(Settings.from_env())
-            orgs = {name: db.create_org(name) for name in ("Acme Inc", "Globex")}
+            orgs = {name: db.create_org(name) for name in ("Acme Inc", "Globex", "Initech")}
             for user, (company, role, password) in USERS.items():
                 db.create_user(orgs[company], user, password, role)
             rows, _ = generate_demo()
@@ -195,8 +204,28 @@ class BrowserTest(unittest.TestCase):
         self.assertIn("not a recognised date", p.inner_text("table"))
         self.shot("05-upload-results")
 
+        # your own workbook back, with the results written in
+        with p.expect_download() as dl:
+            p.click("button:text('Download your file with flags')")
+        self.assertEqual(dl.value.suggested_filename, "ap-export - checked.xlsx")
+        wb = xlsx(dl.value.path())
+        ws = wb["AP export"]
+        self.assertEqual([ws.cell(3, c).value for c in range(7, 11)], ["Risk", "Review status", "Flags", "Why flagged"])
+        self.assertEqual(ws.cell(1, 1).value, "Accounts payable register - Q1 2026")  # original untouched
+        by_id = {ws.cell(r, 1).value: r for r in range(4, 10)}
+        self.assertGreater(ws.cell(by_id["Q1-005"], 7).value, 0)
+        self.assertIn("Duplicate", ws.cell(by_id["Q1-005"], 9).value)
+        self.assertEqual(ws.cell(by_id["Q1-004"], 8).value, "Not imported")
+        self.assertEqual(ws.cell(by_id["Q1-003"], 2).value, XSS_VENDOR)
+        self.assertIn("Flagged invoices", wb.sheetnames)
+
         # the new invoices were checked, and the hostile vendor name is inert text
-        p.click("text=Open review queue")
+        p.click("a:text('Open review queue')")
+        with p.expect_download() as dl:
+            p.click("button:text('Download Excel')")
+        report = xlsx(dl.value.path())["Review queue"]
+        self.assertEqual([c.value for c in report[1]][:3], ["Risk", "Invoice", "Vendor"])
+        self.assertEqual(report.cell(2, 2).value, "INV-0249")  # highest risk first
         p.fill("input[type=search]", "Q1-")
         p.wait_for_selector("td.mono:text-is('Q1-005')")
         self.assertIn("Duplicate", p.inner_text("tr:has(td.mono:text-is('Q1-005'))"))
@@ -268,6 +297,46 @@ class BrowserTest(unittest.TestCase):
             self.shot("09-phone-review")
         finally:
             ctx.close()
+
+    def test_samples_and_multi_sheet_workbooks(self):
+        p = self.page
+        self.login("carmen")
+        p.click("nav a[href='#/upload']")
+        p.wait_for_selector("text=No file handy? Try a sample")
+        self.assertEqual(p.locator(".sample").count(), 4)
+        self.shot("10-samples")
+        with p.expect_download() as dl:
+            p.click(".sample:has-text('Blank template') >> button:text('Download')")
+        self.assertEqual(xlsx(dl.value.path()).sheetnames[0], "Invoices")
+
+        p.click("button[data-sample='ap-register-2026.xlsx']")
+        p.wait_for_selector("#sheet")
+        self.assertEqual(p.input_value("#sheet"), "Q1 2026")
+        self.assertEqual(p.input_value("#map-id"), "Ref")
+        self.assertEqual(p.input_value("#map-amount"), "Amount due")
+        self.shot("11-sheet-picker")
+        p.click("button:text('Import invoices')")
+        p.wait_for_selector("text=Rows that were not imported")
+        self.assertIn("TBC", p.inner_text("table"))
+        for sheet in ("Q2 2026", "Q3 2026"):
+            p.click(f"button:text('Import sheet \"{sheet}\"')")
+            p.wait_for_selector("text=We've reused the matching you chose last time")
+            self.assertEqual(p.input_value("#sheet"), sheet)
+            p.click("button:text('Import invoices')")
+            p.wait_for_selector(".kpi:has-text('Invoices added')")
+        self.assertGreater(int(p.inner_text(".kpi:has-text('Flagged from this file') .value")), 0)
+
+        p.click("nav a[href='#/upload']")
+        p.click("button[data-sample='european-supplier-ledger.xlsx']")
+        p.wait_for_selector("text=Which column is which?")
+        self.assertEqual(p.input_value("#date-order"), "DMY")
+        self.assertEqual(p.input_value("#map-amount"), "Gross amount (EUR)")
+        p.click("button:text('Import invoices')")
+        p.wait_for_selector(".kpi:has-text('Invoices added')")
+        self.assertEqual(p.inner_text(".kpi:has-text('Invoices added') .value"), "260")
+        p.click("a:text('Open review queue')")
+        p.wait_for_selector("td.mono:text('RE-2026-0251')")
+        self.assertEqual(self.errors, [])
 
     def test_security_headers(self):
         with urllib.request.urlopen(self.base + "/") as resp:

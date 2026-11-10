@@ -1,6 +1,9 @@
 import base64
 import importlib.util
+import io
 import unittest
+
+from openpyxl import load_workbook
 
 from support import DbTestCase, make_settings
 
@@ -208,6 +211,74 @@ class ApiTests(DbTestCase):
         for bad in ("/app/index.html", "/app/../db.py", "/app/secret"):
             self.assertEqual(self.client.get(bad).status_code, 404, bad)
         self.assertEqual(self.client.get("/health").headers["x-frame-options"], "DENY")
+
+    def test_excel_round_trip(self):
+        admin, bob = self.auth("alice", PW_A), self.auth("bob", PW_B)
+        csv_text = ("Invoice,Vendor,Date,Amount\n"
+                    "E1,=1+2 Corp,2026-01-05,500\n"
+                    "E2,=1+2 Corp,2026-01-05,500\n"
+                    "E3,Globex,2026-01-07,12.5\n"
+                    "E4,Globex,someday,1\n")
+        body = {"filename": 'ap "march"\r\nX-Evil: 1.csv',
+                "content_base64": base64.b64encode(csv_text.encode()).decode(),
+                "mapping": {"id": "Invoice", "vendor": "Vendor", "date": "Date", "amount": "Amount"},
+                "date_order": "MDY"}
+        self.assertEqual(self.client.post("/import", json=body, headers=admin).json()["added"], 3)
+
+        r = self.client.post("/export/annotated", json=body, headers=admin)
+        self.assertEqual(r.status_code, 200)
+        self.assertTrue(r.headers["content-type"].startswith("application/vnd.openxmlformats"))
+        disposition = r.headers["content-disposition"]
+        self.assertNotIn("\n", disposition)
+        self.assertNotIn("X-Evil:", r.headers)
+        self.assertIn('filename="ap _march___X-Evil_ 1 - checked.xlsx"', disposition)
+        wb = load_workbook(io.BytesIO(r.content))
+        ws = wb["Invoices"]
+        self.assertEqual([ws.cell(1, c).value for c in range(5, 9)], ["Risk", "Review status", "Flags", "Why flagged"])
+        statuses = [ws.cell(row, 6).value for row in range(2, 6)]
+        self.assertEqual(statuses[2:], ["No flags", "Not imported"])
+        self.assertIn("Duplicate", ws.cell(3, 7).value)
+        self.assertEqual((ws.cell(2, 2).data_type, ws.cell(2, 2).value), ("s", "'=1+2 Corp"))
+
+        report = self.client.get("/export/review.xlsx", headers=admin)
+        rq = load_workbook(io.BytesIO(report.content))["Review queue"]
+        self.assertEqual(rq.cell(2, 2).value, "E2")
+        self.assertEqual(rq.cell(2, 3).data_type, "s")
+        self.assertIn('filename="review-queue-company-a.xlsx"', report.headers["content-disposition"])
+        actions = [e["action"] for e in self.client.get("/audit", headers=admin).json()]
+        self.assertIn("workbook_exported", actions)
+        self.assertIn("report_exported", actions)
+
+        # another company gets nothing from the same file or the report
+        theirs = load_workbook(io.BytesIO(self.client.post("/export/annotated", json=body, headers=bob).content))["Invoices"]
+        self.assertEqual([theirs.cell(row, 5).value for row in range(2, 6)], [None] * 4)
+        self.assertEqual([theirs.cell(row, 6).value for row in range(2, 5)], [None] * 3)
+        bob_report = load_workbook(io.BytesIO(self.client.get("/export/review.xlsx", headers=bob).content))
+        self.assertEqual(bob_report["Review queue"].max_row, 1)
+
+        self.assertEqual(self.client.post("/export/annotated", json=body).status_code, 401)
+        self.assertEqual(self.client.get("/export/review.xlsx").status_code, 401)
+
+    def test_sample_files(self):
+        listing = self.client.get("/samples").json()  # synthetic data, no sign-in needed
+        self.assertEqual(len(listing), 4)
+        for item in listing:
+            r = self.client.get("/samples/" + item["name"])
+            self.assertEqual(r.status_code, 200)
+            self.assertTrue(load_workbook(io.BytesIO(r.content)).sheetnames)
+        self.assertEqual(self.client.get("/samples/../api.py").status_code, 404)
+        self.assertEqual(self.client.get("/samples/nope.xlsx").status_code, 404)
+
+    def test_sheet_choice(self):
+        admin = self.auth("alice", PW_A)
+        from invoice_detector.samples import build
+        body = {"filename": "ap-register-2026.xlsx", "content_base64": base64.b64encode(build("ap-register-2026.xlsx")).decode()}
+        first = self.client.post("/import/preview", json=body, headers=admin).json()
+        self.assertEqual((first["sheet"], len(first["sheets"])), ("Q1 2026", 4))
+        second = self.client.post("/import/preview", json={**body, "sheet": "Q3 2026"}, headers=admin).json()
+        self.assertEqual(second["sheet"], "Q3 2026")
+        missing = self.client.post("/import/preview", json={**body, "sheet": "Q9"}, headers=admin)
+        self.assertEqual(missing.status_code, 422)
 
 
 if __name__ == "__main__":

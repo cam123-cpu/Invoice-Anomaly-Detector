@@ -73,20 +73,43 @@ Enter `alice` and the password you chose. The left-hand menu has everything:
 1. Export invoices from your accounting system or save your spreadsheet as **.xlsx** or **.csv**.
    One row per invoice, with at least an invoice number, vendor, amount and date. A bank account
    column is optional but switches on the bank checks.
+   *No file to hand?* The Upload page has four samples with **Try it** buttons, and a blank template.
 2. Open **Upload invoices** and drop the file on the page.
-3. **Match the columns.** The app guesses which of your columns is which, from names like
+3. **Pick the sheet**, if the workbook has several with invoices in them.
+4. **Match the columns.** The app guesses which of your columns is which, from names like
    "Invoice #", "Supplier", "Invoice Date" or "Total". Check each one and fix any wrong guess.
-4. **Check the date format.** If your dates look like 03/05/2026, say whether that means
+5. **Check the date format.** If your dates look like 03/05/2026, say whether that means
    March 5 or 3 May. The app works it out when the file settles it, and warns you when it can't.
-5. Click **Import invoices**. You'll see how many were added, how many were already stored, and
-   every row that couldn't be used, with the reason. Detection runs automatically afterwards.
+6. Click **Import invoices**. You'll see how many were added, how many were already stored,
+   how many from this file were flagged, and every row that couldn't be used, with the reason.
+   Detection runs automatically.
 
 The app handles what real exports look like: title rows above the header, amounts like
 `$1,250.00` or `1.250,00 €`, Excel dates, blank lines and totals rows. It remembers your column
 matching, so next month's export from the same system needs no changes. Re-uploading a file is
-safe, because invoices already stored are skipped.
+safe, because invoices already stored are skipped. For a workbook with one sheet per month or
+quarter, use the **Import sheet "..."** button on the results page to work through them in order.
 
-### 6. Work the review queue
+### 6. Get the results back in Excel
+
+On the results page, click **Download your file with flags**. You get your own workbook back,
+named "... - checked.xlsx", with:
+
+- four new columns on the right of your data: **Risk** (0-100), **Review status**, **Flags** and
+  **Why flagged**, filled in for every row, with high-risk rows shaded red and medium amber;
+- "No flags" in green for rows that passed, and "Not imported" with the reason for rows that
+  couldn't be read;
+- a **Flagged invoices** sheet listing just the problems, highest risk first, with filters;
+- an **About these flags** sheet explaining every flag.
+
+Your own cells and formulas are not changed. Pictures and charts in the workbook are not copied
+into the download, so keep your original. Download it again after reviewing, and the Review
+status column shows your team's decisions.
+
+For a report of everything flagged so far, across all your uploads, use **Download Excel** on
+the Review queue page or **Download Excel report** on the Dashboard.
+
+### 7. Work the review queue
 
 Each row shows a **risk score** from 0 to 100, the invoice, and coloured tags saying why it was
 flagged. Click a row for the full explanation, then decide:
@@ -102,7 +125,7 @@ for less from then on, and the Dashboard shows how each check is performing.
 **Run detection** at the top of the queue re-checks everything, for example after you change the
 approval threshold in Settings.
 
-### 7. Add colleagues
+### 8. Add colleagues
 
 In **Settings**, an admin adds people with a temporary password and one of three roles:
 
@@ -112,7 +135,7 @@ In **Settings**, an admin adds people with a temporary password and one of three
 | Accountant | Also upload, run detection and review flags |
 | Admin | Also manage people and settings, and reveal bank accounts |
 
-### 8. Add a second company
+### 9. Add a second company
 
 Each company's data is completely separate. To see it for yourself:
 
@@ -124,7 +147,7 @@ python -m invoice_detector.cli create-user "Globex" bob admin
 Sign out, sign in as `bob`, and Globex starts empty. Nothing from Acme is visible, even by
 typing an invoice address directly.
 
-### 9. Without the browser
+### 10. Without the browser
 
 The same steps work from the command line, which is handy for scheduled jobs:
 

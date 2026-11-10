@@ -119,6 +119,53 @@ async function api(method, path, body) {
   return data;
 }
 
+/* Fetch a file with the sign-in token and hand it to the browser as a download. */
+async function download(method, path, body) {
+  const headers = {};
+  if (session) headers.Authorization = "Bearer " + session.token;
+  if (body !== undefined) headers["Content-Type"] = "application/json";
+  let res;
+  try {
+    res = await fetch(path, { method, headers, body: body === undefined ? undefined : JSON.stringify(body) });
+  } catch {
+    throw new ApiError(0, "Can't reach the server. Is it still running?");
+  }
+  if (res.status === 401 && session) { signOut("Your session expired. Please sign in again."); throw new ApiError(401, "Signed out"); }
+  if (!res.ok) {
+    let msg = `Download failed (${res.status})`;
+    try { const d = await res.json(); if (typeof d.detail === "string") msg = d.detail; } catch { /* not JSON */ }
+    throw new ApiError(res.status, msg);
+  }
+  const blob = await res.blob();
+  const cd = res.headers.get("Content-Disposition") || "";
+  const star = /filename\*=UTF-8''([^;]+)/i.exec(cd);
+  const plain = /filename="([^"]+)"/i.exec(cd);
+  let name = "download.xlsx";
+  try { name = star ? decodeURIComponent(star[1]) : plain ? plain[1] : name; } catch { name = plain ? plain[1] : name; }
+  const url = URL.createObjectURL(blob);
+  const a = h("a", { href: url, download: name, class: "hidden" });
+  document.body.append(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 10000);
+  return name;
+}
+
+function downloadButton(label, method, path, body, cls) {
+  const btn = h("button", { class: "btn" + (cls ? " " + cls : ""), onclick: async () => {
+    btn.disabled = true;
+    const text = btn.textContent;
+    btn.textContent = "Preparing…";
+    try {
+      const name = await download(method, path, typeof body === "function" ? body() : body);
+      toast(`Downloaded ${name}`);
+    } catch (err) { if (err.status !== 401) toast(err.message, true); }
+    btn.disabled = false;
+    btn.textContent = text;
+  } }, label);
+  return btn;
+}
+
 function signOut(message) {
   session = null;
   store.del("session");
@@ -142,7 +189,9 @@ function shell(active, content) {
   const nav = h("nav", { class: "nav", "aria-label": "Main" },
     PAGES.filter((p) => !p.roles || p.roles.includes(session.role)).map((p) =>
       h("a", { href: "#/" + p.id, class: p.id === active ? "active" : null,
-               "aria-current": p.id === active ? "page" : null },
+               "aria-current": p.id === active ? "page" : null,
+               // the address doesn't change when you click the page you're on, so start it afresh
+               onclick: (e) => { if (location.hash === "#/" + p.id) { e.preventDefault(); render(); } } },
         p.label, p.id === "review" && openCount ? h("span", { class: "count", "aria-label": `${openCount} open` }, whole.format(openCount)) : null)));
   return h("div", { class: "shell" },
     h("aside", { class: "side" },
@@ -243,6 +292,7 @@ async function dashboardView() {
   openCount = s.open;
   const canEdit = CAN_EDIT.includes(session.role);
   const head = pageHead("Dashboard", s.company,
+    s.flagged ? downloadButton("Download Excel report", "GET", "/export/review.xlsx") : null,
     canEdit ? h("a", { class: "btn", href: "#/upload" }, "Upload invoices") : null,
     h("a", { class: "btn primary", href: "#/review" }, "Open review queue"));
 
@@ -405,7 +455,8 @@ async function reviewView() {
     body));
   drawRows();
   return h("div", {},
-    pageHead("Review queue", "Highest risk first. Click a row to see the reasons. Your decisions tune the scoring for your company.", runBtn),
+    pageHead("Review queue", "Highest risk first. Click a row to see the reasons. Your decisions tune the scoring for your company.",
+      items.length ? downloadButton("Download Excel", "GET", "/export/review.xlsx") : null, runBtn),
     h("div", { class: "row" }, tabs, h("span", { class: "spacer" }), search),
     spacer(12), wrap, emptyBox);
 }
@@ -435,6 +486,26 @@ async function uploadView() {
       h("div", { class: "step" + (i + 1 === n ? " on" : i + 1 < n ? " done" : "") },
         h("span", { class: "dot" }, i + 1 < n ? "✓" : i + 1), label)));
 
+  let samples = null;
+  async function loadSamples(box) {
+    try { samples = samples || await api("GET", "/samples"); } catch { return; }
+    put(box, h("h2", {}, "No file handy? Try a sample"),
+      h("p", { class: "muted small" }, "Made-up invoices in the shapes real exports take, with some problems planted in them. The template is a blank file with the columns the app needs."),
+      h("div", { class: "samples" }, samples.map((smp) => h("div", { class: "sample card" },
+        h("div", { class: "sample-title" }, smp.title),
+        h("div", { class: "muted small" }, smp.description),
+        h("div", { class: "row" },
+          smp.name.includes("template") ? null : h("button", { class: "btn sm primary", "data-sample": smp.name,
+            onclick: async () => {
+              try {
+                const res = await fetch("/samples/" + encodeURIComponent(smp.name));
+                if (!res.ok) throw new Error("Couldn't load the sample.");
+                readFile(new File([await res.blob()], smp.name));
+              } catch (err) { chooseStep(err); }
+            } }, "Try it"),
+          downloadButton("Download", "GET", "/samples/" + encodeURIComponent(smp.name), undefined, "sm"))))));
+  }
+
   function chooseStep(error) {
     const input = h("input", { type: "file", accept: ".xlsx,.xlsm,.csv,.txt,.tsv", class: "hidden", id: "file-input",
       onchange: () => input.files[0] && readFile(input.files[0]) });
@@ -445,22 +516,28 @@ async function uploadView() {
       h("div", { class: "big" }, "Drop an Excel or CSV file here"),
       h("p", { class: "muted" }, "An invoice export from QuickBooks, Xero, NetSuite, SAP or your own spreadsheet. Up to 10 MB."),
       h("button", { class: "btn primary", onclick: () => input.click() }, "Choose file"), input);
+    const sampleBox = h("div");
     put(holder, steps(1), error ? failure(error) : null, error ? spacer(12) : null, drop,
       spacer(16), h("p", { class: "muted small" },
-        "Each row should be one invoice with at least an invoice number, vendor, amount and date. A bank account column is optional but enables the bank checks. Columns can have any names; you'll match them in the next step."));
+        "Each row should be one invoice with at least an invoice number, vendor, amount and date. A bank account column is optional but enables the bank checks. Columns can have any names; you'll match them in the next step."),
+      spacer(12), sampleBox);
+    loadSamples(sampleBox);
   }
 
-  async function readFile(file) {
+  async function readFile(file, sheet) {
     if (file.size > 10 * 1024 * 1024) return chooseStep(new Error("That file is larger than 10 MB. Split it into smaller files."));
     put(holder, steps(1), h("p", { class: "muted" }, `Reading ${file.name}…`));
     try {
       const content = toBase64(await file.arrayBuffer());
-      const info = await api("POST", "/import/preview", { filename: file.name, content_base64: content });
-      mapStep(file.name, content, info);
+      const info = await api("POST", "/import/preview", { filename: file.name, content_base64: content, sheet: sheet || null });
+      mapStep(file, content, info);
     } catch (err) { if (err.status !== 401) chooseStep(err); }
   }
 
-  function mapStep(filename, content, info) {
+  let lastInfo = {};
+  function mapStep(file, content, info) {
+    lastInfo = info;
+    const filename = file.name;
     const memoryKey = "mapping:" + info.headers.join("|");
     let saved = null;
     try { saved = JSON.parse(store.get(memoryKey, true) || "null"); } catch { saved = null; }
@@ -489,6 +566,9 @@ async function uploadView() {
       h("option", { value: "DMY" }, "Day first: 03/05/2026 is 3 May"));
     orderSel.value = dateOrder;
     const detect = h("input", { type: "checkbox", id: "run-detect", checked: true });
+    const sheetSel = info.sheets && info.sheets.length > 1 ? h("select", { id: "sheet",
+      onchange: () => readFile(file, sheetSel.value) }, info.sheets.map((n) => h("option", { value: n }, n))) : null;
+    if (sheetSel) sheetSel.value = info.sheet;
     const go = h("button", { class: "btn primary", onclick: async () => {
       err.classList.add("hidden");
       const missing = info.fields.filter((f) => f.required && !mapping[f.name]);
@@ -499,11 +579,12 @@ async function uploadView() {
       go.disabled = true;
       go.textContent = "Importing…";
       try {
-        const result = await api("POST", "/import", { filename, content_base64: content, mapping, date_order: dateOrder, run_detection: detect.checked });
+        const request = { filename, content_base64: content, sheet: info.sheet, mapping, date_order: dateOrder };
+        const result = await api("POST", "/import", { ...request, run_detection: detect.checked });
         store.set(memoryKey, JSON.stringify({ mapping, date_order: dateOrder }), true);
         await refreshCount();
         updateNavCount();
-        resultStep(filename, result);
+        resultStep(filename, result, request, file);
       } catch (ex) {
         if (ex.status === 401) return;
         err.textContent = ex.message;
@@ -518,6 +599,9 @@ async function uploadView() {
         h("h2", {}, "Which column is which?"),
         h("p", { class: "muted" }, `${filename}${info.sheet ? ` · sheet "${info.sheet}"` : ""} · ${whole.format(info.total_rows)} rows. `,
           saved ? "We've reused the matching you chose last time for a file like this." : "We've guessed from the column names. Check and adjust."),
+        sheetSel ? h("div", { class: "note", role: "note" }, `This workbook has ${info.sheets.length} sheets with invoices. `,
+          h("label", { for: "sheet" }, "Import sheet: "), sheetSel, " Import each one in turn to add them all.") : null,
+        sheetSel ? spacer(12) : null,
         h("div", { class: "map-grid" }, selects,
           h("label", { class: "field", for: "date-order" }, "Date format", orderSel)),
         info.date_order_ambiguous && !saved ? h("div", { class: "note", role: "note" },
@@ -530,17 +614,23 @@ async function uploadView() {
         h("button", { class: "btn", onclick: () => chooseStep() }, "Choose a different file"), go));
   }
 
-  function resultStep(filename, r) {
+  function resultStep(filename, r, request, file) {
+    const sheets = (file && request.sheet) ? (lastInfo.sheets || []) : [];
+    const nextSheet = sheets[sheets.indexOf(request.sheet) + 1];
     const kpi = (label, value, alert) => h("div", { class: "card kpi result-kpis" + (alert ? " alert" : "") },
       h("div", { class: "label" }, label), h("div", { class: "value" }, whole.format(value)));
     put(holder, steps(3),
       h("div", { class: "kpis" }, kpi("Invoices added", r.added), kpi("Already stored, skipped", r.already_stored),
         kpi("Rows with problems", r.error_count, r.error_count > 0),
         r.detection ? kpi("Flagged from this file", r.detection.flagged_from_file, r.detection.flagged_from_file > 0) : null),
-      r.detection ? h("div", { class: "row" }, h("a", { class: "btn primary", href: "#/review" }, "Open review queue"),
-        h("button", { class: "btn", onclick: () => chooseStep() }, "Upload another file"))
-        : h("div", { class: "row" }, h("button", { class: "btn", onclick: () => chooseStep() }, "Upload another file")),
-      r.blank_rows ? h("div", {}, spacer(8), h("p", { class: "muted small" }, `${whole.format(r.blank_rows)} blank or total rows were ignored.`)) : null,
+      h("div", { class: "row" },
+        downloadButton("Download your file with flags", "POST", "/export/annotated", request, "primary"),
+        r.detection ? h("a", { class: "btn", href: "#/review" }, "Open review queue") : null,
+        nextSheet ? h("button", { class: "btn", onclick: () => readFile(file, nextSheet) }, `Import sheet "${nextSheet}"`) : null,
+        h("button", { class: "btn", onclick: () => chooseStep() }, "Upload another file")),
+      spacer(8), h("p", { class: "muted small" },
+        "The download is your own workbook with Risk, Review status, Flags and Why flagged columns added to each row, risky rows shaded, and a ranked “Flagged invoices” sheet. Your data and formulas are unchanged; pictures and charts are not copied."),
+      r.blank_rows ? h("div", {}, spacer(8), h("p", { class: "muted small" }, r.blank_rows === 1 ? "1 blank or total row was ignored." : `${whole.format(r.blank_rows)} blank or total rows were ignored.`)) : null,
       r.errors.length ? h("div", {}, spacer(16), h("h2", {}, "Rows that were not imported"),
         h("p", { class: "muted" }, "Fix these in your file and upload it again. Rows already imported are skipped automatically."),
         h("div", { class: "table-wrap" }, h("table", {},
