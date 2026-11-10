@@ -11,7 +11,8 @@ It comes with a **web app** for accounts-payable teams: upload an Excel or CSV e
 columns once, work a ranked review queue with Confirm and Dismiss buttons, and **download your own
 workbook back with every row's risk, status and reasons written in**.
 
-**New here? Follow the [tutorial](docs/TUTORIAL.md).**
+**New here? Follow the [tutorial](docs/TUTORIAL.md).** To understand how the code works, read
+[How it works](docs/HOW-IT-WORKS.md): architecture, data structures, algorithms and security, explained in depth.
 
 ## What it detects
 
@@ -188,6 +189,7 @@ src/invoice_detector/   detection, evaluate, demo, importer, excel_out, samples,
 src/invoice_detector/web/  the web app (index.html, app.js, app.css)
 tests/                  unit tests (unittest style, run by pytest); tests/e2e is the browser test
 docs/TUTORIAL.md        step-by-step guide
+docs/HOW-IT-WORKS.md    how the code works, in depth
 samples/                sample Excel files (regenerate with scripts/make_samples.py)
 prototypes/             the original Gleam version
 .github/workflows/      CI: lint, tests on Linux, Windows and PostgreSQL, browser test, Docker build, dependency audit
