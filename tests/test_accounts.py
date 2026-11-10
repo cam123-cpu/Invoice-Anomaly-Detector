@@ -67,6 +67,16 @@ class PasswordSignInTests(AccountsTestCase):
         self.assertEqual(cm.exception.status, 429)
         self.assertTrue(self.acc.login("bob", "bob-password-12345", "8.8.8.8")["access_token"])
 
+    def test_one_address_trying_many_usernames_is_stopped(self):
+        """A bot spraying passwords across many accounts from one address."""
+        for i in range(30):
+            with self.assertRaises(AccountError):
+                self.acc.login(f"user{i}@acme.example", "guess", "6.6.6.6")
+        with self.assertRaises(AccountError) as cm:
+            self.acc.login("bob", "bob-password-12345", "6.6.6.6")
+        self.assertEqual(cm.exception.status, 429)
+        self.assertTrue(self.acc.login("bob", "bob-password-12345", "7.7.7.7")["access_token"])
+
     def test_sso_only_user_has_no_password(self):
         self.app.create_user(self.a, "sso@acme.example", None, "auditor")
         with self.assertRaises(AccountError):
@@ -211,6 +221,11 @@ class ResetTests(AccountsTestCase):
         with self.assertRaises(AccountError):
             self.acc.reset_password(token, "another-password-12")  # links work once
 
+    def test_reset_emails_to_one_person_are_capped(self):
+        for i in range(6):  # from different addresses, so only the per-person cap applies
+            self.assertEqual(self.acc.forgot_password("alice@acme.example", f"10.0.0.{i}"), {"email_enabled": True})
+        self.assertEqual(len(self.emails()), 3)
+
     def test_no_clues_about_who_has_an_account(self):
         for name in ("nobody@acme.example", "bob"):  # unknown, and a user with no email address
             self.assertEqual(self.acc.forgot_password(name, "5.5.5.5"), {"email_enabled": True})
@@ -249,9 +264,9 @@ class SingleSignOnTests(AccountsTestCase):
 
     def test_sign_in(self):
         self.assertEqual(self.acc.sso_providers(), [{"name": "sso", "label": "Okta"}])
-        where = self.go("Alice@Acme.example")
-        self.assertTrue(where.startswith("/#/sso?token="))
-        user = self.acc.authenticate(unquote(where.split("token=")[1]))
+        where, token = self.go("Alice@Acme.example")
+        self.assertEqual(where, "/#/dashboard")  # the token goes in a cookie, never the address
+        user = self.acc.authenticate(token)
         self.assertEqual((user["sub"], user["mfa"]), ("alice@acme.example", True))
         self.assertIn("single sign-on (Okta)", str(self.app.list_audit(self.a)))
 
@@ -263,9 +278,10 @@ class SingleSignOnTests(AccountsTestCase):
             "other provider": self.go("alice@acme.example", name="google"),
             "cancelled": self.go("alice@acme.example", query={"error": "access_denied"}),
         }
-        for case, where in cases.items():
+        for case, (where, token) in cases.items():
             self.assertTrue(where.startswith("/#/login?error="), case)
-        self.assertIn("no%20account%20for%20stranger%40acme.example", cases["unknown person"])
+            self.assertIsNone(token, case)
+        self.assertIn("no%20account%20for%20stranger%40acme.example", cases["unknown person"][0])
         with self.assertRaises(AccountError):
             self.acc.sso_start("google")
 

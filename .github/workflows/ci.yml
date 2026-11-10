@@ -169,9 +169,23 @@ jobs:
         if: failure()
         run: $COMPOSE logs --no-color --tail 200
 
-  dependency-audit:
+  secret-scan:
+    name: secret scan (whole git history)
     runs-on: ubuntu-latest
-    continue-on-error: true   # warn only; remove this line to make known CVEs fail the build
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # every commit, not just the latest: a deleted secret is still in history
+      - name: gitleaks
+        run: |
+          docker run --rm -v "$PWD:/repo" --entrypoint sh zricethezav/gitleaks:v8.18.4 -c \
+            'git config --global --add safe.directory /repo &&
+             gitleaks detect --source /repo --config /repo/.gitleaks.toml --redact --verbose --exit-code 1'
+
+
+  dependency-audit:
+    name: dependency audit (known vulnerabilities fail the build)
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5

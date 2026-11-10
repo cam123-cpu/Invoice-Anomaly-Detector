@@ -2,6 +2,9 @@
 # redirects plain HTTP to HTTPS. With DOMAIN=localhost it uses its own local certificate.
 {$DOMAIN} {
 	encode zstd gzip
+	request_body {
+		max_size 20MB
+	}
 	reverse_proxy app:8000
 	header -Server
 }

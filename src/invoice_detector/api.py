@@ -14,9 +14,9 @@ from importlib.resources import files
 from typing import Literal
 
 from fastapi import Depends, FastAPI, HTTPException, Request
-from fastapi.responses import RedirectResponse, Response
+from fastapi.responses import JSONResponse, RedirectResponse, Response
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from .config import Settings
 from .db import Conflict, Database
@@ -32,6 +32,9 @@ from .mailer import from_settings as mailer_from_settings
 from .security import TokenSigner
 
 MAX_BULK = 1000
+MAX_BODY = 16 * 1024 * 1024   # an upload is at most 10 MB, about 13.4 MB once base64-encoded
+SAFE_METHODS = ("GET", "HEAD", "OPTIONS")
+SESSION_TTL = 3600
 WEB = files("invoice_detector") / "web"
 WEB_FILES = {"index.html": "text/html", "app.js": "text/javascript", "app.css": "text/css"}
 # The web app loads nothing from other sites and never runs inline script, so a strict
@@ -39,14 +42,56 @@ WEB_FILES = {"index.html": "text/html", "app.js": "text/javascript", "app.css": 
 APP_CSP = ("default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; "
            "connect-src 'self'; font-src 'self'; object-src 'none'; base-uri 'none'; "
            "form-action 'self'; frame-ancestors 'none'")
+# API answers are data, never pages: nothing in them may load or run anything.
+API_CSP = "default-src 'none'; frame-ancestors 'none'"
+SECURITY_HEADERS = {
+    "X-Content-Type-Options": "nosniff",
+    "Referrer-Policy": "no-referrer",
+    "X-Frame-Options": "DENY",
+    "Permissions-Policy": "camera=(), microphone=(), geolocation=(), payment=(), usb=(), interest-cohort=()",
+    "Cross-Origin-Opener-Policy": "same-origin",
+    "Cross-Origin-Resource-Policy": "same-origin",
+}
 
 
-class LoginIn(BaseModel):
+class StrictModel(BaseModel):
+    """Request bodies. Unknown fields are refused rather than silently ignored, so a client
+    can't slip in extra ones (say "role" or "org_id") hoping some code path reads them."""
+    model_config = ConfigDict(extra="forbid")
+
+
+class BodyLimit:
+    """Refuse oversized request bodies before anything reads them. Browsers always send
+    Content-Length for the bodies this app uses; a body without one is refused (411)."""
+
+    def __init__(self, app, max_bytes: int = MAX_BODY):
+        self.app, self.max = app, max_bytes
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] == "http" and scope["method"] not in SAFE_METHODS:
+            headers = dict(scope["headers"])
+            length = headers.get(b"content-length")
+            problem = None
+            if length is None and headers.get(b"transfer-encoding"):
+                problem = (411, "Send a Content-Length header.")
+            elif length is not None and (not length.isdigit() or int(length) > self.max):
+                problem = (413, f"The request is larger than {self.max // (1024 * 1024)} MB.")
+            if problem:
+                body = ('{"detail": "%s"}' % problem[1]).encode()
+                await send({"type": "http.response.start", "status": problem[0],
+                            "headers": [(b"content-type", b"application/json"),
+                                        (b"content-length", str(len(body)).encode())]})
+                await send({"type": "http.response.body", "body": body})
+                return
+        await self.app(scope, receive, send)
+
+
+class LoginIn(StrictModel):
     username: str = Field(min_length=1, max_length=64)
     password: str = Field(min_length=1, max_length=256)
 
 
-class InvoiceIn(BaseModel):
+class InvoiceIn(StrictModel):
     id: str = Field(pattern=ID_PATTERN.pattern)
     vendor: str = Field(min_length=1, max_length=120)
     amount: float = Field(gt=0, lt=1e12)
@@ -54,53 +99,53 @@ class InvoiceIn(BaseModel):
     bank_account: str | None = Field(default=None, max_length=64)
 
 
-class UserIn(BaseModel):
+class UserIn(StrictModel):
     username: str = Field(pattern=r"^[A-Za-z0-9_.@+-]{3,64}$")
     # Leave out for someone who will only use single sign-on (Microsoft, Google, ...).
     password: str | None = Field(default=None, min_length=12, max_length=256)
     role: Literal["admin", "accountant", "auditor"]
 
 
-class SecondFactorIn(BaseModel):
+class SecondFactorIn(StrictModel):
     mfa_token: str = Field(min_length=1, max_length=2000)
     code: str = Field(min_length=6, max_length=40)
 
 
-class CodeIn(BaseModel):
+class CodeIn(StrictModel):
     code: str = Field(min_length=6, max_length=40)
 
 
-class DisableTwoFactorIn(BaseModel):
+class DisableTwoFactorIn(StrictModel):
     password: str | None = Field(default=None, max_length=256)
     code: str = Field(min_length=6, max_length=40)
 
 
-class ChangePasswordIn(BaseModel):
+class ChangePasswordIn(StrictModel):
     current_password: str = Field(min_length=1, max_length=256)
     new_password: str = Field(min_length=12, max_length=256)
 
 
-class ForgotIn(BaseModel):
+class ForgotIn(StrictModel):
     username: str = Field(min_length=1, max_length=64)
 
 
-class ResetIn(BaseModel):
+class ResetIn(StrictModel):
     token: str = Field(min_length=1, max_length=2000)
     new_password: str = Field(min_length=12, max_length=256)
 
 
-class NewPasswordIn(BaseModel):
+class NewPasswordIn(StrictModel):
     new_password: str = Field(min_length=12, max_length=256)
 
 
-class ReviewIn(BaseModel):
+class ReviewIn(StrictModel):
     verdict: Literal["confirmed", "dismissed"]
     # What happens to the payment. Leave out to use the suggestion (e.g. "do_not_pay" for a duplicate).
     action: Literal["pay", "hold", "do_not_pay"] | None = None
     note: str | None = Field(default=None, max_length=500)
 
 
-class FileIn(BaseModel):
+class FileIn(StrictModel):
     filename: str = Field(min_length=1, max_length=255)
     content_base64: str = Field(min_length=1, max_length=14_000_000)
     sheet: str | None = Field(default=None, max_length=100)
@@ -124,7 +169,7 @@ def attachment(data: bytes, filename: str, media_type: str) -> Response:
                                                           "Cache-Control": "no-store"})
 
 
-class SettingsIn(BaseModel):
+class SettingsIn(StrictModel):
     approval_threshold: float | None = Field(default=None, gt=0, lt=1e12)
     require_2fa: bool | None = None
 
@@ -137,9 +182,17 @@ def create_app(settings: Settings | None = None, db: Database | None = None,
     signer = TokenSigner(settings.secret_key)
     accounts = accounts or Accounts(db, signer, settings, mailer_from_settings(settings))
     bearer = HTTPBearer(auto_error=False)
+    https = settings.public_url.startswith("https://")
     sso_cookie = "iad_sso"
+    # The browser's session lives in an HttpOnly cookie, out of reach of page scripts. The
+    # __Host- prefix makes browsers insist it is Secure, for this exact host, for every path.
+    session_cookie = "__Host-iad_session" if https else "iad_session"
 
-    app = FastAPI(title="Invoice Anomaly Detector", version="0.7.0")
+    docs = settings.api_docs
+    app = FastAPI(title="Invoice Anomaly Detector", version="0.8.0",
+                  docs_url="/docs" if docs else None, redoc_url=None,
+                  openapi_url="/openapi.json" if docs else None)
+    app.add_middleware(BodyLimit)
     app.state.db, app.state.signer, app.state.accounts = db, signer, accounts
 
     def http_error(exc: AccountError) -> HTTPException:
@@ -150,22 +203,32 @@ def create_app(settings: Settings | None = None, db: Database | None = None,
         # Behind a proxy, run uvicorn with --proxy-headers so this is the real address.
         return request.client.host if request.client else "unknown"
 
-    def _user(creds: HTTPAuthorizationCredentials | None, enforce_2fa: bool) -> dict:
-        if creds is None:
+    def _user(request: Request, creds: HTTPAuthorizationCredentials | None, enforce_2fa: bool) -> dict:
+        # Programs send "Authorization: Bearer ..."; the web app sends the session cookie.
+        token = creds.credentials if creds else request.cookies.get(session_cookie)
+        if not token:
             raise HTTPException(401, "Not authenticated")
         try:
-            return accounts.authenticate(creds.credentials, enforce_2fa=enforce_2fa)
+            return accounts.authenticate(token, enforce_2fa=enforce_2fa)
         except AccountError as exc:
             raise http_error(exc) from None
 
-    def current_user(creds: HTTPAuthorizationCredentials | None = Depends(bearer)) -> dict:
+    def current_user(request: Request, creds: HTTPAuthorizationCredentials | None = Depends(bearer)) -> dict:
         """The signed-in user. If their company requires two-factor and this session didn't
         use it, only the account pages (below) are reachable."""
-        return _user(creds, enforce_2fa=True)
+        return _user(request, creds, enforce_2fa=True)
 
-    def account_user(creds: HTTPAuthorizationCredentials | None = Depends(bearer)) -> dict:
+    def account_user(request: Request, creds: HTTPAuthorizationCredentials | None = Depends(bearer)) -> dict:
         """For the pages a user needs to set up two-factor or change their password."""
-        return _user(creds, enforce_2fa=False)
+        return _user(request, creds, enforce_2fa=False)
+
+    def start_session(response: Response, result: dict) -> dict:
+        """When a sign-in step produced an access token, also put it in the session cookie.
+        (The token stays in the JSON too, for programs that use the API directly.)"""
+        if isinstance(result, dict) and result.get("access_token"):
+            response.set_cookie(session_cookie, result["access_token"], max_age=SESSION_TTL, path="/",
+                                httponly=True, secure=https, samesite="strict")
+        return result
 
     def require(*roles: str):
         def dependency(user: dict = Depends(current_user)) -> dict:
@@ -205,15 +268,30 @@ def create_app(settings: Settings | None = None, db: Database | None = None,
             # Behind a proxy that ends TLS, uvicorn --proxy-headers sets the scheme from
             # X-Forwarded-Proto, so only real plain-HTTP requests are redirected.
             return RedirectResponse(str(request.url.replace(scheme="https")), status_code=308)
+        if request.method not in SAFE_METHODS:
+            # Cross-site request forgery: another site can make a visitor's browser send a
+            # form here, cookie included. The session cookie is SameSite=Strict, which stops
+            # that in current browsers; as a second lock, a request that relies on the cookie
+            # must carry a header other sites can't add, and come from this site.
+            origin = request.headers.get("origin")
+            if origin and origin.rstrip("/") not in (str(request.base_url).rstrip("/"), settings.public_url):
+                return JSONResponse({"detail": "Request from another site refused."}, status_code=403)
+            uses_cookie = session_cookie in request.cookies and "authorization" not in request.headers
+            if uses_cookie and request.headers.get("x-requested-with") != "fetch":
+                return JSONResponse({"detail": "Missing X-Requested-With header."}, status_code=403)
         response = await call_next(request)
         if settings.force_https:
             response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
-        response.headers.setdefault("X-Content-Type-Options", "nosniff")
-        response.headers.setdefault("Referrer-Policy", "no-referrer")
-        response.headers.setdefault("X-Frame-Options", "DENY")
-        if request.url.path == "/" or request.url.path.startswith("/app/"):
+        for name, value in SECURITY_HEADERS.items():
+            response.headers.setdefault(name, value)
+        path = request.url.path
+        if path == "/" or path.startswith("/app/"):
             response.headers["Content-Security-Policy"] = APP_CSP
             response.headers["Cache-Control"] = "no-cache"
+        elif path != "/docs":
+            response.headers.setdefault("Content-Security-Policy", API_CSP)
+            # Answers hold company data: never keep them in browser or proxy caches.
+            response.headers.setdefault("Cache-Control", "no-store")
         return response
 
     # ---------------- web app ----------------
@@ -266,15 +344,22 @@ def create_app(settings: Settings | None = None, db: Database | None = None,
             raise http_error(exc) from None
 
     @app.post("/login")
-    def login(body: LoginIn, request: Request) -> dict:
+    def login(body: LoginIn, request: Request, response: Response) -> dict:
         """Step 1. Returns an access token, or {"mfa_required": true, "mfa_token": ...} when
         the user has two-factor on; then send the code to POST /login/2fa."""
-        return run(lambda: accounts.login(body.username, body.password, client_ip(request)))
+        return start_session(response, run(lambda: accounts.login(body.username, body.password, client_ip(request))))
 
     @app.post("/login/2fa")
-    def login_2fa(body: SecondFactorIn, request: Request) -> dict:
+    def login_2fa(body: SecondFactorIn, request: Request, response: Response) -> dict:
         """Step 2: a code from the authenticator app, or a one-time recovery code."""
-        return run(lambda: accounts.login_second_factor(body.mfa_token, body.code, client_ip(request)))
+        return start_session(response, run(lambda: accounts.login_second_factor(body.mfa_token, body.code,
+                                                                                client_ip(request))))
+
+    @app.post("/logout")
+    def logout(response: Response) -> dict:
+        """End the browser session (removes the session cookie)."""
+        response.delete_cookie(session_cookie, path="/", secure=https, httponly=True, samesite="strict")
+        return {"signed_out": True}
 
     @app.get("/auth/providers")
     def sso_providers() -> list[dict]:
@@ -291,10 +376,11 @@ def create_app(settings: Settings | None = None, db: Database | None = None,
 
     @app.get("/auth/{name}/callback", include_in_schema=False)
     def sso_callback(name: str, request: Request) -> RedirectResponse:
-        target = accounts.sso_callback(name, dict(request.query_params), request.cookies.get(sso_cookie),
-                                       client_ip(request))
+        target, token = accounts.sso_callback(name, dict(request.query_params), request.cookies.get(sso_cookie),
+                                              client_ip(request))
         response = RedirectResponse(target, status_code=302)
         response.delete_cookie(sso_cookie, path="/auth/")
+        start_session(response, {"access_token": token})
         response.headers["Cache-Control"] = "no-store"
         return response
 
@@ -326,23 +412,24 @@ def create_app(settings: Settings | None = None, db: Database | None = None,
         return run(lambda: accounts.setup_2fa(user))
 
     @app.post("/me/2fa/enable")
-    def two_factor_enable(body: CodeIn, user: dict = Depends(account_user)) -> dict:
+    def two_factor_enable(body: CodeIn, response: Response, user: dict = Depends(account_user)) -> dict:
         """Confirm with a code from the app. Returns ten recovery codes (shown once) and a new
         access token for a session that counts as two-factor."""
-        return run(lambda: accounts.enable_2fa(user, body.code))
+        return start_session(response, run(lambda: accounts.enable_2fa(user, body.code)))
 
     @app.post("/me/2fa/disable")
-    def two_factor_disable(body: DisableTwoFactorIn, user: dict = Depends(account_user)) -> dict:
-        return run(lambda: accounts.disable_2fa(user, body.password, body.code))
+    def two_factor_disable(body: DisableTwoFactorIn, response: Response, user: dict = Depends(account_user)) -> dict:
+        return start_session(response, run(lambda: accounts.disable_2fa(user, body.password, body.code)))
 
     @app.post("/me/2fa/recovery-codes")
     def two_factor_new_codes(body: CodeIn, user: dict = Depends(current_user)) -> dict:
         return run(lambda: accounts.new_recovery_codes(user, body.code))
 
     @app.post("/me/password")
-    def change_password(body: ChangePasswordIn, user: dict = Depends(account_user)) -> dict:
+    def change_password(body: ChangePasswordIn, response: Response, user: dict = Depends(account_user)) -> dict:
         """Ends every other session; returns a new access token for this one."""
-        return run(lambda: accounts.change_password(user, body.current_password, body.new_password))
+        return start_session(response, run(lambda: accounts.change_password(user, body.current_password,
+                                                                            body.new_password)))
 
     # ---------------- company administration ----------------
     @app.get("/users")

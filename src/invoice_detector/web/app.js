@@ -99,19 +99,22 @@ function toast(message, isError) {
 }
 
 /* ------------------------------------------------------------ API */
-let session = null; // { token, username, role, company, needs2fa }
+// Who is signed in. The sign-in itself is an HttpOnly cookie that this script can't read
+// (so an injected script couldn't steal it either); this is only what the page shows.
+let session = null; // { username, role, company, needs2fa }
 // Requests where a 401 means "wrong password or code", not "session expired".
 const AUTH_PATHS = ["/login", "/password/", "/me/password", "/me/2fa/disable", "/me/2fa/recovery-codes"];
 
-function saveSession() { store.set("session", JSON.stringify(session)); }
-
-/* Finish signing in with an access token: load the profile and remember the session. */
-async function startSession(token) {
-  session = { token };
+/* Load who is signed in (the server knows from the session cookie). */
+async function loadSession() {
   const me = await api("GET", "/me");
-  session = { token, username: me.username, role: me.role, company: me.company,
+  session = { username: me.username, role: me.role, company: me.company,
     needs2fa: me.two_factor_required && !me.signed_in_with_two_factor };
-  saveSession();
+}
+
+/* Finish signing in: the server has set the session cookie. */
+async function startSession() {
+  await loadSession();
   await refreshCount();
   go(session.needs2fa ? "#/security" : "#/dashboard");
 }
@@ -133,10 +136,13 @@ class ApiError extends Error {
   constructor(status, message) { super(message); this.status = status; }
 }
 
+// Sent with every request. Other sites can't add this header to a forged form, and the
+// server refuses cookie-signed changes without it.
+const BASE_HEADERS = { "X-Requested-With": "fetch" };
+
 async function api(method, path, body) {
-  const headers = { Accept: "application/json" };
+  const headers = { ...BASE_HEADERS, Accept: "application/json" };
   if (body !== undefined) headers["Content-Type"] = "application/json";
-  if (session) headers.Authorization = "Bearer " + session.token;
   let res;
   try {
     res = await fetch(path, { method, headers, body: body === undefined ? undefined : JSON.stringify(body) });
@@ -151,7 +157,6 @@ async function api(method, path, body) {
   }
   if (res.status === 403 && res.headers.get("X-Requires-2FA") && session) {
     session.needs2fa = true;
-    saveSession();
     if (location.hash !== "#/security") location.hash = "#/security";
     throw new ApiError(403, "Your company requires two-factor authentication. Set it up to continue.");
   }
@@ -165,8 +170,7 @@ async function api(method, path, body) {
 
 /* Fetch a file with the sign-in token and hand it to the browser as a download. */
 async function download(method, path, body) {
-  const headers = {};
-  if (session) headers.Authorization = "Bearer " + session.token;
+  const headers = { ...BASE_HEADERS };
   if (body !== undefined) headers["Content-Type"] = "application/json";
   let res;
   try {
@@ -212,7 +216,7 @@ function downloadButton(label, method, path, body, cls) {
 
 function signOut(message) {
   session = null;
-  store.del("session");
+  fetch("/logout", { method: "POST", headers: BASE_HEADERS }).catch(() => {});
   if (message) toast(message, true);
   go("#/login");
 }
@@ -333,7 +337,7 @@ function loginView() {
         if (r.recovery_codes_left !== undefined && r.recovery_codes_left < 3) {
           toast(`Only ${r.recovery_codes_left} recovery codes left. Make new ones under Your account.`, true);
         }
-        await startSession(r.access_token);
+        await startSession();
       } catch (ex) {
         fail(ex);
         go.disabled = false;
@@ -355,7 +359,7 @@ function loginView() {
     try {
       const r = await api("POST", "/login", { username: user.value.trim(), password: pass.value });
       if (r.mfa_required) { codeStep(r.mfa_token); return; }
-      await startSession(r.access_token);
+      await startSession();
     } catch (ex) {
       session = null;
       fail(ex);
@@ -448,11 +452,8 @@ function recoveryCodesBox(codes, onDone) {
 async function securityView() {
   const [me, tf] = await Promise.all([api("GET", "/me"), api("GET", "/me/2fa")]);
 
-  function updateToken(token, needs2fa) {
-    session.token = token;
-    session.needs2fa = needs2fa;
-    saveSession();
-  }
+  // The server replaced the session cookie (new sign-in level or new password).
+  function updateSession(needs2fa) { session.needs2fa = needs2fa; }
 
   // ----- two-factor -----
   const twoFactor = h("div", { class: "card" });
@@ -477,8 +478,8 @@ async function securityView() {
             state.required_by_company ? h("span", { class: "muted small" }, "Your company requires two-factor, so it can't be turned off.")
               : h("button", { class: "btn danger", onclick: async () => {
                 try {
-                  const r = await api("POST", "/me/2fa/disable", { password: password ? password.value : null, code: code.value.trim() });
-                  updateToken(r.access_token, false);
+                  await api("POST", "/me/2fa/disable", { password: password ? password.value : null, code: code.value.trim() });
+                  updateSession(false);
                   toast("Two-factor authentication is off");
                   render();
                 } catch (ex) { show(ex); }
@@ -511,7 +512,7 @@ async function securityView() {
         err.classList.add("hidden");
         try {
           const r = await api("POST", "/me/2fa/enable", { code: code.value.trim() });
-          updateToken(r.access_token, false);
+          updateSession(false);
           put(twoFactor, recoveryCodesBox(r.recovery_codes, () => { toast("Two-factor authentication is on"); render(); }));
         } catch (ex) { err.textContent = ex.message; err.classList.remove("hidden"); }
       } }, h("label", { class: "field", for: "tf-confirm" }, "Code from the app", code), err,
@@ -534,8 +535,8 @@ async function securityView() {
       err.classList.add("hidden");
       if (nw.value !== again.value) { err.textContent = "The two new passwords don't match."; err.classList.remove("hidden"); return; }
       try {
-        const r = await api("POST", "/me/password", { current_password: cur.value, new_password: nw.value });
-        updateToken(r.access_token, session.needs2fa);
+        await api("POST", "/me/password", { current_password: cur.value, new_password: nw.value });
+        updateSession(session.needs2fa);
         cur.value = nw.value = again.value = "";
         toast("Password changed. Any other sessions were signed out.");
       } catch (ex) { err.textContent = ex.message; err.classList.remove("hidden"); }
@@ -1123,14 +1124,7 @@ function roleHelp(role) {
 /* ------------------------------------------------------------ start */
 window.addEventListener("hashchange", render);
 document.addEventListener("DOMContentLoaded", async () => {
-  if (location.hash.startsWith("#/sso?")) {
-    // Back from single sign-on: the server put a new session token in the address
-    // fragment (never sent to servers or logged). Take it, then remove it from history.
-    const token = hashParams().get("token");
-    history.replaceState(null, "", "#/dashboard");
-    try { await startSession(token); return; } catch { session = null; }
-  }
-  try { session = JSON.parse(store.get("session") || "null"); } catch { session = null; }
-  if (session) await refreshCount();
+  // Already signed in (session cookie), including straight back from single sign-on?
+  try { await loadSession(); await refreshCount(); } catch { session = null; }
   render();
 });

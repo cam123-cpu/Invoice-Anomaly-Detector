@@ -126,6 +126,33 @@ class ReadAndConvertTests(unittest.TestCase):
             read_table("x.xlsx", b"not really excel")
         with self.assertRaises(FileProblem):
             read_table("x.csv", b"")
+
+    def test_files_must_be_what_their_name_says(self):
+        import zipfile
+        with self.assertRaisesRegex(FileProblem, "isn't an Excel workbook"):
+            read_table("invoices.xlsx", b"MZ\x90\x00 a renamed program")
+        with self.assertRaisesRegex(FileProblem, "isn't text"):
+            read_table("invoices.csv", b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR")
+        with self.assertRaisesRegex(FileProblem, "isn't text"):
+            read_table("invoices.csv", xlsx_bytes(self.ROWS))  # a workbook renamed to .csv
+        other_zip = io.BytesIO()
+        with zipfile.ZipFile(other_zip, "w") as z:
+            z.writestr("readme.txt", "hello")
+        with self.assertRaisesRegex(FileProblem, "isn't an Excel workbook"):
+            read_table("invoices.xlsx", other_zip.getvalue())
+
+    def test_zip_bombs_are_refused_before_opening(self):
+        import zipfile
+        from unittest import mock
+        bomb = io.BytesIO()
+        with zipfile.ZipFile(bomb, "w", zipfile.ZIP_DEFLATED) as z:
+            z.writestr("xl/workbook.xml", "<workbook/>")
+            z.writestr("xl/worksheets/sheet1.xml", b"\x00" * (8 * 1024 * 1024))  # 8 MB of zeros
+        self.assertLess(len(bomb.getvalue()), 64 * 1024)  # tiny on disk
+        # The real limit is 200 MB; a smaller one keeps the test fast.
+        with mock.patch("invoice_detector.importer.MAX_UNZIPPED", 4 * 1024 * 1024):
+            with self.assertRaisesRegex(FileProblem, "too large to read safely"):
+                read_table("invoices.xlsx", bomb.getvalue())
         table = read_table("x.csv", b"Invoice,Vendor,Date,Amount\nA,B,2026-01-05,1\n")
         with self.assertRaisesRegex(FileProblem, "Invoice date"):
             convert(table, {"id": "Invoice", "vendor": "Vendor", "amount": "Amount"})

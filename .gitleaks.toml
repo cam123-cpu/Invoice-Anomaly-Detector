@@ -1,0 +1,14 @@
+# Secret scanning (CI job "secret scan"). Uses gitleaks' built-in rules for API keys, tokens
+# and private keys, plus one for this app's own secrets.
+[extend]
+useDefault = true
+
+[[rules]]
+id = "invoice-detector-secret"
+description = "SECRET_KEY / ENCRYPTION_KEYS / INDEX_KEY / passwords with a real-looking value"
+regex = '''(?i)\b(SECRET_KEY|ENCRYPTION_KEYS|INDEX_KEY|SMTP_PASSWORD|[A-Z_]*CLIENT_SECRET)\s*=\s*["']?([A-Za-z0-9+/=:_-]{20,})'''
+secretGroup = 2
+
+[allowlist]
+description = "Throwaway values that only exist inside the test suite and CI"
+paths = ['''^tests/''']

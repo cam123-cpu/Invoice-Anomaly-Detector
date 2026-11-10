@@ -83,6 +83,7 @@ class Settings:
     mail_dir: str | None = None          # development: write emails to this folder instead
     sso_providers: dict = field(default_factory=dict, repr=False)
     oidc_allow_http: bool = False        # testing only: allow a non-HTTPS identity provider
+    api_docs: bool = True                # the interactive API pages at /docs; off in production
 
     @property
     def email_enabled(self) -> bool:
@@ -116,6 +117,7 @@ class Settings:
             mail_dir=env("MAIL_DIR"),
             sso_providers=_providers(),
             oidc_allow_http=env("OIDC_ALLOW_HTTP", "0") == "1",
+            api_docs=env("API_DOCS", "1") == "1",
         )
 
 

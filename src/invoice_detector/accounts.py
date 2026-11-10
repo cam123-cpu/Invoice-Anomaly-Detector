@@ -49,9 +49,11 @@ class Accounts:
         self.sso = sso_clients if sso_clients is not None else {
             name: OIDCClient(p, allow_http=settings.oidc_allow_http) for name, p in settings.sso_providers.items()}
         self.sealer = StateSealer(settings.secret_key)
-        self.login_limiter = RateLimiter()
+        self.login_limiter = RateLimiter()                 # 5 wrong passwords per address + username
+        self.address_limiter = RateLimiter(max_attempts=30)  # 30 per address, any usernames (bots)
         self.code_limiter = RateLimiter()
-        self.reset_limiter = RateLimiter()
+        self.reset_limiter = RateLimiter()                 # reset emails per address
+        self.reset_account_limiter = RateLimiter(max_attempts=3, window=3600, lockout=3600)  # per account
         self._pepper = hmac.new(settings.secret_key.encode(), b"recovery-codes", hashlib.sha256).digest()
 
     # ------------------------------------------------------------ helpers
@@ -85,12 +87,14 @@ class Accounts:
     # ------------------------------------------------------------ password sign-in
     def login(self, username: str, password: str, ip: str) -> dict:
         key = f"{ip}:{username.lower()}"
+        self._check_rate(self.address_limiter, ip)
         self._check_rate(self.login_limiter, key)
         user = self.db.auth_lookup(username)
         usable = user is not None and user["password_hash"] != SSO_ONLY
         ok = verify_password(password, user["password_hash"] if usable else DUMMY_HASH)
         if not (usable and ok):
             self.login_limiter.record_failure(key)
+            self.address_limiter.record_failure(ip)
             if user:
                 self.db.audit(user["org_id"], user["username"], "login_failed", f"from {ip}")
             raise AccountError(401, "Wrong username or password.")
@@ -236,7 +240,13 @@ class Accounts:
         self._check_rate(self.reset_limiter, ip)
         self.reset_limiter.record_failure(ip)  # count every request from this address
         user = self.db.auth_lookup(username.strip())
+        account = f"reset:{(user or {}).get('username', '')}"
+        try:
+            self.reset_account_limiter.check(account)
+        except RateLimitError:
+            return {"email_enabled": True}  # same answer; just no more emails to this person
         if user and "@" in user["username"] and user["password_hash"] != SSO_ONLY:
+            self.reset_account_limiter.record_failure(account)  # at most 3 emails an hour each
             token = self.signer.issue({"sub": user["username"], "org": user["org_id"],
                                        "pwf": password_fingerprint(user["password_hash"])}, "reset", RESET_TTL)
             link = f"{self.settings.public_url}/#/reset?token={token}"
@@ -292,9 +302,9 @@ class Accounts:
             raise AccountError(502, str(exc)) from None
         return url, self.sealer.seal(attempt)
 
-    def sso_callback(self, name: str, query: dict, cookie: str | None, ip: str) -> str:
-        """Where to send the browser next: the app with a new session, or the sign-in page
-        with an explanation."""
+    def sso_callback(self, name: str, query: dict, cookie: str | None, ip: str) -> tuple[str, str | None]:
+        """(Where to send the browser next, new access token or None). The API puts the token
+        in the session cookie, so it never appears in an address."""
         try:
             client = self.sso.get(name)
             if client is None:
@@ -312,6 +322,6 @@ class Accounts:
             if user is None:
                 raise SSOError(f"There's no account for {email}. Ask your company's admin to add you.")
             self.db.audit(user["org_id"], user["username"], "login", f"single sign-on ({client.provider.label}), from {ip}")
-            return "/#/sso?token=" + quote(self._token(user, user["org_id"], mfa=True))
+            return "/#/dashboard", self._token(user, user["org_id"], mfa=True)
         except SSOError as exc:
-            return "/#/login?error=" + quote(str(exc))
+            return "/#/login?error=" + quote(str(exc)), None

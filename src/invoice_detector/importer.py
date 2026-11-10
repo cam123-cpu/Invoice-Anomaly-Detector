@@ -19,6 +19,8 @@ FIELD_LABELS = {"id": "Invoice number", "vendor": "Vendor", "amount": "Amount",
                 "date": "Invoice date", "bank_account": "Bank account (optional)"}
 MAX_BYTES = 10 * 1024 * 1024
 MAX_ROWS = 50_000
+MAX_UNZIPPED = 200 * 1024 * 1024   # an .xlsx is a zip; refuse ones that expand to more than this
+MAX_ZIP_ENTRIES = 2_000
 ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 _./#:-]{0,63}$")
 
 # Normalized header names (lowercase letters and digits only) for each field.
@@ -98,10 +100,39 @@ def _has_data(rows: list[list]) -> bool:
     return sum(1 for r in rows if sum(_present(v) for v in r) >= 2) >= 2
 
 
+def _check_xlsx(data: bytes) -> None:
+    """An .xlsx file is a zip archive. Check that before handing it to the Excel library, and
+    refuse 'zip bombs': small files that expand to gigabytes and exhaust memory."""
+    import zipfile
+    if not data.startswith(b"PK\x03\x04"):
+        raise FileProblem("This file is named .xlsx but isn't an Excel workbook. "
+                          "Open it in Excel and save it as .xlsx or .csv.")
+    try:
+        with zipfile.ZipFile(io.BytesIO(data)) as z:
+            entries = z.infolist()
+    except zipfile.BadZipFile:
+        raise FileProblem("This Excel file is damaged. Re-save it as .xlsx or .csv.") from None
+    if len(entries) > MAX_ZIP_ENTRIES or sum(e.file_size for e in entries) > MAX_UNZIPPED:
+        raise FileProblem("This Excel file is too large to read safely. Split it into smaller files.")
+    if not any(e.filename == "xl/workbook.xml" for e in entries):
+        raise FileProblem("This file is named .xlsx but isn't an Excel workbook.")
+
+
+def _check_text(data: bytes) -> None:
+    """A CSV file is text. Refuse binary files (images, programs, renamed workbooks)."""
+    if data.startswith((b"\xff\xfe", b"\xfe\xff")):  # UTF-16 text has zero bytes; that's fine
+        return
+    if b"\x00" in data[:65536] or data.startswith(b"PK\x03\x04"):
+        raise FileProblem("This file is named .csv but isn't text. If it's an Excel file, "
+                          "give it the .xlsx ending or save it as CSV from Excel.")
+
+
 def _read_xlsx(data: bytes, sheet: str | None = None) -> tuple[list[list], str | None, list[str]]:
     """Rows of the chosen sheet (or the first sheet with a table, active sheet first),
     its name, and the names of all sheets that contain a table."""
     from openpyxl import load_workbook
+
+    _check_xlsx(data)
 
     try:
         wb = load_workbook(io.BytesIO(data), read_only=True, data_only=True)
@@ -162,6 +193,7 @@ def read_table(filename: str, data: bytes, sheet: str | None = None) -> Table:
         raise FileProblem("Old .xls files aren't supported. In Excel, use File > Save As and "
                           "choose .xlsx or .csv.")
     elif name.endswith((".csv", ".txt", ".tsv")):
+        _check_text(data)
         rows, sheet = _read_csv(data), None
     else:
         raise FileProblem("Upload an Excel (.xlsx) or CSV (.csv) file.")
