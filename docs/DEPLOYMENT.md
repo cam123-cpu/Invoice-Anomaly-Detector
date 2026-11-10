@@ -57,7 +57,7 @@ open.
 
 ```bash
 git clone https://github.com/<you>/<repo>.git invoice-detector && cd invoice-detector
-python3 -m pip install -e .            # or: PYTHONPATH=src python3 -m invoice_detector.cli ...
+python3 -m pip install -e .            # Python 3.11+; only needed to create the secrets
 python3 -m invoice_detector.cli init-deploy deploy/secrets
 ```
 

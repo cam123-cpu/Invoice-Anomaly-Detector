@@ -16,7 +16,7 @@ INDEX_KEY = secrets.token_bytes(32)
 ADMIN_URL = os.environ.get("TEST_DATABASE_ADMIN_URL")
 APP_URL = os.environ.get("TEST_DATABASE_URL")
 USING_POSTGRES = bool(ADMIN_URL and APP_URL)
-TABLES = ("orgs", "users", "invoices", "anomalies", "reviews", "audit_log")
+TABLES = ("orgs", "users", "invoices", "anomalies", "reviews", "audit_log")  # per-company tables
 
 
 def make_settings(api_key=None):
@@ -30,7 +30,7 @@ def make_dbs():
     if USING_POSTGRES:
         admin = Database(ADMIN_URL, KEYS, INDEX_KEY)
         admin.migrate()
-        admin.conn.execute(f"TRUNCATE {', '.join(TABLES)} RESTART IDENTITY")
+        admin.conn.execute(f"TRUNCATE {', '.join(TABLES + ('meta',))} RESTART IDENTITY")
         return admin, Database(APP_URL, KEYS, INDEX_KEY)
     db = Database(":memory:", KEYS, INDEX_KEY)
     return db, db

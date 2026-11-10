@@ -67,10 +67,13 @@ jobs:
       - name: Test against PostgreSQL
         run: pytest -v -rs
       - name: CLI end to end on PostgreSQL
+        # A fresh database: the tests above leave their own keys' check value behind, and the
+        # CLI rightly refuses to use different keys on that data.
         env:
-          DATABASE_ADMIN_URL: postgresql://postgres:owner-pw@localhost:5432/invoices
-          DATABASE_URL: postgresql://invoice_app:app-pw@localhost:5432/invoices
+          DATABASE_ADMIN_URL: postgresql://postgres:owner-pw@localhost:5432/cli_e2e
+          DATABASE_URL: postgresql://invoice_app:app-pw@localhost:5432/cli_e2e
         run: |
+          PGPASSWORD=owner-pw psql -h localhost -U postgres -d invoices -c "CREATE DATABASE cli_e2e"
           python -m invoice_detector.cli gen-keys > .env
           python -m invoice_detector.cli migrate
           python -m invoice_detector.cli create-org "CI Company"
@@ -123,7 +126,9 @@ jobs:
         with:
           python-version: "3.12"
       - name: Generate secret files
-        run: PYTHONPATH=src python -m invoice_detector.cli init-deploy deploy/secrets
+        run: |
+          pip install -e .
+          python -m invoice_detector.cli init-deploy deploy/secrets
       - name: Start the stack
         run: |
           $COMPOSE up -d --build
