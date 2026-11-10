@@ -65,6 +65,10 @@ class ApiTests(unittest.TestCase):
         rules = {a["rule"] for a in self.client.get("/anomalies", headers=admin).json()}
         self.assertIn("duplicate", rules)
         self.assertIn("INV-2", self.client.post("/explain", headers=admin).json()["explanation"])
+        queue = self.client.get("/review-queue", headers=admin).json()
+        self.assertEqual(queue[0]["invoice_id"], "INV-2")
+        self.assertIn("duplicate", queue[0]["rules"])
+        self.assertEqual(self.client.get("/review-queue").status_code, 401)
 
 
 if __name__ == "__main__":
