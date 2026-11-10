@@ -1,3 +1,4 @@
+import base64
 import importlib.util
 import unittest
 
@@ -148,6 +149,65 @@ class ApiTests(DbTestCase):
         self.assertEqual(rules, ["below_threshold"])
         bob = self.auth("bob", PW_B)
         self.assertEqual(self.client.get("/settings", headers=bob).json(), {"approval_threshold": 10000})
+
+    def upload(self, headers, text, filename="export.csv", **extra):
+        body = {"filename": filename, "content_base64": base64.b64encode(text.encode()).decode(), **extra}
+        return self.client.post("/import/preview" if "mapping" not in extra else "/import", json=body, headers=headers)
+
+    def test_file_import_flow(self):
+        admin = self.auth("alice", PW_A)
+        csv_text = ("Invoice #,Supplier,Invoice Date,Total\n"
+                    "Q1/001,Northwind,03/02/2026,\"$1,250.00\"\n"
+                    "Q1/002,Northwind,03/02/2026,1250\n"
+                    "Q1/003,Contoso,not a date,10\n")
+        preview = self.upload(admin, csv_text).json()
+        self.assertEqual(preview["mapping"]["vendor"], "Supplier")
+        self.assertTrue(preview["date_order_ambiguous"])
+        mapping = preview["mapping"]
+        result = self.upload(admin, csv_text, mapping=mapping, date_order="DMY").json()
+        self.assertEqual((result["added"], result["error_count"]), (2, 1))
+        self.assertEqual(result["errors"][0]["row"], 4)
+        self.assertEqual(result["detection"]["flagged_from_file"], 1)  # the duplicate
+        again = self.upload(admin, csv_text, mapping=mapping, date_order="DMY").json()
+        self.assertEqual((again["added"], again["already_stored"], again["detection"]), (0, 2, None))
+        stored = {i["id"]: i["invoice_date"] for i in self.client.get("/invoices", headers=admin).json()}
+        self.assertEqual(stored, {"Q1/001": "2026-02-03", "Q1/002": "2026-02-03"})
+        # ids with slashes work in the per-invoice URLs too
+        self.assertEqual(self.client.post("/review/Q1%2F002", json={"verdict": "confirmed"}, headers=admin).status_code, 200)
+        self.assertEqual(self.client.get("/invoices/Q1%2F001/bank", headers=admin).json()["bank_account"], None)
+
+        summary = self.client.get("/summary", headers=admin).json()
+        self.assertEqual((summary["invoices"], summary["confirmed"], summary["company"]), (2, 1, "Company A"))
+        self.assertIsNotNone(summary["last_import"])
+        queue = self.client.get("/review-queue", headers=admin).json()
+        self.assertEqual((queue[0]["vendor"], queue[0]["amount"], queue[0]["date"]), ("Northwind", 1250.0, "2026-02-03"))
+
+        bad_map = dict(mapping, date=None)
+        self.assertIn("Invoice date", self.upload(admin, csv_text, mapping=bad_map).json()["detail"])
+        self.assertEqual(self.upload(admin, "x", filename="notes.pdf").status_code, 422)
+        broken = {"filename": "a.csv", "content_base64": "not base64!!"}
+        self.assertEqual(self.client.post("/import/preview", json=broken, headers=admin).status_code, 422)
+        auditor = self.auth("audit1", "auditor-password-123")
+        self.assertEqual(self.upload(auditor, csv_text).status_code, 403)
+        bob = self.auth("bob", PW_B)
+        self.assertEqual(self.client.get("/summary", headers=bob).json()["invoices"], 0)
+
+    def test_web_app_is_served_with_a_strict_policy(self):
+        page = self.client.get("/")
+        self.assertEqual(page.status_code, 200)
+        self.assertIn('src="/app/app.js"', page.text)
+        csp = page.headers["content-security-policy"]
+        for directive in ("default-src 'self'", "script-src 'self'", "frame-ancestors 'none'"):
+            self.assertIn(directive, csp)
+        self.assertNotIn("unsafe-inline", csp)
+        self.assertEqual(page.headers["x-content-type-options"], "nosniff")
+        js = self.client.get("/app/app.js")
+        self.assertEqual((js.status_code, js.headers["content-type"].split(";")[0]), (200, "text/javascript"))
+        self.assertNotIn("innerHTML", js.text)  # all server text is inserted as plain text
+        self.assertEqual(self.client.get("/app/app.css").status_code, 200)
+        for bad in ("/app/index.html", "/app/../db.py", "/app/secret"):
+            self.assertEqual(self.client.get(bad).status_code, 404, bad)
+        self.assertEqual(self.client.get("/health").headers["x-frame-options"], "DENY")
 
 
 if __name__ == "__main__":

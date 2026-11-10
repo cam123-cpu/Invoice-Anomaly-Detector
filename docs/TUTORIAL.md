@@ -1,6 +1,6 @@
 # Tutorial: run it and use it
 
-Part 1 gets you running on one computer in about ten minutes. Part 2 is the production
+Part 1 gets you running on one computer in about ten minutes, using the web app. Part 2 is the production
 setup with PostgreSQL. Part 3 is how a company fits it into its payment process.
 
 Commands are shown for Windows PowerShell. On macOS or Linux, activate the environment with
@@ -26,114 +26,113 @@ pip install -e ".[dev]"
 pytest
 ```
 
-All tests should pass. A few are reported as skipped: those need PostgreSQL and run in Part 2.
+All tests should pass. Some are reported as skipped: those need PostgreSQL (Part 2) or the browser test setup.
 
 > Upgrading from an earlier copy? Start in a fresh folder as above. The old `invoices.db`
 > has no companies in it and cannot be reused.
 
-### 2. Create your secrets, two companies and their users
+### 2. Create your secrets, a company and a login
+
+Run these **one at a time**. `create-user` asks for a password of at least 12 characters, and
+nothing appears while you type, which is normal.
 
 ```powershell
 python -m invoice_detector.cli init
-
 python -m invoice_detector.cli create-org "Acme Inc"
-python -m invoice_detector.cli create-org "Globex"
-
 python -m invoice_detector.cli create-user "Acme Inc" alice admin
-python -m invoice_detector.cli create-user "Globex" bob admin
 ```
 
-Each `create-user` asks for a password of at least 12 characters. Typing stays invisible.
-Usernames are unique across all companies, so in real use make them email addresses.
+Want sample data to explore? Also run `python -m invoice_detector.cli seed "Acme Inc"`, which
+adds 258 made-up invoices with 14 planted problems.
 
-### 3. Load demo data and run detection
-
-```powershell
-python -m invoice_detector.cli seed "Acme Inc"
-python -m invoice_detector.cli detect "Acme Inc"
-```
-
-You get a ranked list like this. The 14 invoices from INV-0245 up are the planted anomalies.
-
-```
-INV-0249     risk  94  bank_account_change, shared_bank_account
-INV-0247     risk  84  amount_outlier, ml_outlier
-INV-0245     risk  80  duplicate
-```
-
-Globex has no invoices yet. That is the point: the two companies share nothing.
-
-### 4. Start the web interface
+### 3. Start the app
 
 ```powershell
 uvicorn invoice_detector.api:create_app --factory --reload
 ```
 
-Open http://127.0.0.1:8000/docs. Leave the terminal running, and press Ctrl+C there to stop.
+Wait for `Uvicorn running on http://127.0.0.1:8000`, then open **http://127.0.0.1:8000** in your
+browser. Leave the terminal window open; press Ctrl+C there to stop the app.
 
-### 5. Log in
+### 4. Sign in
 
-1. Open **POST /login**, click **Try it out**, enter `alice` and her password, then **Execute**.
-2. Copy the long `access_token` value from the response, without the quotes.
-3. Click **Authorize** at the top right, paste it, click **Authorize**, then **Close**.
-4. Run **GET /me**. It shows your username, role and company.
+Enter `alice` and the password you chose. The left-hand menu has everything:
 
-The token lasts one hour. After that you get a 401 and log in again.
+| Page | What it's for |
+|---|---|
+| **Dashboard** | How many invoices you have, how many need review, how many are high risk, and how accurate the flags have been |
+| **Review queue** | Flagged invoices, highest risk first, with the reasons. This is where the work happens |
+| **Upload invoices** | Add invoices from an Excel or CSV export |
+| **Invoices** | Everything stored. Admins can reveal a bank account, and each reveal is logged |
+| **Activity log** | Who signed in, imported, reviewed or viewed bank details (admins and auditors) |
+| **Settings** | Your company's approval threshold, and adding colleagues (admins) |
+
+### 5. Upload a file
+
+1. Export invoices from your accounting system or save your spreadsheet as **.xlsx** or **.csv**.
+   One row per invoice, with at least an invoice number, vendor, amount and date. A bank account
+   column is optional but switches on the bank checks.
+2. Open **Upload invoices** and drop the file on the page.
+3. **Match the columns.** The app guesses which of your columns is which, from names like
+   "Invoice #", "Supplier", "Invoice Date" or "Total". Check each one and fix any wrong guess.
+4. **Check the date format.** If your dates look like 03/05/2026, say whether that means
+   March 5 or 3 May. The app works it out when the file settles it, and warns you when it can't.
+5. Click **Import invoices**. You'll see how many were added, how many were already stored, and
+   every row that couldn't be used, with the reason. Detection runs automatically afterwards.
+
+The app handles what real exports look like: title rows above the header, amounts like
+`$1,250.00` or `1.250,00 €`, Excel dates, blank lines and totals rows. It remembers your column
+matching, so next month's export from the same system needs no changes. Re-uploading a file is
+safe, because invoices already stored are skipped.
 
 ### 6. Work the review queue
 
-| Step | Endpoint | What to look for |
-|---|---|---|
-| Run the checks | `POST /detect` | Counts of invoices checked and flagged |
-| See the queue | `GET /review-queue` | Invoices ranked by `risk`, with `rules`, `details` and `status` |
-| Decide | `POST /review/{invoice_id}` | Body `{"verdict": "confirmed"}` for a real problem, or `"dismissed"` for a false alarm |
-| See the effect | `GET /review-queue` | Dismissed invoices drop out. Add `include_dismissed=true` to see them |
-| Measure | `GET /metrics` | Precision per rule from your decisions, and each rule's current `weight` |
+Each row shows a **risk score** from 0 to 100, the invoice, and coloured tags saying why it was
+flagged. Click a row for the full explanation, then decide:
 
-Try it: dismiss INV-0255 (a round amount) and INV-0256 (a weekend date), then confirm INV-0245.
-`GET /metrics` now shows `round_amount` and `weekend_invoice` with a lower `weight` than their
-`base_weight`. The more a rule's flags are dismissed at your company, the less it counts
-towards risk. It takes several reviews to move a weight much, by design.
+- **Confirm** if it's a real problem, such as a duplicate payment or a changed bank account you
+  didn't expect.
+- **Dismiss** if it's a false alarm.
 
-### 7. See that companies are isolated
+Decided invoices leave the **Open** tab; the other tabs show them again, and you can change your
+mind. Your decisions teach the app: checks that keep raising false alarms at your company count
+for less from then on, and the Dashboard shows how each check is performing.
 
-1. Click **Authorize**, then **Logout**.
-2. Log in as `bob` and authorize with his token.
-3. `GET /invoices` and `GET /review-queue` return empty lists.
-4. `GET /invoices/INV-0245/bank` returns 404. Bob cannot reach Acme's data even by exact id.
+**Run detection** at the top of the queue re-checks everything, for example after you change the
+approval threshold in Settings.
 
-### 8. Everything else on the page
+### 7. Add colleagues
 
-| Endpoint | Who | Use |
-|---|---|---|
-| `POST /invoices` | admin, accountant | Add one invoice |
-| `POST /invoices/bulk` | admin, accountant | Add up to 1,000 at once. Existing ids are skipped |
-| `GET /invoices` | everyone | List invoices. Bank details are never included |
-| `GET /invoices/{id}/bank` | admin | Decrypt one bank account. Each use is written to the audit log |
-| `GET /anomalies` | everyone | Every individual flag |
-| `POST /explain` | everyone | Plain-English summary of the top flags |
-| `GET` / `PUT /settings` | everyone / admin | Your company's approval threshold, used by two of the rules |
-| `GET` / `POST /users` | admin | List or add users in your own company |
-| `GET /audit` | admin, auditor | Who logged in, imported, ran detection, reviewed or viewed bank data |
+In **Settings**, an admin adds people with a temporary password and one of three roles:
 
-Roles: an **auditor** can only read. An **accountant** can also add invoices, run detection and
-review. An **admin** can also manage users and settings and view bank accounts.
+| Role | Can |
+|---|---|
+| Auditor | See everything except bank accounts. Can't change anything |
+| Accountant | Also upload, run detection and review flags |
+| Admin | Also manage people and settings, and reveal bank accounts |
 
-### 9. Use your own invoices
+### 8. Add a second company
 
-Make a CSV with these columns. The date must be `yyyy-mm-dd`, and `bank_account` is optional.
-
-```csv
-id,vendor,amount,date,bank_account
-INV-1001,Acme Supplies,480.25,2026-03-02,DE89370400440532013000
-```
+Each company's data is completely separate. To see it for yourself:
 
 ```powershell
-python -m invoice_detector.cli import-csv "Globex" invoices.csv
-python -m invoice_detector.cli detect "Globex"
+python -m invoice_detector.cli create-org "Globex"
+python -m invoice_detector.cli create-user "Globex" bob admin
 ```
 
-Rows with a bad amount or date, and ids that are already stored, are skipped and counted.
+Sign out, sign in as `bob`, and Globex starts empty. Nothing from Acme is visible, even by
+typing an invoice address directly.
+
+### 9. Without the browser
+
+The same steps work from the command line, which is handy for scheduled jobs:
+
+```powershell
+python -m invoice_detector.cli import "Acme Inc" march-invoices.xlsx
+python -m invoice_detector.cli detect "Acme Inc"
+```
+
+The raw API, for connecting other systems, is documented at http://127.0.0.1:8000/docs.
 
 ---
 
@@ -176,7 +175,7 @@ password above, its permissions, and the row-level-security policies.
 
 ### 4. Carry on exactly as in Part 1
 
-`create-org`, `create-user`, `seed`, `detect` and `uvicorn` all work the same way.
+`create-org`, `create-user`, `uvicorn` and the web app all work the same way.
 
 ### 5. Prove the isolation yourself
 
@@ -212,13 +211,14 @@ into another company, and refuses to let the role switch the protection off.
 
 ## Part 3: fitting it into a company's process
 
-1. **Feed it.** Export new invoices from the ERP or accounting system each night and load them
-   with `import-csv`, or have the ERP send them to `POST /invoices/bulk`.
-2. **Set the approval threshold** with `PUT /settings` to match the company's sign-off policy.
-3. **Run it in shadow mode for a few weeks.** Run `POST /detect` daily and have accounts-payable
-   staff review the queue, without holding any payments yet.
-4. **Read `GET /metrics`.** It shows which rules are right for this company and which are noise.
-   The risk scores adjust on their own as reviews accumulate.
+1. **Feed it.** Upload each week's or month's invoice export on the Upload page. For automatic
+   feeds, a scheduled job can run `cli import`, or another system can send invoices to
+   `POST /invoices/bulk`.
+2. **Set the approval threshold** in Settings to match the company's sign-off policy.
+3. **Run it in shadow mode for a few weeks.** Have accounts-payable staff work the review queue
+   after each upload, without holding any payments yet.
+4. **Watch the Dashboard.** "How each check is performing" shows which checks are right for this
+   company and which are noise. The risk scores adjust on their own as reviews accumulate.
 5. **Go live.** Before each payment run, run detection and hold anything open in the queue
    above a risk level the team agrees on, until someone has reviewed it.
 6. **Keep people deciding.** A flag means "look at this", never "this is fraud". Nothing in this
@@ -248,6 +248,9 @@ for item in api.get("/review-queue").json():
 | `Missing required environment variable` | Run `python -m invoice_detector.cli init` in the project folder |
 | `This database file is from an older version` | Delete `invoices.db`, then redo steps 2 and 3 of Part 1 |
 | `No company named ...` | Create it with `create-org`, and use quotes if the name has spaces |
-| 401 on every request | The token expired or was not pasted into **Authorize**. Log in again |
-| 429 on login | Five wrong passwords. Wait 15 minutes or restart the server |
+| `Password too short` straight away | Commands were pasted as a block, so the next line was taken as the password. Run `create-user` on its own |
+| The page won't open | The `uvicorn` window must stay open while you use the app. Start it again |
+| "Your session expired" | Sign-ins last one hour. Sign in again |
+| "Too many attempts" on sign-in | Five wrong passwords. Wait 15 minutes or restart the app |
+| An upload says ".xls isn't supported" | In Excel, use File > Save As and choose .xlsx or .csv |
 | A package fails to build during install | Use Python 3.11 to 3.13. The newest Python release may not have builds for every library yet |

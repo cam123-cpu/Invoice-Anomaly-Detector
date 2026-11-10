@@ -84,7 +84,10 @@ class CliTests(unittest.TestCase):
                     "A1,Acme,100.50,2026-01-05,ACCT1\n")
         self.assertEqual(cli.main(["import-csv", "Acme Inc", "in.csv"]), 0)
         db = self.open_db()
-        self.assertEqual([r["id"] for r in db.list_invoices(db.org_id_by_name("Acme Inc"))], ["A1"])
+        self.assertEqual([r["id"] for r in db.list_invoices(db.org_id_by_name("Acme Inc"))],
+                         ["A1", "A3"])  # A2 has a bad amount; the second A1 is a repeat
+        self.assertEqual(cli.main(["import", "Acme Inc", "missing.xlsx"]), 1)
+        self.assertEqual(cli.main(["import", "Nobody", "in.csv"]), 1)
 
     def test_old_database_format_gets_a_clear_error(self):
         import sqlite3

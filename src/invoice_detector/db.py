@@ -184,6 +184,49 @@ class Database:
                 "bank_idx, created_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                 (org_id, inv_id, vendor, amount, invoice_date, bank_enc, bank_idx, created_by))
 
+    def add_invoices(self, org_id: str, invoices: list[dict], created_by: str) -> list[str]:
+        """Insert many invoices in one transaction. Returns the ids that were already
+        stored (and so were skipped); everything else was added."""
+        vault = self.vault(org_id)
+        rows = []
+        for inv in invoices:
+            bank = inv.get("bank_account")
+            rows.append((org_id, inv["id"], inv["vendor"], inv["amount"], inv["date"],
+                         vault.encrypt(bank, f"invoices.bank:{org_id}:{inv['id']}") if bank else None,
+                         vault.blind_index(normalize_account(bank)) if bank else None, created_by))
+        existing = []
+        query = ("INSERT INTO invoices (org_id, id, vendor, amount, invoice_date, bank_enc, bank_idx, "
+                 "created_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (org_id, id) DO NOTHING")
+        if self.is_postgres:
+            query = query.replace("?", "%s")
+        with self._tx(org_id):
+            for row in rows:
+                if self.conn.execute(query, row).rowcount == 0:
+                    existing.append(row[1])
+        return existing
+
+    def get_invoices(self, org_id: str, ids: list[str]) -> dict[str, dict]:
+        found: dict[str, dict] = {}
+        ids = list(dict.fromkeys(ids))
+        for start in range(0, len(ids), 500):
+            chunk = ids[start:start + 500]
+            marks = ", ".join("?" * len(chunk))
+            with self._tx(org_id) as run:
+                for r in run(f"SELECT id, vendor, amount, invoice_date FROM invoices "
+                             f"WHERE org_id = ? AND id IN ({marks})", (org_id, *chunk)):
+                    found[r["id"]] = r
+        return found
+
+    def count_invoices(self, org_id: str) -> int:
+        with self._tx(org_id) as run:
+            return run("SELECT count(*) AS n FROM invoices WHERE org_id = ?", (org_id,))[0]["n"]
+
+    def last_audit(self, org_id: str, action: str) -> dict | None:
+        with self._tx(org_id) as run:
+            rows = run("SELECT at, username, detail FROM audit_log WHERE org_id = ? AND action = ? "
+                       "ORDER BY id DESC LIMIT 1", (org_id, action))
+        return rows[0] if rows else None
+
     def list_invoices(self, org_id: str, sort: str = "invoice_date", limit: int = 50) -> list[dict]:
         if sort not in SORTABLE:
             raise ValueError("Invalid sort column")

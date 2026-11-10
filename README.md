@@ -7,6 +7,9 @@ seeing only its own data. Twelve signals (eleven audit rules plus an Isolation F
 risk-ranked review queue, and each company's review decisions tune the scoring for that company.
 It produces signals, not proof of fraud.
 
+It comes with a **web app** for accounts-payable teams: upload an Excel or CSV export, match its
+columns once, and work a ranked review queue with Confirm and Dismiss buttons.
+
 **New here? Follow the [tutorial](docs/TUTORIAL.md).**
 
 ## What it detects
@@ -101,13 +104,29 @@ pip install -e ".[dev]"
 python -m invoice_detector.cli init                       # creates .env with fresh secrets
 python -m invoice_detector.cli create-org "Acme Inc"
 python -m invoice_detector.cli create-user "Acme Inc" alice admin
-python -m invoice_detector.cli seed "Acme Inc"            # synthetic invoices with planted anomalies
-python -m invoice_detector.cli detect "Acme Inc"          # prints the ranked review queue
+python -m invoice_detector.cli seed "Acme Inc"            # optional: synthetic invoices with planted anomalies
 uvicorn invoice_detector.api:create_app --factory --reload
 ```
 
-Then open http://127.0.0.1:8000/docs. The [tutorial](docs/TUTORIAL.md) walks through the web
-interface, loading your own CSV, the PostgreSQL setup and how to fit this into a payment process.
+Then open http://127.0.0.1:8000 and sign in. The [tutorial](docs/TUTORIAL.md) walks through
+uploading your own files, the review queue, the PostgreSQL setup and how to fit this into a
+payment process. The raw API is documented at http://127.0.0.1:8000/docs.
+
+## The web app
+
+| Page | What it does |
+|---|---|
+| Dashboard | Invoices, open and high-risk flags, confirmed problems, false alarms, flag accuracy, and how each check is performing |
+| Review queue | Flagged invoices by risk with reasons; Confirm or Dismiss each one |
+| Upload invoices | Excel (.xlsx) or CSV; suggested column matching, date-format detection, per-row error report, remembered mappings |
+| Invoices | Search and sort; admins can reveal a bank account (logged) |
+| Activity log | The company's audit trail |
+| Settings | Approval threshold, people and roles |
+
+It is plain HTML, CSS and JavaScript served by the API, with no third-party scripts, under a strict
+Content-Security-Policy. Uploaded text is always displayed as text, never run. CI tests it in a
+real browser (Chromium) against the real server, including a file with a hostile vendor name,
+role restrictions, company isolation and a phone-sized screen.
 
 ## API
 
@@ -115,7 +134,9 @@ interface, loading your own CSV, the PostgreSQL setup and how to fit this into a
 |---|---|---|
 | `POST /login` | anyone | Returns a bearer token (rate limited) |
 | `GET /me` | any role | Your username, role and company |
+| `POST /import/preview`, `POST /import` | admin, accountant | Read an Excel/CSV file and suggest a column mapping; import it |
 | `POST /invoices`, `POST /invoices/bulk` | admin, accountant | Add one invoice, or up to 1,000 |
+| `GET /summary` | any role | Dashboard numbers |
 | `GET /invoices` | any role | List invoices (no bank data) |
 | `GET /invoices/{id}/bank` | admin | Decrypt one bank account (audited) |
 | `POST /detect` | admin, accountant | Run detection and store the flags |
@@ -140,16 +161,17 @@ ruff check .
 Tests cover each detection rule, a quality bar on synthetic data (so a threshold change that
 hurts precision or recall fails the build), feedback learning, tenant isolation, password
 hashing, token tampering and expiry, rate-limit lockouts, encryption, SQL-injection strings,
-CSV import and the API. To include the PostgreSQL tests, see part 2 of the tutorial.
+Excel/CSV parsing, the API and the web app in a real browser. To include the PostgreSQL tests, see part 2 of the tutorial.
 
 ## Layout
 
 ```
-src/invoice_detector/   detection, evaluate, demo, api, cli, db, schema, crypto, security, config, explain
-tests/                  unit tests (unittest style, run by pytest)
+src/invoice_detector/   detection, evaluate, demo, importer, api, cli, db, schema, crypto, security, config, explain
+src/invoice_detector/web/  the web app (index.html, app.js, app.css)
+tests/                  unit tests (unittest style, run by pytest); tests/e2e is the browser test
 docs/TUTORIAL.md        step-by-step guide
 prototypes/             the original Gleam version
-.github/workflows/      CI: lint, tests on Linux, Windows and PostgreSQL, Docker build, dependency audit
+.github/workflows/      CI: lint, tests on Linux, Windows and PostgreSQL, browser test, Docker build, dependency audit
 ```
 
 ## Docker
