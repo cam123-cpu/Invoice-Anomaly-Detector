@@ -100,8 +100,9 @@ class ApiTests(DbTestCase):
         new = {"username": "carol", "password": "carol-password-123", "role": "accountant"}
         self.assertEqual(self.client.post("/users", json=new, headers=alice).status_code, 201)
         self.assertEqual(self.client.post("/users", json=new, headers=alice).status_code, 409)
-        self.assertEqual(self.client.get("/me", headers=self.auth("carol", "carol-password-123")).json(),
-                         {"username": "carol", "role": "accountant", "company": "Company A"})
+        me = self.client.get("/me", headers=self.auth("carol", "carol-password-123")).json()
+        self.assertEqual((me["username"], me["role"], me["company"], me["two_factor_enabled"]),
+                         ("carol", "accountant", "Company A", False))
         bob_users = [u["username"] for u in self.client.get("/users", headers=self.auth("bob", PW_B)).json()]
         self.assertEqual(bob_users, ["bob"])
 
@@ -146,12 +147,12 @@ class ApiTests(DbTestCase):
         self.assertEqual(self.client.get("/anomalies", headers=admin).json(), [])
         put = self.client.put("/settings", json={"approval_threshold": 500}, headers=admin)
         self.assertEqual(put.status_code, 200)
-        self.assertEqual(self.client.get("/settings", headers=admin).json(), {"approval_threshold": 500})
+        self.assertEqual(self.client.get("/settings", headers=admin).json(), {"approval_threshold": 500, "require_2fa": False})
         self.client.post("/detect", headers=admin)
         rules = [a["rule"] for a in self.client.get("/anomalies", headers=admin).json()]
         self.assertEqual(rules, ["below_threshold"])
         bob = self.auth("bob", PW_B)
-        self.assertEqual(self.client.get("/settings", headers=bob).json(), {"approval_threshold": 10000})
+        self.assertEqual(self.client.get("/settings", headers=bob).json(), {"approval_threshold": 10000, "require_2fa": False})
 
     def upload(self, headers, text, filename="export.csv", **extra):
         body = {"filename": filename, "content_base64": base64.b64encode(text.encode()).decode(), **extra}
@@ -330,3 +331,148 @@ class ApiTests(DbTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+@unittest.skipUnless(HAVE_API_DEPS, "fastapi/httpx not installed")
+class SignInApiTests(DbTestCase):
+    """The HTTP wiring of sign-in; the rules themselves are tested in test_accounts.py."""
+
+    def setUp(self):
+        super().setUp()
+        import tempfile
+        from dataclasses import replace
+
+        from fake_idp import FakeIdP
+        from fastapi.testclient import TestClient
+        from invoice_detector.accounts import Accounts
+        from invoice_detector.api import create_app
+        from invoice_detector.mailer import FolderMailer
+        from invoice_detector.oidc import OIDCClient, Provider
+        from invoice_detector.security import TokenSigner
+
+        self.mail_dir = tempfile.mkdtemp()
+        self.idp = FakeIdP()
+        self.settings = replace(make_settings(), public_url="https://app.example", mail_dir=self.mail_dir)
+        accounts = Accounts(self.app, TokenSigner(self.settings.secret_key), self.settings, FolderMailer(self.mail_dir),
+                            {"sso": OIDCClient(Provider("sso", "Okta", self.idp.issuer, self.idp.client_id, "s"),
+                                               self.idp.get_json, self.idp.post_form)})
+        self.make_app = lambda settings=self.settings: create_app(settings, db=self.app, accounts=accounts)
+        self.client = TestClient(self.make_app(), base_url="https://testserver")
+        self.TestClient = TestClient
+        self.app.create_user(self.a, "alice@acme.example", PW_A, "admin")
+        self.app.create_user(self.a, "dana@acme.example", "dana-password-1234", "accountant")
+
+    def token(self, user="alice@acme.example", password=PW_A):
+        return self.client.post("/login", json={"username": user, "password": password}).json()["access_token"]
+
+    def h(self, token):
+        return {"Authorization": f"Bearer {token}"}
+
+    def code(self, secret, ahead=0):
+        from invoice_detector import totp
+        return totp.code_at(secret.replace(" ", ""), totp.current_step() + ahead)
+
+    def enable(self, token):
+        setup = self.client.post("/me/2fa/setup", headers=self.h(token)).json()
+        done = self.client.post("/me/2fa/enable", json={"code": self.code(setup["secret"])}, headers=self.h(token)).json()
+        return setup["secret"], done
+
+    def test_two_factor(self):
+        token = self.token()
+        self.assertFalse(self.client.get("/me", headers=self.h(token)).json()["two_factor_enabled"])
+        setup = self.client.post("/me/2fa/setup", headers=self.h(token)).json()
+        self.assertTrue(setup["qr"].startswith("data:image/svg+xml;base64,"))
+        bad = self.client.post("/me/2fa/enable", json={"code": "000000"}, headers=self.h(token))
+        self.assertEqual(bad.status_code, 400)
+        done = self.client.post("/me/2fa/enable", json={"code": self.code(setup["secret"])}, headers=self.h(token)).json()
+        self.assertEqual(len(done["recovery_codes"]), 10)
+        first = self.client.post("/login", json={"username": "alice@acme.example", "password": PW_A}).json()
+        self.assertEqual(set(first), {"mfa_required", "mfa_token"})
+        wrong = self.client.post("/login/2fa", json={"mfa_token": first["mfa_token"], "code": "000000"})
+        self.assertEqual(wrong.status_code, 401)
+        ok = self.client.post("/login/2fa", json={"mfa_token": first["mfa_token"], "code": self.code(setup["secret"], 1)})
+        me = self.client.get("/me", headers=self.h(ok.json()["access_token"])).json()
+        self.assertEqual((me["two_factor_enabled"], me["signed_in_with_two_factor"]), (True, True))
+        self.assertEqual(self.client.get("/me/2fa", headers=self.h(ok.json()["access_token"])).json()["recovery_codes_left"], 10)
+
+    def test_company_requires_two_factor(self):
+        admin = self.token()
+        refused = self.client.put("/settings", json={"require_2fa": True}, headers=self.h(admin))
+        self.assertEqual(refused.status_code, 409)  # turn it on for yourself first
+        _, done = self.enable(admin)
+        admin = done["access_token"]
+        self.assertTrue(self.client.put("/settings", json={"require_2fa": True}, headers=self.h(admin)).json()["require_2fa"])
+        dana = self.token("dana@acme.example", "dana-password-1234")
+        blocked = self.client.get("/invoices", headers=self.h(dana))
+        self.assertEqual((blocked.status_code, blocked.headers.get("x-requires-2fa")), (403, "1"))
+        self.assertTrue(self.client.get("/me", headers=self.h(dana)).json()["two_factor_required"])
+        _, dana_done = self.enable(dana)
+        self.assertEqual(self.client.get("/invoices", headers=self.h(dana_done["access_token"])).status_code, 200)
+        users = {u["username"]: u for u in self.client.get("/users", headers=self.h(admin)).json()}
+        self.assertTrue(users["dana@acme.example"]["two_factor"])
+        self.assertEqual(self.client.post("/users/dana@acme.example/2fa/reset", headers=self.h(admin)).status_code, 200)
+        self.assertEqual(self.client.post("/users/nobody@x.example/2fa/reset", headers=self.h(admin)).status_code, 404)
+
+    def test_passwords(self):
+        import os
+        from urllib.parse import unquote
+        old = self.token("dana@acme.example", "dana-password-1234")
+        short = self.client.post("/me/password", json={"current_password": "dana-password-1234", "new_password": "short"},
+                                 headers=self.h(old))
+        self.assertEqual(short.status_code, 422)
+        new = self.client.post("/me/password", json={"current_password": "dana-password-1234",
+                                                     "new_password": "dana-new-password-1"}, headers=self.h(old)).json()
+        self.assertEqual(self.client.get("/me", headers=self.h(old)).status_code, 401)  # other sessions end
+        self.assertEqual(self.client.get("/me", headers=self.h(new["access_token"])).status_code, 200)
+
+        self.assertEqual(self.client.post("/password/forgot", json={"username": "dana@acme.example"}).json(),
+                         {"email_enabled": True})
+        self.assertEqual(self.client.post("/password/forgot", json={"username": "ghost@acme.example"}).json(),
+                         {"email_enabled": True})
+        mail = [open(os.path.join(self.mail_dir, f), encoding="utf-8").read() for f in os.listdir(self.mail_dir)]
+        self.assertEqual(len(mail), 1)
+        link = next(line for line in mail[0].splitlines() if "#/reset?token=" in line)
+        self.assertTrue(link.startswith("https://app.example/#/reset?token="))
+        reset = self.client.post("/password/reset", json={"token": unquote(link.split("token=")[1]),
+                                                          "new_password": "dana-third-password"})
+        self.assertEqual(reset.status_code, 200)
+        self.assertTrue(self.token("dana@acme.example", "dana-third-password"))
+
+        admin = self.token()
+        self.client.post("/users/dana@acme.example/password", json={"new_password": "temporary-pass-123"}, headers=self.h(admin))
+        self.assertTrue(self.token("dana@acme.example", "temporary-pass-123"))
+        sso_user = {"username": "Eve@Acme.example", "role": "auditor"}
+        made = self.client.post("/users", json=sso_user, headers=self.h(admin)).json()
+        self.assertEqual((made["username"], made["sso_only"]), ("eve@acme.example", True))
+        self.assertEqual(self.client.post("/users", json=sso_user, headers=self.h(admin)).status_code, 409)
+
+    def test_single_sign_on(self):
+        from urllib.parse import parse_qs, unquote, urlparse
+        self.assertEqual(self.client.get("/auth/providers").json(), [{"name": "sso", "label": "Okta"}])
+        start = self.client.get("/auth/sso/start", follow_redirects=False)
+        self.assertEqual(start.status_code, 302)
+        cookie = start.headers["set-cookie"].lower()
+        for attribute in ("httponly", "samesite=lax", "path=/auth/", "secure"):
+            self.assertIn(attribute, cookie)
+        q = parse_qs(urlparse(start.headers["location"]).query)
+        code = self.idp.approve("alice@acme.example", q["nonce"][0])
+        back = self.client.get(f"/auth/sso/callback?code={code}&state={q['state'][0]}", follow_redirects=False)
+        self.assertEqual(back.status_code, 302)
+        where = back.headers["location"]
+        self.assertTrue(where.startswith("/#/sso?token="))
+        me = self.client.get("/me", headers=self.h(unquote(where.split("token=")[1]))).json()
+        self.assertEqual((me["username"], me["signed_in_with_two_factor"]), ("alice@acme.example", True))
+        replay = self.client.get(f"/auth/sso/callback?code={code}&state={q['state'][0]}", follow_redirects=False)
+        self.assertTrue(replay.headers["location"].startswith("/#/login?error="))  # cookie cleared, code used
+        self.assertEqual(self.client.get("/auth/google/start", follow_redirects=False).status_code, 404)
+
+    def test_https_enforcement(self):
+        from dataclasses import replace
+        secure = self.TestClient(self.make_app(replace(self.settings, force_https=True)), base_url="http://testserver")
+        r = secure.get("/me", follow_redirects=False)
+        self.assertEqual((r.status_code, r.headers["location"]), (308, "https://testserver/me"))
+        self.assertEqual(secure.get("/health").status_code, 200)  # load-balancer checks stay on http
+        tls = self.TestClient(self.make_app(replace(self.settings, force_https=True)), base_url="https://testserver")
+        self.assertIn("max-age=31536000", tls.get("/health").headers["strict-transport-security"])
+        self.assertNotIn("strict-transport-security", self.client.get("/health").headers)
+        self.assertEqual(tls.get("/health/ready").json(), {"status": "ready"})

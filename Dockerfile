@@ -3,9 +3,12 @@ WORKDIR /app
 COPY pyproject.toml ./
 COPY src ./src
 RUN pip install --no-cache-dir ".[postgres]"
-RUN useradd --create-home app && mkdir /data && chown app /data
+COPY deploy/entrypoint.sh /entrypoint.sh
+RUN chmod 755 /entrypoint.sh && useradd --create-home app && mkdir /data && chown app /data
 USER app
-ENV DB_PATH=/data/invoices.db
+ENV DB_PATH=/data/invoices.db PYTHONUNBUFFERED=1
 EXPOSE 8000
-# Secrets are passed at runtime (docker run --env-file .env), never baked into the image.
-CMD ["uvicorn", "invoice_detector.api:create_app", "--factory", "--host", "0.0.0.0", "--port", "8000"]
+HEALTHCHECK --interval=10s --timeout=5s --start-period=20s --retries=5 \
+  CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health/ready', timeout=4)"
+# Secrets are supplied at runtime (environment variables or *_FILE paths), never baked in.
+ENTRYPOINT ["/entrypoint.sh"]

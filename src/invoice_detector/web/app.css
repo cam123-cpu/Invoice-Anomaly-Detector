@@ -184,6 +184,20 @@ th .maps { display: block; text-transform: none; letter-spacing: 0; color: var(-
 .sample-title { font-weight: 600; }
 .note select { margin: 0 4px; padding: 4px 8px; }
 
+.sso { display: grid; gap: 8px; }
+.sso-btn { justify-content: center; }
+.divider { display: flex; align-items: center; gap: 10px; color: var(--muted); font-size: 12.5px; margin: 6px 0; }
+.divider::before, .divider::after { content: ""; flex: 1; height: 1px; background: var(--line); }
+.setup-grid { display: flex; gap: 20px; align-items: center; flex-wrap: wrap; margin: 8px 0 16px; }
+.qr { border: 1px solid var(--line); border-radius: 8px; background: #fff; padding: 6px; image-rendering: pixelated; }
+.secret { font-size: 15px; letter-spacing: .04em; margin: 2px 0 8px; overflow-wrap: anywhere; }
+.steps-list { padding-left: 20px; margin: 0 0 8px; }
+.codes { columns: 2; padding-left: 22px; font-size: 14px; }
+.codes li { margin: 3px 0; }
+.recovery { border-color: var(--amber); }
+.user-actions { white-space: nowrap; }
+.user-actions input { width: 180px; }
+
 /* ---------- toasts ---------- */
 #toasts { position: fixed; right: 16px; bottom: 16px; display: grid; gap: 8px; z-index: 50; max-width: calc(100vw - 32px); }
 .toast { background: var(--text); color: var(--bg); padding: 10px 14px; border-radius: 9px; box-shadow: 0 6px 20px rgba(0,0,0,.2); font-weight: 500; }

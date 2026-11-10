@@ -111,6 +111,59 @@ jobs:
       - uses: actions/checkout@v4
       - run: docker build -t invoice-detector .
 
+  production-stack:
+    name: production stack (HTTPS, PostgreSQL, secrets, backups)
+    runs-on: ubuntu-latest
+    env:
+      DOMAIN: localhost
+      COMPOSE: docker compose -f docker-compose.prod.yml
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Generate secret files
+        run: PYTHONPATH=src python -m invoice_detector.cli init-deploy deploy/secrets
+      - name: Start the stack
+        run: |
+          $COMPOSE up -d --build
+          for i in $(seq 60); do
+            [ "$($COMPOSE ps app --format '{{.Health}}')" = healthy ] && break; sleep 3
+          done
+          $COMPOSE ps
+          [ "$($COMPOSE ps app --format '{{.Health}}')" = healthy ]
+      - name: HTTPS works and plain HTTP redirects
+        run: |
+          for i in $(seq 30); do curl -skf https://localhost/health/ready && break; sleep 2; done
+          curl -skf https://localhost/health/ready | grep -q '"ready"'
+          code=$(curl -s -o /dev/null -w '%{http_code}' http://localhost/)
+          echo "http -> $code"; [ "$code" = 308 ] || [ "$code" = 301 ]
+          curl -skI https://localhost/ | grep -i '^strict-transport-security'
+      - name: No secret is visible in the app's environment
+        run: |
+          ! $COMPOSE exec -T app env | grep -E '^(SECRET_KEY|ENCRYPTION_KEYS|INDEX_KEY|DATABASE_URL)='
+      - name: Create a company and sign in
+        run: |
+          $COMPOSE exec -T app python -m invoice_detector.cli create-org "CI Company"
+          $COMPOSE exec -T app python -m invoice_detector.cli seed "CI Company"
+          printf 'ci-password-123456\nci-password-123456\n' | \
+            $COMPOSE exec -T app python -m invoice_detector.cli create-user "CI Company" ci.admin admin
+          curl -skf https://localhost/login -H 'content-type: application/json' \
+            -d '{"username":"ci.admin","password":"ci-password-123456"}' | grep -q access_token
+      - name: Back up, wipe, restore
+        run: |
+          $COMPOSE exec -T backup bash /backup.sh once
+          ls -l backups/
+          file=$(ls backups/*.dump | tail -1)
+          $COMPOSE exec -T db psql -U postgres -d invoices -c "TRUNCATE invoices CASCADE"
+          $COMPOSE exec -T backup bash /backup.sh restore "/backups/$(basename "$file")"
+          $COMPOSE exec -T app python -m invoice_detector.cli migrate
+          $COMPOSE exec -T app python -m invoice_detector.cli detect "CI Company" | tee detect.txt
+          grep -q 'INV-' detect.txt
+      - name: Logs
+        if: failure()
+        run: $COMPOSE logs --no-color --tail 200
+
   dependency-audit:
     runs-on: ubuntu-latest
     continue-on-error: true   # warn only; remove this line to make known CVEs fail the build

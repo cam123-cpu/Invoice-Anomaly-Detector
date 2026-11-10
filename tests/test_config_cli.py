@@ -104,6 +104,34 @@ class CliTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "older version"):
             Database("old.db", {1: b"k" * 32}, b"i" * 32)
 
+    def test_init_deploy_writes_matching_secret_files_once(self):
+        self.assertEqual(cli.main(["init-deploy", "secrets"]), 0)
+        self.assertEqual(cli.main(["init-deploy", "secrets"]), 1)  # never overwrites keys
+        def read(name):
+            with open(os.path.join("secrets", name), encoding="utf-8") as f:
+                return f.read().strip()
+        self.assertIn(":" + read("app_db_password") + "@", read("database_url"))
+        self.assertIn(":" + read("postgres_password") + "@", read("database_admin_url"))
+        # The files work as *_FILE settings, exactly as docker-compose.prod.yml uses them.
+        with mock.patch.dict(os.environ, {
+                "SECRET_KEY_FILE": "secrets/secret_key",
+                "ENCRYPTION_KEYS_FILE": "secrets/encryption_keys",
+                "INDEX_KEY_FILE": "secrets/index_key"}):
+            settings = Settings.from_env()
+        self.assertEqual(settings.secret_key, read("secret_key"))
+
+    def test_wrong_encryption_keys_are_refused_with_a_clear_message(self):
+        cli.main(["init"])
+        cli.main(["create-org", "Acme Inc"])
+        cli.main(["seed", "Acme Inc"])
+        os.rename(".env", "old.env")
+        for name in ("SECRET_KEY", "ENCRYPTION_KEYS", "INDEX_KEY"):
+            os.environ.pop(name, None)   # loaded from the old .env
+        cli.main(["init"])   # new keys, same invoices.db
+        with mock.patch("sys.stderr") as err:
+            self.assertEqual(cli.run(["detect", "Acme Inc"]), 2)
+        self.assertIn("key", "".join(c.args[0] for c in err.write.call_args_list).lower())
+
     def test_unknown_command_prints_help(self):
         self.assertEqual(cli.main(["nope"]), 1)
         self.assertEqual(cli.main(["seed"]), 1)  # missing company

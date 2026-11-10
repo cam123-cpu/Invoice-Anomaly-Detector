@@ -8,7 +8,7 @@
 This uses one connection guarded by a lock, which is fine for a small deployment.
 Use a connection pool (e.g. psycopg_pool) when you need more throughput.
 """
-import os
+import json
 import sqlite3
 import threading
 import uuid
@@ -29,6 +29,14 @@ VERDICTS = ("confirmed", "dismissed")
 
 class Conflict(Exception):
     """A uniqueness, foreign-key or check constraint was violated."""
+
+
+class KeyMismatch(RuntimeError):
+    """The encryption keys in the settings are not the ones this database was written with."""
+
+
+SSO_ONLY = "!sso"  # stored instead of a password hash: this user signs in with single sign-on only
+SECURITY_FIELDS = ("totp_secret", "totp_enabled", "totp_last_step", "recovery_codes")
 
 
 def normalize_account(value: str) -> str:
@@ -98,7 +106,8 @@ class Database:
             for table, column, definition in ADDED_COLUMNS:
                 self.conn.execute(f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {column} {definition}")
             self.conn.execute(POSTGRES_SECURITY)
-            password = os.environ.get("APP_DB_PASSWORD")
+            from .config import env
+            password = env("APP_DB_PASSWORD")
             if password:
                 self.conn.execute(sql.SQL("ALTER ROLE invoice_app PASSWORD {}").format(
                     sql.Literal(password)))
@@ -124,6 +133,47 @@ class Database:
                         yield run
             except self._integrity_error as exc:
                 raise Conflict(str(exc)) from exc
+
+    def _execute(self, query: str, params: tuple = ()):
+        """Run one statement inside an open _tx() and return the cursor (for rowcount)."""
+        return self.conn.execute(query.replace("?", "%s") if self.is_postgres else query, params)
+
+    def check_keys(self) -> None:
+        """Refuse to run with the wrong encryption keys. A mix-up (a lost .env, a restored
+        backup with new keys) would otherwise make bank details unreadable or, worse, write
+        new data that the real keys can't read. The first run records a check value; later
+        runs must be able to decrypt it. Existing encrypted data is tested too, where the
+        connection is allowed to see it."""
+        master = Vault(self._keys, self._index_key)
+        with self._tx() as run:
+            rows = run("SELECT value FROM meta WHERE key = ?", ("key_check",))
+            if rows:
+                stored = json.loads(rows[0]["value"])
+                try:
+                    ok = master.decrypt(stored["enc"], "meta:key_check") == "ok"
+                except ValueError:
+                    ok = False
+                if not ok or stored.get("idx") != master.blind_index("index-check"):
+                    raise KeyMismatch(
+                        "The encryption keys don't match this database. Use the ENCRYPTION_KEYS and "
+                        "INDEX_KEY it was created with (check your secrets manager or key backup).")
+                return
+            sample = run("SELECT org_id, id, bank_enc FROM invoices WHERE bank_enc IS NOT NULL LIMIT 1")
+        if sample:
+            row = sample[0]
+            try:
+                self.vault(row["org_id"]).decrypt(row["bank_enc"], f"invoices.bank:{row['org_id']}:{row['id']}")
+            except ValueError:
+                raise KeyMismatch("The encryption keys can't read the bank details already stored in "
+                                  "this database. Use the keys it was created with.") from None
+        value = json.dumps({"enc": master.encrypt("ok", "meta:key_check"),
+                            "idx": master.blind_index("index-check")})
+        with self._tx() as run:
+            run("INSERT INTO meta (key, value) VALUES (?, ?) ON CONFLICT (key) DO NOTHING", ("key_check", value))
+
+    def ping(self) -> bool:
+        with self._tx() as run:
+            return run("SELECT 1 AS ok")[0]["ok"] == 1
 
     def vault(self, org_id: str) -> Vault:
         if org_id not in self._vaults:
@@ -152,44 +202,88 @@ class Database:
     # ----- company settings -----
     def get_org(self, org_id: str) -> dict:
         with self._tx(org_id) as run:
-            rows = run("SELECT id, name, approval_threshold FROM orgs WHERE id = ?", (org_id,))
+            rows = run("SELECT id, name, approval_threshold, require_2fa FROM orgs WHERE id = ?", (org_id,))
         if not rows:
             raise KeyError(org_id)
-        return rows[0]
+        org = rows[0]
+        org["require_2fa"] = bool(org["require_2fa"])
+        return org
+
+    def set_org_settings(self, org_id: str, approval_threshold: float | None = None,
+                         require_2fa: bool | None = None) -> None:
+        with self._tx(org_id) as run:
+            if approval_threshold is not None:
+                run("UPDATE orgs SET approval_threshold = ? WHERE id = ?", (approval_threshold, org_id))
+            if require_2fa is not None:
+                run("UPDATE orgs SET require_2fa = ? WHERE id = ?", (int(require_2fa), org_id))
 
     def set_approval_threshold(self, org_id: str, value: float) -> None:
-        with self._tx(org_id) as run:
-            run("UPDATE orgs SET approval_threshold = ? WHERE id = ?", (value, org_id))
+        self.set_org_settings(org_id, approval_threshold=value)
 
     # ----- users -----
-    def create_user(self, org_id: str, username: str, password: str, role: str) -> None:
+    def create_user(self, org_id: str, username: str, password: str | None, role: str) -> None:
+        """password None makes a single-sign-on-only user (no password can ever match)."""
         with self._tx(org_id) as run:
             run("INSERT INTO users (username, org_id, password_hash, role) VALUES (?, ?, ?, ?)",
-                (username, org_id, hash_password(password), role))
+                (username, org_id, hash_password(password) if password else SSO_ONLY, role))
 
-    def set_password(self, username: str, password: str) -> bool:
-        """Operator tool (owner connection): replace a user's password. False if no such user."""
-        query = "UPDATE users SET password_hash = ? WHERE username = ?"
-        with self._tx():
-            cur = self.conn.execute(query.replace("?", "%s") if self.is_postgres else query,
+    def set_password(self, username: str, password: str, org_id: str | None = None) -> bool:
+        """Replace a user's password. False if no such user (in this company, when given;
+        the CLI's owner connection may leave the company out)."""
+        with self._tx(org_id):
+            if org_id is None:
+                cur = self._execute("UPDATE users SET password_hash = ? WHERE username = ?",
                                     (hash_password(password), username))
+            else:
+                cur = self._execute("UPDATE users SET password_hash = ? WHERE username = ? AND org_id = ?",
+                                    (hash_password(password), username, org_id))
             return cur.rowcount == 1
+
+    def user_security(self, org_id: str, username: str) -> dict | None:
+        """Password hash and two-factor state of one user in this company."""
+        with self._tx(org_id) as run:
+            rows = run("SELECT username, role, password_hash, totp_secret, totp_enabled, totp_last_step, "
+                       "recovery_codes FROM users WHERE org_id = ? AND username = ?", (org_id, username))
+        if not rows:
+            return None
+        user = rows[0]
+        user["totp_enabled"] = bool(user["totp_enabled"])
+        user["recovery_codes"] = json.loads(user["recovery_codes"]) if user["recovery_codes"] else []
+        return user
+
+    def update_user_security(self, org_id: str, username: str, **fields) -> None:
+        """Change two-factor fields. Only the allow-listed column names can be set."""
+        unknown = set(fields) - set(SECURITY_FIELDS)
+        if unknown:
+            raise ValueError(f"Not a security field: {sorted(unknown)}")
+        values = {k: (json.dumps(v) if k == "recovery_codes" and v is not None else
+                      int(v) if k == "totp_enabled" else v) for k, v in fields.items()}
+        assignments = ", ".join(f"{k} = ?" for k in values)  # names come from the allow-list
+        with self._tx(org_id):
+            self._execute(f"UPDATE users SET {assignments} WHERE org_id = ? AND username = ?",
+                          (*values.values(), org_id, username))
 
     def auth_lookup(self, username: str) -> dict | None:
         """Used only by login, before the company is known."""
         with self._tx() as run:
             if self.is_postgres:
-                rows = run("SELECT username, password_hash, role, org_id FROM auth_lookup(?)",
+                rows = run("SELECT username, password_hash, role, org_id, totp_enabled FROM auth_lookup(?)",
                            (username,))
-            else:
-                rows = run("SELECT username, password_hash, role, org_id FROM users "
-                           "WHERE username = ?", (username,))
-        return rows[0] if rows else None
+            else:  # case-insensitive, so Alice@Acme.com and alice@acme.com are the same person
+                rows = run("SELECT username, password_hash, role, org_id, totp_enabled FROM users "
+                           "WHERE lower(username) = lower(?) ORDER BY username LIMIT 1", (username,))
+        if not rows:
+            return None
+        user = rows[0]
+        user["totp_enabled"] = bool(user["totp_enabled"])
+        return user
 
     def list_users(self, org_id: str) -> list[dict]:
         with self._tx(org_id) as run:
-            return run("SELECT username, role FROM users WHERE org_id = ? ORDER BY username",
-                       (org_id,))
+            rows = run("SELECT username, role, totp_enabled, password_hash FROM users WHERE org_id = ? "
+                       "ORDER BY username", (org_id,))
+        return [{"username": r["username"], "role": r["role"], "two_factor": bool(r["totp_enabled"]),
+                 "sso_only": r["password_hash"] == SSO_ONLY} for r in rows]
 
     # ----- invoices -----
     def add_invoice(self, org_id: str, inv_id: str, vendor: str, amount: float,

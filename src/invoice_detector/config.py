@@ -1,7 +1,11 @@
 """Settings come from environment variables (optionally via a local .env file).
 
-Secrets never live in code. Secret fields are hidden from repr() so they can't leak
-into logs by accident.
+Secrets never live in code. In production they come from a secrets manager, which hands
+them to the app in one of two standard ways, both supported here:
+- as environment variables (AWS ECS, Google Cloud Run, Azure, Render, Fly, Heroku), or
+- as files, named by NAME_FILE (Docker and Kubernetes secrets): SECRET_KEY_FILE=/run/secrets/secret_key.
+
+Secret fields are hidden from repr() so they can't leak into logs by accident.
 """
 import base64
 import os
@@ -24,10 +28,25 @@ def load_dotenv(path: str = ".env") -> None:
         os.environ.setdefault(key.strip(), value.strip().strip("'\""))
 
 
-def _require(name: str) -> str:
+def env(name: str, default: str | None = None) -> str | None:
+    """NAME from the environment, or the contents of the file named by NAME_FILE."""
     value = os.environ.get(name)
+    if value:
+        return value
+    path = os.environ.get(name + "_FILE")
+    if path:
+        try:
+            with open(path, encoding="utf-8") as f:
+                return f.read().strip() or default
+        except OSError as exc:
+            raise RuntimeError(f"{name}_FILE points to {path}, which can't be read") from exc
+    return default
+
+
+def _require(name: str) -> str:
+    value = env(name)
     if not value:
-        raise RuntimeError(f"Missing required environment variable: {name}")
+        raise RuntimeError(f"Missing required setting: {name} (or {name}_FILE)")
     return value
 
 
@@ -52,6 +71,22 @@ class Settings:
     database_url: str | None = field(default=None, repr=False)        # PostgreSQL, app role
     database_admin_url: str | None = field(default=None, repr=False)  # PostgreSQL, owner (CLI only)
     anthropic_api_key: str | None = field(default=None, repr=False)
+    # web address people use, e.g. https://invoices.example.com (links in emails, SSO redirects)
+    public_url: str = "http://127.0.0.1:8000"
+    force_https: bool = False            # redirect http to https and send HSTS
+    smtp_host: str | None = None
+    smtp_port: int = 587
+    smtp_user: str | None = None
+    smtp_password: str | None = field(default=None, repr=False)
+    smtp_security: str = "starttls"      # starttls | ssl | none
+    mail_from: str = "Invoice Review <no-reply@localhost>"
+    mail_dir: str | None = None          # development: write emails to this folder instead
+    sso_providers: dict = field(default_factory=dict, repr=False)
+    oidc_allow_http: bool = False        # testing only: allow a non-HTTPS identity provider
+
+    @property
+    def email_enabled(self) -> bool:
+        return bool(self.smtp_host or self.mail_dir)
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -67,7 +102,26 @@ class Settings:
             encryption_keys=parse_keys(_require("ENCRYPTION_KEYS")),
             index_key=index_key,
             db_path=os.environ.get("DB_PATH", "invoices.db"),
-            database_url=os.environ.get("DATABASE_URL") or None,
-            database_admin_url=os.environ.get("DATABASE_ADMIN_URL") or None,
-            anthropic_api_key=os.environ.get("ANTHROPIC_API_KEY") or None,
+            database_url=env("DATABASE_URL"),
+            database_admin_url=env("DATABASE_ADMIN_URL"),
+            anthropic_api_key=env("ANTHROPIC_API_KEY"),
+            public_url=(env("PUBLIC_URL") or "http://127.0.0.1:8000").rstrip("/"),
+            force_https=env("FORCE_HTTPS", "0") == "1",
+            smtp_host=env("SMTP_HOST"),
+            smtp_port=int(env("SMTP_PORT", "587")),
+            smtp_user=env("SMTP_USER"),
+            smtp_password=env("SMTP_PASSWORD"),
+            smtp_security=env("SMTP_SECURITY", "starttls"),
+            mail_from=env("MAIL_FROM", "Invoice Review <no-reply@localhost>"),
+            mail_dir=env("MAIL_DIR"),
+            sso_providers=_providers(),
+            oidc_allow_http=env("OIDC_ALLOW_HTTP", "0") == "1",
         )
+
+
+def _providers() -> dict:
+    from .oidc import providers_from_env
+    names = ("GOOGLE_CLIENT_ID", "GOOGLE_CLIENT_SECRET", "MICROSOFT_CLIENT_ID", "MICROSOFT_CLIENT_SECRET",
+             "MICROSOFT_TENANT_ID", "OIDC_ISSUER", "OIDC_CLIENT_ID", "OIDC_CLIENT_SECRET", "OIDC_LABEL",
+             "OIDC_REQUIRE_VERIFIED_EMAIL")
+    return providers_from_env({n: v for n in names if (v := env(n))})

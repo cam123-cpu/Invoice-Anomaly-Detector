@@ -1,0 +1,96 @@
+# Production on one server: HTTPS (Caddy + Let's Encrypt), PostgreSQL with row-level
+# security, the app, and nightly backups. See docs/DEPLOYMENT.md.
+#
+#   python -m invoice_detector.cli init-deploy deploy/secrets   # once; then back that folder up
+#   DOMAIN=invoices.example.com docker compose -f docker-compose.prod.yml up -d --build
+#
+# Secrets are files in deploy/secrets/ (git-ignored), mounted at /run/secrets/ and read
+# through *_FILE settings. To use a cloud secrets manager instead, set the same names as
+# environment variables, or mount its files at these paths.
+services:
+  db:
+    image: postgres:16
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: invoices
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+    secrets: [postgres_password]
+    volumes: [db-data:/var/lib/postgresql/data]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d invoices"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  app:
+    build: .
+    restart: unless-stopped
+    depends_on:
+      db: {condition: service_healthy}
+    environment:
+      SECRET_KEY_FILE: /run/secrets/secret_key
+      ENCRYPTION_KEYS_FILE: /run/secrets/encryption_keys
+      INDEX_KEY_FILE: /run/secrets/index_key
+      DATABASE_URL_FILE: /run/secrets/database_url              # limited role, used by the web app
+      DATABASE_ADMIN_URL_FILE: /run/secrets/database_admin_url  # owner, used only by migrate / CLI
+      APP_DB_PASSWORD_FILE: /run/secrets/app_db_password
+      PUBLIC_URL: https://${DOMAIN:?set DOMAIN, e.g. invoices.example.com}
+      FORCE_HTTPS: "1"
+      FORWARDED_ALLOW_IPS: "*"   # the app is reachable only through Caddy on this network
+      # Optional: password-reset emails
+      SMTP_HOST: ${SMTP_HOST:-}
+      SMTP_PORT: ${SMTP_PORT:-587}
+      SMTP_USER: ${SMTP_USER:-}
+      SMTP_PASSWORD: ${SMTP_PASSWORD:-}
+      MAIL_FROM: ${MAIL_FROM:-Invoice Review <no-reply@localhost>}
+      # Optional: single sign-on
+      MICROSOFT_CLIENT_ID: ${MICROSOFT_CLIENT_ID:-}
+      MICROSOFT_CLIENT_SECRET: ${MICROSOFT_CLIENT_SECRET:-}
+      MICROSOFT_TENANT_ID: ${MICROSOFT_TENANT_ID:-}
+      GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID:-}
+      GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET:-}
+      OIDC_ISSUER: ${OIDC_ISSUER:-}
+      OIDC_CLIENT_ID: ${OIDC_CLIENT_ID:-}
+      OIDC_CLIENT_SECRET: ${OIDC_CLIENT_SECRET:-}
+      OIDC_LABEL: ${OIDC_LABEL:-}
+    secrets: [secret_key, encryption_keys, index_key, database_url, database_admin_url, app_db_password]
+
+  caddy:
+    image: caddy:2
+    restart: unless-stopped
+    depends_on: [app]
+    ports: ["80:80", "443:443"]
+    environment:
+      DOMAIN: ${DOMAIN}
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+
+  backup:
+    image: postgres:16
+    restart: unless-stopped
+    depends_on:
+      db: {condition: service_healthy}
+    entrypoint: ["bash", "/backup.sh", "loop"]
+    environment:
+      BACKUP_KEEP_DAYS: ${BACKUP_KEEP_DAYS:-14}
+      BACKUP_INTERVAL_HOURS: ${BACKUP_INTERVAL_HOURS:-24}
+    secrets: [postgres_password]
+    volumes:
+      - ./deploy/backup.sh:/backup.sh:ro
+      - ./backups:/backups   # copy this folder off the server too (see docs/DEPLOYMENT.md)
+
+secrets:
+  secret_key: {file: ./deploy/secrets/secret_key}
+  encryption_keys: {file: ./deploy/secrets/encryption_keys}
+  index_key: {file: ./deploy/secrets/index_key}
+  postgres_password: {file: ./deploy/secrets/postgres_password}
+  app_db_password: {file: ./deploy/secrets/app_db_password}
+  database_url: {file: ./deploy/secrets/database_url}
+  database_admin_url: {file: ./deploy/secrets/database_admin_url}
+
+volumes:
+  db-data:
+  caddy-data:
+  caddy-config:

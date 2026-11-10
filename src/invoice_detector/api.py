@@ -27,8 +27,9 @@ from .excel_out import XLSX, annotate, payment_file, review_report
 from .explain import explain
 from .importer import FIELDS, ID_PATTERN, FileProblem, convert, preview, read_table
 from .samples import SAMPLES, build as build_sample
-from .security import (DUMMY_HASH, AuthError, RateLimiter, RateLimitError, TokenSigner,
-                       verify_password)
+from .accounts import AccountError, Accounts
+from .mailer import from_settings as mailer_from_settings
+from .security import TokenSigner
 
 MAX_BULK = 1000
 WEB = files("invoice_detector") / "web"
@@ -54,9 +55,42 @@ class InvoiceIn(BaseModel):
 
 
 class UserIn(BaseModel):
-    username: str = Field(pattern=r"^[A-Za-z0-9_.@-]{3,64}$")
-    password: str = Field(min_length=12, max_length=256)
+    username: str = Field(pattern=r"^[A-Za-z0-9_.@+-]{3,64}$")
+    # Leave out for someone who will only use single sign-on (Microsoft, Google, ...).
+    password: str | None = Field(default=None, min_length=12, max_length=256)
     role: Literal["admin", "accountant", "auditor"]
+
+
+class SecondFactorIn(BaseModel):
+    mfa_token: str = Field(min_length=1, max_length=2000)
+    code: str = Field(min_length=6, max_length=40)
+
+
+class CodeIn(BaseModel):
+    code: str = Field(min_length=6, max_length=40)
+
+
+class DisableTwoFactorIn(BaseModel):
+    password: str | None = Field(default=None, max_length=256)
+    code: str = Field(min_length=6, max_length=40)
+
+
+class ChangePasswordIn(BaseModel):
+    current_password: str = Field(min_length=1, max_length=256)
+    new_password: str = Field(min_length=12, max_length=256)
+
+
+class ForgotIn(BaseModel):
+    username: str = Field(min_length=1, max_length=64)
+
+
+class ResetIn(BaseModel):
+    token: str = Field(min_length=1, max_length=2000)
+    new_password: str = Field(min_length=12, max_length=256)
+
+
+class NewPasswordIn(BaseModel):
+    new_password: str = Field(min_length=12, max_length=256)
 
 
 class ReviewIn(BaseModel):
@@ -91,26 +125,47 @@ def attachment(data: bytes, filename: str, media_type: str) -> Response:
 
 
 class SettingsIn(BaseModel):
-    approval_threshold: float = Field(gt=0, lt=1e12)
+    approval_threshold: float | None = Field(default=None, gt=0, lt=1e12)
+    require_2fa: bool | None = None
 
 
-def create_app(settings: Settings | None = None, db: Database | None = None) -> FastAPI:
+def create_app(settings: Settings | None = None, db: Database | None = None,
+               accounts: Accounts | None = None) -> FastAPI:
     settings = settings or Settings.from_env()
     db = db or Database.from_settings(settings)
+    db.check_keys()  # refuse to start with encryption keys that don't match the data
     signer = TokenSigner(settings.secret_key)
-    limiter = RateLimiter()
+    accounts = accounts or Accounts(db, signer, settings, mailer_from_settings(settings))
     bearer = HTTPBearer(auto_error=False)
+    sso_cookie = "iad_sso"
 
-    app = FastAPI(title="Invoice Anomaly Detector", version="0.6.0")
-    app.state.db, app.state.signer = db, signer
+    app = FastAPI(title="Invoice Anomaly Detector", version="0.7.0")
+    app.state.db, app.state.signer, app.state.accounts = db, signer, accounts
 
-    def current_user(creds: HTTPAuthorizationCredentials | None = Depends(bearer)) -> dict:
+    def http_error(exc: AccountError) -> HTTPException:
+        headers = {"X-Requires-2FA": "1"} if exc.requires_2fa else None
+        return HTTPException(exc.status, exc.message, headers=headers)
+
+    def client_ip(request: Request) -> str:
+        # Behind a proxy, run uvicorn with --proxy-headers so this is the real address.
+        return request.client.host if request.client else "unknown"
+
+    def _user(creds: HTTPAuthorizationCredentials | None, enforce_2fa: bool) -> dict:
         if creds is None:
             raise HTTPException(401, "Not authenticated")
         try:
-            return signer.read(creds.credentials)
-        except AuthError:
-            raise HTTPException(401, "Invalid or expired token") from None
+            return accounts.authenticate(creds.credentials, enforce_2fa=enforce_2fa)
+        except AccountError as exc:
+            raise http_error(exc) from None
+
+    def current_user(creds: HTTPAuthorizationCredentials | None = Depends(bearer)) -> dict:
+        """The signed-in user. If their company requires two-factor and this session didn't
+        use it, only the account pages (below) are reachable."""
+        return _user(creds, enforce_2fa=True)
+
+    def account_user(creds: HTTPAuthorizationCredentials | None = Depends(bearer)) -> dict:
+        """For the pages a user needs to set up two-factor or change their password."""
+        return _user(creds, enforce_2fa=False)
 
     def require(*roles: str):
         def dependency(user: dict = Depends(current_user)) -> dict:
@@ -146,7 +201,13 @@ def create_app(settings: Settings | None = None, db: Database | None = None) -> 
 
     @app.middleware("http")
     async def security_headers(request: Request, call_next):
+        if settings.force_https and request.url.scheme == "http" and not request.url.path.startswith("/health"):
+            # Behind a proxy that ends TLS, uvicorn --proxy-headers sets the scheme from
+            # X-Forwarded-Proto, so only real plain-HTTP requests are redirected.
+            return RedirectResponse(str(request.url.replace(scheme="https")), status_code=308)
         response = await call_next(request)
+        if settings.force_https:
+            response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
         response.headers.setdefault("X-Content-Type-Options", "nosniff")
         response.headers.setdefault("Referrer-Policy", "no-referrer")
         response.headers.setdefault("X-Frame-Options", "DENY")
@@ -185,32 +246,103 @@ def create_app(settings: Settings | None = None, db: Database | None = None) -> 
     # ---------------- session ----------------
     @app.get("/health")
     def health() -> dict:
+        """Liveness: the process is up (for load balancers)."""
         return {"status": "ok"}
+
+    @app.get("/health/ready")
+    def ready() -> dict:
+        """Readiness: the database answers."""
+        try:
+            db.ping()
+        except Exception:
+            raise HTTPException(503, "Database unavailable") from None
+        return {"status": "ready"}
+
+    # ---------------- signing in ----------------
+    def run(action):
+        try:
+            return action()
+        except AccountError as exc:
+            raise http_error(exc) from None
 
     @app.post("/login")
     def login(body: LoginIn, request: Request) -> dict:
-        ip = request.client.host if request.client else "unknown"
-        key = f"{ip}:{body.username.lower()}"
-        try:
-            limiter.check(key)
-        except RateLimitError:
-            raise HTTPException(429, "Too many attempts. Try again later.") from None
-        user = db.auth_lookup(body.username)
-        ok = verify_password(body.password, user["password_hash"] if user else DUMMY_HASH)
-        if not (user and ok):
-            limiter.record_failure(key)
-            if user:
-                db.audit(user["org_id"], user["username"], "login_failed", f"from {ip}")
-            raise HTTPException(401, "Invalid credentials")  # same message either way
-        limiter.record_success(key)
-        db.audit(user["org_id"], user["username"], "login", f"from {ip}")
-        return {"access_token": signer.make(user["username"], user["role"], user["org_id"]),
-                "token_type": "bearer"}
+        """Step 1. Returns an access token, or {"mfa_required": true, "mfa_token": ...} when
+        the user has two-factor on; then send the code to POST /login/2fa."""
+        return run(lambda: accounts.login(body.username, body.password, client_ip(request)))
 
+    @app.post("/login/2fa")
+    def login_2fa(body: SecondFactorIn, request: Request) -> dict:
+        """Step 2: a code from the authenticator app, or a one-time recovery code."""
+        return run(lambda: accounts.login_second_factor(body.mfa_token, body.code, client_ip(request)))
+
+    @app.get("/auth/providers")
+    def sso_providers() -> list[dict]:
+        """Single sign-on options configured on this server (for the sign-in page)."""
+        return accounts.sso_providers()
+
+    @app.get("/auth/{name}/start", include_in_schema=False)
+    def sso_start(name: str) -> RedirectResponse:
+        url, sealed = run(lambda: accounts.sso_start(name))
+        response = RedirectResponse(url, status_code=302)
+        response.set_cookie(sso_cookie, sealed, max_age=600, httponly=True, samesite="lax", path="/auth/",
+                            secure=settings.public_url.startswith("https://"))
+        return response
+
+    @app.get("/auth/{name}/callback", include_in_schema=False)
+    def sso_callback(name: str, request: Request) -> RedirectResponse:
+        target = accounts.sso_callback(name, dict(request.query_params), request.cookies.get(sso_cookie),
+                                       client_ip(request))
+        response = RedirectResponse(target, status_code=302)
+        response.delete_cookie(sso_cookie, path="/auth/")
+        response.headers["Cache-Control"] = "no-store"
+        return response
+
+    @app.post("/password/forgot")
+    def forgot_password(body: ForgotIn, request: Request) -> dict:
+        """Email a reset link. The reply is the same whether or not the account exists."""
+        return run(lambda: accounts.forgot_password(body.username, client_ip(request)))
+
+    @app.post("/password/reset")
+    def reset_password(body: ResetIn) -> dict:
+        return run(lambda: accounts.reset_password(body.token, body.new_password))
+
+    # ---------------- your account ----------------
     @app.get("/me")
-    def me(user: dict = Depends(current_user)) -> dict:
+    def me(user: dict = Depends(account_user)) -> dict:
         org = db.get_org(user["org"])
-        return {"username": user["sub"], "role": user["role"], "company": org["name"]}
+        return {"username": user["sub"], "role": user["role"], "company": org["name"],
+                "two_factor_enabled": user["two_factor"], "two_factor_required": user["require_2fa"],
+                "signed_in_with_two_factor": user["mfa"], "sso_only": user["sso_only"],
+                "email_enabled": settings.email_enabled}
+
+    @app.get("/me/2fa")
+    def two_factor_status(user: dict = Depends(account_user)) -> dict:
+        return accounts.two_factor_status(user)
+
+    @app.post("/me/2fa/setup")
+    def two_factor_setup(user: dict = Depends(account_user)) -> dict:
+        """A new secret, as a QR code and as text, for the authenticator app."""
+        return run(lambda: accounts.setup_2fa(user))
+
+    @app.post("/me/2fa/enable")
+    def two_factor_enable(body: CodeIn, user: dict = Depends(account_user)) -> dict:
+        """Confirm with a code from the app. Returns ten recovery codes (shown once) and a new
+        access token for a session that counts as two-factor."""
+        return run(lambda: accounts.enable_2fa(user, body.code))
+
+    @app.post("/me/2fa/disable")
+    def two_factor_disable(body: DisableTwoFactorIn, user: dict = Depends(account_user)) -> dict:
+        return run(lambda: accounts.disable_2fa(user, body.password, body.code))
+
+    @app.post("/me/2fa/recovery-codes")
+    def two_factor_new_codes(body: CodeIn, user: dict = Depends(current_user)) -> dict:
+        return run(lambda: accounts.new_recovery_codes(user, body.code))
+
+    @app.post("/me/password")
+    def change_password(body: ChangePasswordIn, user: dict = Depends(account_user)) -> dict:
+        """Ends every other session; returns a new access token for this one."""
+        return run(lambda: accounts.change_password(user, body.current_password, body.new_password))
 
     # ---------------- company administration ----------------
     @app.get("/users")
@@ -219,24 +351,45 @@ def create_app(settings: Settings | None = None, db: Database | None = None) -> 
 
     @app.post("/users", status_code=201)
     def add_user(body: UserIn, user: dict = Depends(require("admin"))) -> dict:
-        """Admins add users to their own company only."""
+        """Admins add people to their own company only. Use their email address as the
+        username: it's what single sign-on and password-reset emails match on."""
+        username = body.username.strip().lower() if "@" in body.username else body.username.strip()
+        if db.auth_lookup(username):
+            raise HTTPException(409, "Username is already taken")
         try:
-            db.create_user(user["org"], body.username, body.password, body.role)
+            db.create_user(user["org"], username, body.password, body.role)
         except Conflict:
             raise HTTPException(409, "Username is already taken") from None
-        db.audit(user["org"], user["sub"], "user_created", f"{body.username} as {body.role}")
-        return {"username": body.username, "role": body.role}
+        method = "password" if body.password else "single sign-on only"
+        db.audit(user["org"], user["sub"], "user_created", f"{username} as {body.role} ({method})")
+        return {"username": username, "role": body.role, "sso_only": body.password is None}
+
+    @app.post("/users/{username}/password")
+    def admin_set_password(username: str, body: NewPasswordIn, user: dict = Depends(require("admin"))) -> dict:
+        """Give someone a temporary password (ends their sessions)."""
+        run(lambda: accounts.admin_set_password(user, username, body.new_password))
+        return {"username": username}
+
+    @app.post("/users/{username}/2fa/reset")
+    def admin_reset_2fa(username: str, user: dict = Depends(require("admin"))) -> dict:
+        """Turn off someone's two-factor, e.g. after they lost their phone and recovery codes."""
+        run(lambda: accounts.admin_reset_2fa(user, username))
+        return {"username": username}
 
     @app.get("/settings")
     def get_settings(user: dict = Depends(current_user)) -> dict:
-        return {"approval_threshold": db.get_org(user["org"])["approval_threshold"]}
+        org = db.get_org(user["org"])
+        return {"approval_threshold": org["approval_threshold"], "require_2fa": org["require_2fa"]}
 
     @app.put("/settings")
     def put_settings(body: SettingsIn, user: dict = Depends(require("admin"))) -> dict:
-        db.set_approval_threshold(user["org"], body.approval_threshold)
-        db.audit(user["org"], user["sub"], "settings_changed",
-                 f"approval_threshold={body.approval_threshold}")
-        return {"approval_threshold": body.approval_threshold}
+        if body.require_2fa and not user["two_factor"]:
+            raise HTTPException(409, "Turn on two-factor for your own account first, so you aren't locked out.")
+        db.set_org_settings(user["org"], body.approval_threshold, body.require_2fa)
+        changes = {k: v for k, v in body.model_dump().items() if v is not None}
+        db.audit(user["org"], user["sub"], "settings_changed", ", ".join(f"{k}={v}" for k, v in changes.items()))
+        org = db.get_org(user["org"])
+        return {"approval_threshold": org["approval_threshold"], "require_2fa": org["require_2fa"]}
 
     @app.get("/audit")
     def audit_log(limit: int = 100, user: dict = Depends(require("admin", "auditor"))) -> list[dict]:

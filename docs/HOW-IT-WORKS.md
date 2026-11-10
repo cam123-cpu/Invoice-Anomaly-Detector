@@ -129,8 +129,10 @@ the login rate limiter does keep in-memory state.)
 
 ### 2.5 Configuration from the environment
 
-Secrets and settings come from **environment variables** (optionally loaded from a `.env` file),
-never from the code. This is one of the "Twelve-Factor App" principles. The same code runs on
+Secrets and settings come from **environment variables** (optionally loaded from a `.env` file
+on a developer's computer), never from the code. Every setting can also be given as
+`NAME_FILE=/path`, a file holding the value: that is how Docker, Kubernetes and the cloud
+secrets managers hand secrets to a container without putting them in its environment. This is one of the "Twelve-Factor App" principles. The same code runs on
 your laptop and in production, and only the environment differs. It also means secrets never end
 up on GitHub; `.gitignore` excludes `.env`.
 
@@ -162,7 +164,8 @@ approach is called **defence in depth**:
   same anywhere. It runs as a non-root user, and secrets are passed in at runtime, never baked in.
 - **GitHub Actions** (`.github/workflows/ci.yml`) is the **CI pipeline** (continuous
   integration). On every push it lints the code and runs the tests on Linux, Windows, three
-  Python versions, a real PostgreSQL server and a real browser, then builds the Docker image.
+  Python versions, a real PostgreSQL server and a real browser, then builds the Docker image and
+  starts the whole production stack (section 6.14).
 
 ---
 
@@ -170,30 +173,37 @@ approach is called **defence in depth**:
 
 ```
 src/invoice_detector/
-  api.py         ~440 lines  Web API: every URL, sign-in, roles, uploads, downloads
-  web/app.js     ~760 lines  The browser app (pages, buttons, tables)
-  web/app.css    ~220 lines  The look: layout, colours, dark mode, phone layout
+  api.py         ~630 lines  Web API: every URL, roles, uploads, downloads, HTTPS enforcement
+  web/app.js    ~1140 lines  The browser app (pages, sign-in, two-factor set-up, tables)
+  web/app.css    ~250 lines  The look: layout, colours, dark mode, phone layout
   web/index.html   16 lines  The empty page that loads app.js and app.css
+  db.py          ~450 lines  All database reads and writes, scoped to one company; key check
   importer.py    ~410 lines  Reads Excel/CSV, guesses columns, parses amounts and dates
   detection.py   ~390 lines  The 12 checks, the ML model, risk scoring, learning from reviews
-  decisions.py    ~90 lines  Payment decision and next steps for each flagged invoice
-  db.py          ~310 lines  All database reads and writes, scoped to one company
-  excel_out.py   ~220 lines  Writes results into workbooks, reports, the template
-  cli.py         ~190 lines  Command-line tool: init, create-org, import, detect, ...
+  accounts.py    ~320 lines  Sign-in rules: passwords, two-factor, SSO, password reset
+  excel_out.py   ~300 lines  Writes results into workbooks, reports, the template
+  cli.py         ~260 lines  Command-line tool: init, init-deploy, migrate, create-org, import, ...
+  qr.py          ~250 lines  QR code encoder (for the two-factor set-up screen)
+  oidc.py        ~250 lines  Single sign-on: OpenID Connect with PKCE, ID-token checks
+  schema.py      ~160 lines  Table definitions and PostgreSQL security policies
   samples.py     ~150 lines  Builds the four sample workbooks
-  schema.py      ~130 lines  Table definitions and PostgreSQL security policies
+  config.py      ~130 lines  Reads settings and secrets (variables or files)
+  security.py    ~120 lines  Password hashing, rate limiting, signed tokens
   demo.py        ~110 lines  Synthetic invoices with planted problems
-  security.py    ~100 lines  Password hashing, login rate limiting, signed tokens
+  totp.py        ~100 lines  Authenticator-app codes and recovery codes
+  decisions.py    ~90 lines  Payment decision and next steps for each flagged invoice
   evaluate.py     ~80 lines  Measures precision and recall on synthetic data
-  config.py       ~70 lines  Reads settings and secrets from the environment
+  mailer.py       ~70 lines  Sends password-reset emails (SMTP, or a folder for testing)
   crypto.py       ~55 lines  AES-GCM encryption, per-company keys, blind index
   explain.py      ~50 lines  Optional plain-English summary via the Claude API
-tests/                       124 automated tests (unit, API, database, browser)
+tests/                       ~175 automated tests (unit, API, database, browser)
 samples/                     The four sample Excel files
-docs/                        TUTORIAL.md and this guide
+docs/                        TUTORIAL.md, DEPLOYMENT.md and this guide
+deploy/                      Caddyfile (HTTPS), entrypoint.sh (start-up), backup.sh
 prototypes/                  The original Gleam version
 .github/workflows/ci.yml     The CI pipeline
-Dockerfile, docker-compose.yml, pyproject.toml, .env.example, .gitignore
+Dockerfile, docker-compose.yml (local database), docker-compose.prod.yml (production),
+pyproject.toml, .env.example, .gitignore
 ```
 
 `pyproject.toml` is the project's manifest: its name, version, the libraries it depends on
@@ -234,6 +244,12 @@ sequenceDiagram
     end
     Note over B: Stores the token in sessionStorage and<br/>sends it as "Authorization: Bearer ..." on every request
 ```
+
+That is the password path with two-factor off. With two-factor on, step "right" returns
+`{mfa_required, mfa_token}` instead: a 5-minute token that only `POST /login/2fa` accepts, which
+swaps it plus a 6-digit code for the real token. Single sign-on skips the password entirely: the
+browser goes to Microsoft or Google and comes back with a one-time code the server exchanges for
+a verified identity. Both are explained in [section 6.13](#613-sign-in-accountspy-totppy-qrpy-oidcpy-mailerpy).
 
 ### 4.2 Uploading a spreadsheet
 
@@ -403,6 +419,12 @@ Concepts at work:
   **fail-fast** principle.
 - `parse_keys` reads `ENCRYPTION_KEYS="1:<base64>,2:<base64>"`, a numbered key list that makes
   key rotation possible ([section 8](#8-the-security-model)).
+- `env(name)` returns `NAME` if set, otherwise the contents of the file named by `NAME_FILE`
+  (trailing newline stripped). Every secret goes through it, so secrets managers that mount
+  files and ones that set variables both work.
+- Settings for hosting and sign-in: `PUBLIC_URL` (the address used in emailed links and SSO
+  redirects), `FORCE_HTTPS`, `SMTP_*` / `MAIL_FROM` / `MAIL_DIR`, and the SSO providers, parsed by
+  `oidc.providers_from_env`.
 
 ### 6.2 `security.py`: passwords, rate limiting, tokens
 
@@ -447,7 +469,14 @@ eyJzdWIiOiJhbGljZSIsInJvbGUiOiJhZG1pbiIs...  .  q0Rk3...
   company's ID) makes the signature check fail. A test does exactly this.
 - The body is readable (base64 is encoding, not encryption), so tokens contain no secrets.
 - `exp` makes tokens **expire** after an hour.
-- These tokens are **stateless**: the server verifies them with math, with no lookup.
+- Each token has a **purpose** (`access`, `mfa`, `reset`). `verify(token, purpose)` rejects a token
+  made for a different purpose, so a half-finished sign-in token or a password-reset link can
+  never be used as a session.
+- The signature is checked with math alone, but `accounts.authenticate` then does one cheap
+  database lookup per request: the user must still exist, in the same company, and the token's
+  `pwf` (a 16-character fingerprint of the password hash) must match. Changing or resetting a
+  password changes the fingerprint, which **ends every existing session** at once, without a
+  session table.
 
 ### 6.3 `crypto.py`: encrypting bank details
 
@@ -658,7 +687,10 @@ A small **command dispatcher**: `main(argv)` looks at the first word (`init`, `c
 success, 1 for failure), the Unix convention scripts rely on. `_db()` is a context manager that
 always closes the database, even on errors. The CLI uses the database *owner* connection, because
 operators need to create companies, which the web server's limited role can't do.
-`reset-password NAME` sets a new password for a user who forgot theirs.
+`reset-password NAME` sets a new password for a user who forgot theirs. `init-deploy DIR` writes
+one file per production secret (with matching database passwords, permissions `600`, never
+overwriting). Every command except `migrate` first runs `db.check_keys()`; `run(argv)` turns a
+configuration problem such as wrong keys into a one-line message and exit code 2.
 
 ### 6.9 `decisions.py`: what to do about a flag
 
@@ -748,6 +780,115 @@ JavaScript.
   active page, keyboard-operable rows (Enter or Space expands), and visible focus outlines.
 
 ---
+
+### 6.13 Sign-in: `accounts.py`, `totp.py`, `qr.py`, `oidc.py`, `mailer.py`
+
+`accounts.py` is the **sign-in service**: every rule about who may sign in and how lives here,
+as plain Python methods (`login`, `login_second_factor`, `authenticate`, `enable_2fa`,
+`forgot_password`, `sso_callback`, ...). `api.py` only turns HTTP into calls and errors
+(`AccountError(status, message)`) back into HTTP. Keeping the logic out of the web framework is
+the **thin controller** pattern: the tests in `test_accounts.py` exercise every rule without
+starting a server.
+
+**Two-factor authentication (`totp.py`).** TOTP, RFC 6238, the algorithm in every
+authenticator app:
+
+1. When you turn it on, the server makes a random 160-bit **shared secret** and shows it as a QR
+   code. Your phone stores it. (On the server it is encrypted like a bank account.)
+2. Both sides compute `step = floor(unix_time / 30)`, then `HMAC-SHA1(secret, step)`, take 4 bytes
+   from a position given by the last byte (**dynamic truncation**), and keep the last 6 digits.
+3. Same secret + same clock = same code, with nothing sent over the network.
+
+`verify` accepts the step before and after too (phones' clocks drift), and stores the last step
+used (`totp_last_step`): a code that was already used, even within its 30 seconds, is refused.
+That is **replay protection**. **Recovery codes** are ten random one-time codes; only their
+HMAC (keyed with the server secret, a **pepper**) is stored, and each is deleted once used.
+
+**QR codes (`qr.py`).** The QR code is drawn by the app itself rather than a library or an
+online service, so the secret never leaves the server and the page needs no third-party script
+(the CSP stays strict). It is a complete encoder for what's needed: byte mode, error-correction
+level M, versions 1–10. The interesting parts: **Reed–Solomon error correction** (polynomial
+division over the finite field GF(256), so a scratched code still scans), the fixed patterns
+(finders, timing, alignment), and trying all **eight masks** and keeping the one with the lowest
+penalty score, which avoids patterns that confuse cameras. A test decodes 320 generated codes
+with OpenCV to prove they read back correctly.
+
+**Single sign-on (`oidc.py`).** OpenID Connect, the standard behind "Sign in with Microsoft /
+Google", using the **authorization code flow with PKCE**:
+
+```mermaid
+sequenceDiagram
+    participant B as Browser
+    participant A as App
+    participant P as Microsoft / Google
+    B->>A: GET /auth/microsoft/start
+    A->>A: random state, nonce, PKCE verifier<br/>sealed (encrypted) into a cookie
+    A-->>B: redirect to P with state, nonce, sha256(verifier)
+    B->>P: user signs in (their password + their MFA)
+    P-->>B: redirect to /auth/microsoft/callback?code=...&state=...
+    B->>A: callback (cookie comes back too)
+    A->>A: state matches cookie? (stops forged callbacks)
+    A->>P: POST code + verifier + client secret
+    P-->>A: ID token (a signed JWT)
+    A->>A: verify RS256 signature with P's published keys,<br/>issuer, audience, expiry, nonce
+    A->>A: email must belong to a user an admin added
+    A-->>B: redirect to /#/sso?token=... (our own access token)
+```
+
+- **state** ties the callback to the browser that started it; **nonce** ties the ID token to this
+  attempt; **PKCE** means an intercepted `code` is useless without the verifier only the server
+  holds.
+- Keys are fetched from the provider's **JWKS** URL found by **discovery**
+  (`/.well-known/openid-configuration`) and re-fetched when an unknown key ID appears, so the
+  provider can rotate its keys.
+- Microsoft must be configured with your own tenant ID; multi-tenant endpoints are refused, so
+  a stranger with any Microsoft account can't get in.
+- SSO never creates accounts: the email must match a username an admin added. Sign-ins through
+  SSO count as two-factor, because the provider handles that.
+- Network calls (`get_json`, `post_form`) are passed in, so tests run against `tests/fake_idp.py`
+  and the browser test against a small fake provider server, with real RSA signatures.
+
+**Password reset (`mailer.py`).** `forgot_password` makes a 30-minute token with purpose `reset`
+that also carries the current password fingerprint, so it stops working as soon as it's used
+(the password, and so the fingerprint, changes). The mailer is chosen from settings: SMTP, a
+folder of `.eml` files (`MAIL_DIR`, for testing), or none. The reply is identical whether the
+account exists or not, and requests are rate limited.
+
+### 6.14 Hosting: `Dockerfile`, `docker-compose.prod.yml`, `deploy/`
+
+The production stack is four containers on a private network ([DEPLOYMENT.md](DEPLOYMENT.md)):
+
+```mermaid
+flowchart LR
+    U[Browser] -- HTTPS 443 --> C[caddy<br/>certificates, HTTP→HTTPS]
+    C -- HTTP, private network --> A[app<br/>uvicorn + FastAPI]
+    A -- invoice_app role, RLS --> D[(db<br/>PostgreSQL 16)]
+    K[backup<br/>pg_dump nightly] --> D
+    K --> F[./backups]
+    S[/deploy/secrets/*/] -. mounted at /run/secrets .-> A
+```
+
+- **TLS termination at a reverse proxy.** Caddy holds the certificate (obtained and renewed
+  automatically with the ACME protocol from Let's Encrypt) and forwards plain HTTP to the app
+  over the private network. uvicorn runs with `--proxy-headers`, trusting `X-Forwarded-For` and
+  `X-Forwarded-Proto` only from allowed addresses, so the rate limiter sees real client IPs and
+  the app knows the request was HTTPS.
+- **HTTPS enforcement** in `api.py`: with `FORCE_HTTPS=1`, any plain-HTTP request is redirected
+  (308) and every response carries **HSTS** (`Strict-Transport-Security`), which tells browsers
+  to refuse plain HTTP for this site for a year. `/health` is exempt so internal checks work.
+- **Docker secrets:** each secret is a file mounted at `/run/secrets/NAME` and read through
+  `NAME_FILE`, so it never appears in `docker inspect` or the process environment.
+- **Start-up** (`deploy/entrypoint.sh`): run `migrate` (idempotent: it only adds what's missing)
+  and the key check, then `exec uvicorn` so uvicorn receives stop signals directly.
+- **Key check** (`db.check_keys`): the first start stores a value encrypted with the keys in the
+  `meta` table (a **canary**). Every later start decrypts it; wrong keys stop the app before it
+  writes anything unreadable.
+- **Health checks:** `/health` (process is up) and `/health/ready` (database answers). Docker's
+  `HEALTHCHECK` and cloud load balancers use the second.
+- **Backups** (`deploy/backup.sh`): `pg_dump --format=custom`, written to a `.partial` file and
+  renamed only when complete (so a crash never leaves a half backup that looks whole), old files
+  deleted after 14 days. Restoring is `pg_restore --clean` followed by `migrate`, which re-applies
+  the role permissions and policies. The keys are deliberately **not** in the backups.
 
 ## 7. The detection engine in depth
 
@@ -915,7 +1056,15 @@ company's real, labelled invoices.
 | Threat | Defence | Where |
 |---|---|---|
 | Stolen database reveals passwords | scrypt, salted, slow, memory-hard | `security.py` |
-| Password guessing | Rate limit 5 per 15 min per IP + user, then lockout | `security.py`, `api.py` |
+| Password guessing | Rate limit 5 per 15 min per IP + user, then lockout | `security.py`, `accounts.py` |
+| Stolen password | Two-factor (TOTP), can be required company-wide; or SSO with the company's own MFA | `totp.py`, `accounts.py` |
+| Replaying a two-factor code | Last used time-step stored; same code refused | `totp.py` |
+| Forged SSO callback, stolen code | state + nonce + PKCE, ID token signature and claims checked | `oidc.py` |
+| Stranger with a Microsoft/Google account | Own tenant only; email must be a user an admin added | `oidc.py`, `accounts.py` |
+| Reset link reused or leaked later | 30-minute expiry; dies when the password changes | `accounts.py`, `security.py` |
+| Old sessions after a password change | Password fingerprint in every token | `security.py` |
+| Eavesdropping | HTTPS only (redirect + HSTS), TLS at the proxy | `api.py`, `deploy/Caddyfile` |
+| App started with the wrong keys | Encrypted canary checked at start-up | `db.py` `check_keys` |
 | Learning which usernames exist | Same message and same timing for unknown user and wrong password | `api.py`, `DUMMY_HASH` |
 | Forged or altered login token | HMAC-SHA256 signature, expiry | `TokenSigner` |
 | Seeing another company's data | Token carries company; every query filtered; PostgreSQL RLS; per-company keys | `api.py`, `db.py`, `schema.py`, `crypto.py` |
@@ -929,7 +1078,7 @@ company's real, labelled invoices.
 | Header injection through file names | Download names sanitized and percent-encoded | `api.py` `attachment()` |
 | Insider tampering with history | Audit log is append-only for the app role | `schema.py` |
 | Over-privileged users | Three roles enforced on every route | `api.py` `require()` |
-| Secrets leaked in code or logs | Environment variables, `.gitignore`, `repr=False` | `config.py` |
+| Secrets leaked in code or logs | Secrets manager or mounted files (`NAME_FILE`), `.gitignore`, `repr=False` | `config.py` |
 | Sensitive data sent to an AI service | Only IDs, rule names and numbers are sent | `explain.py` |
 
 **Content-Security-Policy (CSP)** deserves a sentence: it's a response header telling the browser
@@ -938,7 +1087,7 @@ an attacker somehow got markup into the page, the browser would refuse to execut
 was built with no inline scripts and no third-party libraries specifically so this strict policy
 works.
 
-Limits are listed honestly in the README: no single sign-on or multi-factor login yet; RLS
+Limits are listed honestly in the README: the sign-in rate limiter is per server; RLS
 protects against application mistakes, not against an attacker who can run arbitrary SQL as the
 app role; role checks live in the application, not the database.
 
@@ -1029,10 +1178,12 @@ tests sit at the top. Each level catches different mistakes.
 
 ### 11.3 Continuous integration
 
-On every push, GitHub Actions runs eight jobs in parallel: lint (ruff) and tests on Ubuntu with
+On every push, GitHub Actions runs nine jobs in parallel: lint (ruff) and tests on Ubuntu with
 Python 3.11, 3.12 and 3.13 and on Windows (four jobs); the same tests against a real PostgreSQL 16
-server, with a guard that fails if the PostgreSQL tests were silently skipped; the browser tests;
-a Docker build; and a dependency vulnerability audit (pip-audit). Dependabot opens pull requests
+server, with a guard that fails if the PostgreSQL tests were silently skipped; the browser tests (including two-factor set-up from the on-screen QR secret, SSO through a
+fake provider, and a reset email read from the outbox);
+a Docker build; the **production stack** (`docker-compose.prod.yml` with HTTPS, secrets as files,
+sign-in, then a backup → wipe → restore → read cycle); and a dependency vulnerability audit (pip-audit). Dependabot opens pull requests
 when libraries update.
 
 ---
@@ -1102,7 +1253,9 @@ that learns from their decisions."
 - **Accuracy on real data is unmeasured.** The next real milestone is a pilot on one company's
   historical invoices.
 - **No connectors yet.** QuickBooks or Xero sync would remove manual exports.
-- **Sign-in:** no single sign-on, multi-factor authentication or password reset.
+- **Sign-in:** SSO, two-factor and reset are tested against stand-ins (a fake identity
+  provider, `.eml` files), not real Microsoft, Google or mail servers. Next: passkeys
+  (WebAuthn), and SCIM so leavers are removed automatically.
 - **Scale:** one database connection per server process; detection runs inside the web request;
   the rate limiter lives in memory. Production would add a connection pool, a background job
   queue and Redis.
@@ -1119,6 +1272,10 @@ that learns from their decisions."
 | Term | Meaning |
 |---|---|
 | AEAD | Encryption that also proves the data wasn't altered, and can bind extra context |
+| HSTS | A header telling browsers to use only HTTPS for this site |
+| OIDC | OpenID Connect: the standard behind "Sign in with Microsoft/Google" |
+| PKCE | Proof Key for Code Exchange: stops a stolen sign-in code being used by someone else |
+| TOTP | Time-based one-time password: the 6-digit codes in authenticator apps |
 | AES-256-GCM | The specific AEAD cipher used for bank accounts |
 | API | The set of URLs a program offers for other programs to call |
 | ASGI | The standard interface between Python async web apps and servers |
