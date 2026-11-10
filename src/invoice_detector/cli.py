@@ -1,37 +1,37 @@
-"""Command line helpers.
+"""Command line helpers. COMPANY is the company name, in quotes if it has spaces.
 
-  python -m invoice_detector.cli init                   # create .env with fresh secrets
-  python -m invoice_detector.cli create-user NAME ROLE  # role: admin|accountant|auditor
-  python -m invoice_detector.cli seed                   # load synthetic demo invoices
-  python -m invoice_detector.cli import-csv FILE        # columns: id,vendor,amount,date[,bank_account]
-  python -m invoice_detector.cli detect                 # run detection, print the review queue
-  python -m invoice_detector.cli evaluate               # score the detector on synthetic data
-  python -m invoice_detector.cli gen-keys               # print fresh secrets (for a secrets manager)
+  python -m invoice_detector.cli init                           # create .env with fresh secrets
+  python -m invoice_detector.cli migrate                        # PostgreSQL only: tables + row-level security
+  python -m invoice_detector.cli create-org COMPANY             # add a company
+  python -m invoice_detector.cli list-orgs
+  python -m invoice_detector.cli create-user COMPANY NAME ROLE  # role: admin|accountant|auditor
+  python -m invoice_detector.cli seed COMPANY                   # load synthetic demo invoices
+  python -m invoice_detector.cli import-csv COMPANY FILE        # columns: id,vendor,amount,date[,bank_account]
+  python -m invoice_detector.cli detect COMPANY                 # run detection, print the review queue
+  python -m invoice_detector.cli evaluate                       # score the detector on synthetic data
+  python -m invoice_detector.cli gen-keys                       # print fresh secrets (for a secrets manager)
 """
 import base64
 import csv
 import getpass
 import os
 import secrets
-import sqlite3
 import sys
 from contextlib import contextmanager
+from dataclasses import replace
 from datetime import date
 
 from .config import Settings
-from .crypto import Vault
-from .db import Database
+from .db import ROLES, Conflict, Database
 from .demo import generate_demo
-from .detection import detect, review_queue
+from .detection import DEFAULT_CONFIG, detect, learned_weights, review_queue
 from .evaluate import evaluate, format_report
-
-ROLES = ("admin", "accountant", "auditor")
 
 
 @contextmanager
 def _db():
-    settings = Settings.from_env()
-    db = Database(settings.db_path, Vault.from_settings(settings))
+    """The CLI is an operator tool, so it uses the owner connection when one is set."""
+    db = Database.from_settings(Settings.from_env(), admin=True)
     try:
         yield db
     finally:
@@ -57,72 +57,110 @@ def _init() -> int:
     return 0
 
 
-def _create_user(name: str, role: str) -> int:
+def _org(db: Database, name: str) -> str | None:
+    try:
+        return db.org_id_by_name(name)
+    except KeyError:
+        print(f"No company named '{name}'. Create it with: create-org \"{name}\"")
+        return None
+
+
+def _create_user(company: str, name: str, role: str) -> int:
     if role not in ROLES:
         print(f"Role must be one of: {', '.join(ROLES)}")
         return 1
-    password = getpass.getpass("Password (min 12 chars): ")
-    if len(password) < 12:
-        print("Password too short.")
-        return 1
-    try:
-        with _db() as db:
-            db.create_user(name, password, role)
-    except sqlite3.IntegrityError:
-        print(f"User '{name}' already exists.")
-        return 1
-    print(f"Created {role} user '{name}'.")
+    with _db() as db:
+        org_id = _org(db, company)
+        if org_id is None:
+            return 1
+        password = getpass.getpass("Password (min 12 chars): ")
+        if len(password) < 12:
+            print("Password too short.")
+            return 1
+        try:
+            db.create_user(org_id, name, password, role)
+        except Conflict:
+            print(f"Username '{name}' is already taken.")
+            return 1
+    print(f"Created {role} user '{name}' in {company}.")
     return 0
 
 
-def _load(db: Database, rows) -> tuple[int, int]:
+def _load(db: Database, org_id: str, rows) -> tuple[int, int]:
     added = skipped = 0
     for r in rows:
         try:
             amount = float(r["amount"])
             date.fromisoformat(r["date"])  # must be yyyy-mm-dd
-            db.add_invoice(r["id"].strip(), r["vendor"].strip(), amount, r["date"],
+            db.add_invoice(org_id, r["id"].strip(), r["vendor"].strip(), amount, r["date"],
                            (r.get("bank_account") or "").strip() or None, "import")
             added += 1
-        except (KeyError, ValueError, AttributeError, sqlite3.IntegrityError):
+        except (KeyError, ValueError, AttributeError, Conflict):
             skipped += 1  # bad row or an id that is already stored
     return added, skipped
 
 
-def _detect() -> int:
+def _detect(company: str) -> int:
     with _db() as db:
-        invoices = db.detection_inputs()
-        found = detect(invoices)
-        db.save_flags(found)
-    queue = review_queue(found)
-    print(f"Checked {len(invoices)} invoices: {len(queue)} flagged for review.\n")
+        org_id = _org(db, company)
+        if org_id is None:
+            return 1
+        cfg = replace(DEFAULT_CONFIG, approval_threshold=db.get_org(org_id)["approval_threshold"])
+        invoices = db.detection_inputs(org_id)
+        found = detect(invoices, cfg)
+        db.save_flags(org_id, found)
+        queue = review_queue(found, learned_weights(db.feedback_counts(org_id)))
+    print(f"{company}: checked {len(invoices)} invoices, {len(queue)} flagged for review.\n")
     for item in queue[:25]:
         print(f"{item['invoice_id']:<12} risk {item['risk']:>3}  {', '.join(item['rules'])}")
     return 0
 
 
 def main(argv: list[str]) -> int:
-    cmd = argv[0] if argv else ""
-    if cmd == "init":
+    cmd, args = (argv[0], argv[1:]) if argv else ("", [])
+    if cmd == "init" and not args:
         return _init()
-    if cmd == "gen-keys":
+    if cmd == "gen-keys" and not args:
         print(_fresh_secrets(), end="")
-    elif cmd == "create-user" and len(argv) == 3:
-        return _create_user(argv[1], argv[2])
-    elif cmd == "seed":
-        rows, injected = generate_demo()
-        with _db() as db:
-            added, skipped = _load(db, rows)
-        print(f"Loaded {added} synthetic invoices ({skipped} skipped), "
-              f"including {len(injected)} injected anomalies.")
-    elif cmd == "import-csv" and len(argv) == 2:
-        with open(argv[1], newline="", encoding="utf-8-sig") as f, _db() as db:
-            added, skipped = _load(db, csv.DictReader(f))
-        print(f"Imported {added} invoices, skipped {skipped} (bad rows or existing ids).")
-    elif cmd == "detect":
-        return _detect()
-    elif cmd == "evaluate":
+    elif cmd == "evaluate" and not args:
         print(format_report(evaluate()))
+    elif cmd == "migrate" and not args:
+        with _db() as db:
+            db.migrate()
+        print("Database is up to date." if db.is_postgres
+              else "Nothing to do: SQLite tables are created automatically.")
+    elif cmd == "create-org" and len(args) == 1:
+        try:
+            with _db() as db:
+                db.create_org(args[0])
+        except Conflict:
+            print(f"Company '{args[0]}' already exists.")
+            return 1
+        print(f"Created company '{args[0]}'.")
+    elif cmd == "list-orgs" and not args:
+        with _db() as db:
+            for org in db.list_orgs():
+                print(f"{org['name']}  (approval threshold {org['approval_threshold']:,.0f})")
+    elif cmd == "create-user" and len(args) == 3:
+        return _create_user(*args)
+    elif cmd == "seed" and len(args) == 1:
+        with _db() as db:
+            org_id = _org(db, args[0])
+            if org_id is None:
+                return 1
+            rows, injected = generate_demo()
+            added, skipped = _load(db, org_id, rows)
+        print(f"Loaded {added} synthetic invoices into {args[0]} ({skipped} skipped), "
+              f"including {len(injected)} injected anomalies.")
+    elif cmd == "import-csv" and len(args) == 2:
+        with open(args[1], newline="", encoding="utf-8-sig") as f, _db() as db:
+            org_id = _org(db, args[0])
+            if org_id is None:
+                return 1
+            added, skipped = _load(db, org_id, csv.DictReader(f))
+        print(f"Imported {added} invoices into {args[0]}, skipped {skipped} (bad rows or existing ids).")
+    elif cmd == "detect" and len(args) == 1:
+        return _detect(args[0])
     else:
         print(__doc__)
         return 1

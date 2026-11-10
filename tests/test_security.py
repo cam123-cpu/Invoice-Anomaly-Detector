@@ -24,23 +24,24 @@ class TokenTests(unittest.TestCase):
         self.signer = TokenSigner("s" * 40)
 
     def test_roundtrip(self):
-        data = self.signer.read(self.signer.make("alice", "admin"))
-        self.assertEqual(data, {"sub": "alice", "role": "admin"})
+        data = self.signer.read(self.signer.make("alice", "admin", "org-a"))
+        self.assertEqual(data, {"sub": "alice", "role": "admin", "org": "org-a"})
 
     def test_tampered_token_rejected(self):
-        body, sig = self.signer.make("alice", "auditor").split(".")
-        forged = self.signer.make("alice", "admin").split(".")[0] + "." + sig
-        with self.assertRaises(AuthError):
-            self.signer.read(forged)
+        _, sig = self.signer.make("alice", "auditor", "org-a").split(".")
+        for role, org in (("admin", "org-a"), ("auditor", "org-b")):  # change role, or company
+            forged = self.signer.make("alice", role, org).split(".")[0] + "." + sig
+            with self.assertRaises(AuthError):
+                self.signer.read(forged)
 
     def test_expired_token_rejected(self):
-        token = self.signer.make("alice", "admin", ttl=60, now=1000)
+        token = self.signer.make("alice", "admin", "org-a", ttl=60, now=1000)
         self.assertEqual(self.signer.read(token, now=1030)["sub"], "alice")
         with self.assertRaises(AuthError):
             self.signer.read(token, now=1100)
 
     def test_other_secret_rejected(self):
-        token = self.signer.make("alice", "admin")
+        token = self.signer.make("alice", "admin", "org-a")
         with self.assertRaises(AuthError):
             TokenSigner("different-secret-" + "z" * 30).read(token)
 

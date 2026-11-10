@@ -4,7 +4,8 @@ from invoice_detector.demo import generate_demo
 from invoice_detector.detection import (DetectionConfig, Invoice, detect, find_amount_outliers,
                                         find_bank_account_changes, find_ml_outliers,
                                         find_near_duplicates, find_similar_vendor_names,
-                                        find_split_invoices, review_queue, risk_scores)
+                                        find_split_invoices, learned_weights, review_queue,
+                                        risk_scores, RULE_WEIGHT)
 from invoice_detector.evaluate import to_invoices
 
 
@@ -89,6 +90,23 @@ class RuleTests(unittest.TestCase):
         risks = risk_scores(found)
         self.assertGreater(risks["2"], risks["1"])  # the duplicate outranks the original
         self.assertLessEqual(max(risks.values()), 100)
+
+    def test_feedback_tunes_rule_weights(self):
+        self.assertEqual(learned_weights({}), RULE_WEIGHT)  # no reviews: nothing changes
+        noisy = learned_weights({"weekend_invoice": (0, 40), "duplicate": (30, 0), "made_up": (1, 1)})
+        self.assertLessEqual(noisy["weekend_invoice"], RULE_WEIGHT["weekend_invoice"] / 2)
+        self.assertGreaterEqual(noisy["weekend_invoice"], 0.05)  # never silenced completely
+        self.assertEqual(noisy["duplicate"], RULE_WEIGHT["duplicate"])  # confirmations keep it
+        self.assertNotIn("made_up", noisy)
+        few = learned_weights({"near_duplicate": (0, 1)})  # one dismissal barely moves it
+        self.assertGreater(few["near_duplicate"], RULE_WEIGHT["near_duplicate"] * 0.8)
+
+    def test_learned_weights_reorder_the_queue(self):
+        found = detect([inv(1, amount=5000.0, date="2026-01-05"), inv(2, amount=5000.0, date="2026-01-05"),
+                        inv(3, vendor="W", amount=7000.0, date="2026-01-07")])
+        self.assertEqual(review_queue(found)[0]["invoice_id"], "2")
+        tuned = learned_weights({"duplicate": (0, 500), "round_amount": (0, 500)})
+        self.assertLess(risk_scores(found, tuned)["2"], risk_scores(found)["2"])
 
 
 if __name__ == "__main__":

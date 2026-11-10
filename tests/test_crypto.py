@@ -42,6 +42,17 @@ class VaultTests(unittest.TestCase):
         other = Vault({1: self.k1}, secrets.token_bytes(32))
         self.assertNotEqual(self.vault.blind_index("X"), other.blind_index("X"))
 
+    def test_each_company_gets_its_own_keys(self):
+        a = Vault.for_org({1: self.k1}, self.idx, "org-a")
+        b = Vault.for_org({1: self.k1}, self.idx, "org-b")
+        token = a.encrypt("secret", "ctx")
+        self.assertEqual(Vault.for_org({1: self.k1}, self.idx, "org-a").decrypt(token, "ctx"), "secret")
+        with self.assertRaises(ValueError):
+            b.decrypt(token, "ctx")
+        with self.assertRaises(ValueError):
+            self.vault.decrypt(token, "ctx")  # the master key alone doesn't open it either
+        self.assertNotEqual(a.blind_index("X"), b.blind_index("X"))
+
 
 if __name__ == "__main__":
     unittest.main()

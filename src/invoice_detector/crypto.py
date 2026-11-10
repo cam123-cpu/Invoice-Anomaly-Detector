@@ -1,13 +1,19 @@
-"""Field-level encryption: AES-256-GCM with key IDs (rotation) and a blind index."""
+"""Field-level encryption: AES-256-GCM with key IDs (rotation), a blind index,
+and a separate derived key per company."""
 import base64
 import hashlib
 import hmac
 import secrets
 
 from cryptography.exceptions import InvalidTag
+from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 
-from .config import Settings
+
+def _derive(key: bytes, purpose: str, org_id: str) -> bytes:
+    return HKDF(algorithm=hashes.SHA256(), length=32, salt=None,
+                info=f"invoice-detector/{purpose}/{org_id}".encode()).derive(key)
 
 
 class Vault:
@@ -17,8 +23,12 @@ class Vault:
         self._index_key = index_key
 
     @classmethod
-    def from_settings(cls, settings: Settings) -> "Vault":
-        return cls(settings.encryption_keys, settings.index_key)
+    def for_org(cls, keys: dict[int, bytes], index_key: bytes, org_id: str) -> "Vault":
+        """Each company gets its own keys, derived from the master keys with HKDF.
+        One company's ciphertext cannot be decrypted with another company's vault, and
+        the same bank account produces a different blind index in each company."""
+        return cls({kid: _derive(k, "enc", org_id) for kid, k in keys.items()},
+                   _derive(index_key, "idx", org_id))
 
     def encrypt(self, plaintext: str, context: str) -> str:
         """`context` (e.g. 'invoices.bank:INV-1') is authenticated, so a ciphertext

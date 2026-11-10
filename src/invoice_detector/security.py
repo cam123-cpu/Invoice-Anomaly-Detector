@@ -79,9 +79,9 @@ class TokenSigner:
     def _sign(self, body: str) -> str:
         return _b64(hmac.new(self._key, body.encode(), hashlib.sha256).digest())
 
-    def make(self, user: str, role: str, ttl: int = 3600, now: float | None = None) -> str:
+    def make(self, user: str, role: str, org: str, ttl: int = 3600, now: float | None = None) -> str:
         now = time.time() if now is None else now
-        body = _b64(json.dumps({"sub": user, "role": role, "exp": now + ttl}).encode())
+        body = _b64(json.dumps({"sub": user, "role": role, "org": org, "exp": now + ttl}).encode())
         return f"{body}.{self._sign(body)}"
 
     def read(self, token: str, now: float | None = None) -> dict:
@@ -93,6 +93,6 @@ class TokenSigner:
             data = json.loads(base64.urlsafe_b64decode(body + "=" * (-len(body) % 4)))
             if data["exp"] < now:
                 raise AuthError("Token expired")
-            return {"sub": data["sub"], "role": data["role"]}
+            return {"sub": data["sub"], "role": data["role"], "org": data["org"]}
         except (ValueError, KeyError) as exc:
             raise AuthError("Malformed token") from exc

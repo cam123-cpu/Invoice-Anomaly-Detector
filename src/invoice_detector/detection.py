@@ -328,20 +328,38 @@ def detect(invoices: list[Invoice], cfg: DetectionConfig = DEFAULT_CONFIG) -> li
     return sorted(found, key=lambda a: (SEVERITY_RANK[a.severity], a.invoice_id, a.rule))
 
 
-def risk_scores(anomalies: list[Anomaly]) -> dict[str, int]:
+def learned_weights(feedback: dict[str, tuple[int, int]], prior: int = 5) -> dict[str, float]:
+    """Adjust each rule's weight using a company's own review decisions.
+
+    feedback is {rule: (confirmed, dismissed)}. A rule's weight is multiplied by
+    (confirmed + prior) / (confirmed + dismissed + prior): with no reviews nothing
+    changes, and a rule whose flags keep being dismissed fades (to a floor of 0.05,
+    so it is never silenced completely). `prior` is how many reviews it takes before
+    feedback starts to dominate.
+    """
+    weights = dict(RULE_WEIGHT)
+    for rule, (confirmed, dismissed) in feedback.items():
+        if rule in weights:
+            factor = (confirmed + prior) / (confirmed + dismissed + prior)
+            weights[rule] = round(max(0.05, weights[rule] * factor), 3)
+    return weights
+
+
+def risk_scores(anomalies: list[Anomaly], weights: dict[str, float] | None = None) -> dict[str, int]:
     """Risk 0-100 per invoice. Signals combine as a noisy-OR: independent weak signals
     add up, but no amount of weak signals outranks certainty. Highest first."""
+    weights = RULE_WEIGHT if weights is None else weights
     miss: dict[str, float] = defaultdict(lambda: 1.0)
     for a in anomalies:
-        weight = RULE_WEIGHT.get(a.rule, 0.3)
+        weight = weights.get(a.rule, 0.3)
         if a.rule == "amount_outlier" and a.severity == "high":
-            weight = 0.75
+            weight = min(0.95, weight * 0.75 / RULE_WEIGHT["amount_outlier"])
         miss[a.invoice_id] *= 1 - weight
     scores = {inv_id: round(100 * (1 - m)) for inv_id, m in miss.items()}
     return dict(sorted(scores.items(), key=lambda kv: (-kv[1], kv[0])))
 
 
-def review_queue(anomalies: list[Anomaly]) -> list[dict]:
+def review_queue(anomalies: list[Anomaly], weights: dict[str, float] | None = None) -> list[dict]:
     """Invoices ranked by risk, each with the reasons it was flagged."""
     reasons: dict[str, list[Anomaly]] = defaultdict(list)
     for a in anomalies:
@@ -349,4 +367,4 @@ def review_queue(anomalies: list[Anomaly]) -> list[dict]:
     return [{"invoice_id": inv_id, "risk": risk,
              "rules": [a.rule for a in reasons[inv_id]],
              "details": [a.detail for a in reasons[inv_id]]}
-            for inv_id, risk in risk_scores(anomalies).items()]
+            for inv_id, risk in risk_scores(anomalies, weights).items()]
