@@ -2,9 +2,12 @@
 
 [![CI](https://github.com/cam123-cpu/Invoice-Anomaly-Detector/actions/workflows/ci.yml/badge.svg)](https://github.com/cam123-cpu/Invoice-Anomaly-Detector/actions/workflows/ci.yml)
 
-Flags suspicious invoices for **human review**, using eleven transparent audit rules plus an
-Isolation Forest, and ranks them in a risk-scored review queue. It produces signals, not proof
-of fraud.
+Flags suspicious invoices for **human review**. Many companies can share one deployment, each
+seeing only its own data. Twelve signals (eleven audit rules plus an Isolation Forest) feed a
+risk-ranked review queue, and each company's review decisions tune the scoring for that company.
+It produces signals, not proof of fraud.
+
+**New here? Follow the [tutorial](docs/TUTORIAL.md).**
 
 ## What it detects
 
@@ -25,7 +28,12 @@ of fraud.
 
 **Risk score (0–100):** weights combine as a noisy-OR, `risk = 1 − Π(1 − weight)`. Several weak
 signals add up, but they never outrank one strong signal. Thresholds live in `DetectionConfig`
-(`src/invoice_detector/detection.py`).
+(`src/invoice_detector/detection.py`); the approval threshold is a per-company setting.
+
+**Learning from reviewers:** when staff mark flagged invoices as confirmed or dismissed, each
+rule's weight for that company is multiplied by `(confirmed + 5) / (confirmed + dismissed + 5)`.
+Rules that keep raising false alarms fade, and `GET /metrics` reports the measured precision
+per rule. This re-weights the rules; it does not retrain the Isolation Forest.
 
 ## How good is it?
 
@@ -49,57 +57,78 @@ date), which score below the cut-off by design.
 detects them, and real invoices are messier. Measure on your own labelled data before trusting
 any figure here.
 
-## Security features
+## Many companies, kept apart
+
+| Layer | What it does |
+|---|---|
+| Signed token | Every request carries the caller's company inside a tamper-proof token |
+| Application | Every query is filtered by that company's `org_id` |
+| PostgreSQL row-level security | The database refuses to return or accept another company's rows, even for a query with no filter |
+| Least-privilege role | The web server's database role cannot create companies, edit or delete invoices, alter the audit log, or switch the protection off |
+| Per-company keys | Bank accounts are encrypted with a key derived for each company, so one company's data cannot be decrypted with another's key |
+
+`tests/test_tenancy.py` proves each of these, and CI runs it against a real PostgreSQL 16 server
+on every push. SQLite, used for local runs, has the first two layers and the last.
+
+**Limits to know about:**
+
+- Row-level security protects against application bugs such as a forgotten filter. It does not
+  help if an attacker can run arbitrary SQL as the app role, because the role sets the current
+  company itself. Parameterized queries everywhere are the defence against that.
+- Role checks (admin, accountant, auditor) are enforced in the application, not the database.
+- No single sign-on or multi-factor login yet, and the login rate limiter is per server.
+- One database connection per server process. Add a connection pool for real load.
+- Amounts are stored as floating-point numbers, which is fine for detection but not for ledgers.
+
+## Other security features
 
 - **Secrets in environment variables** (`.env` is git-ignored; `.env.example` is the template)
 - **Passwords hashed** with salted scrypt; constant-time comparison
 - **Rate-limited login**: 5 failures per 15 minutes per IP + username, then a lockout
-- **Signed, expiring tokens** and **role-based access** (admin / accountant / auditor)
 - **Parameterized SQL everywhere**; sort columns go through an allow-list
 - **Bank accounts encrypted** with AES-256-GCM (key rotation supported) plus a keyed blind
   index, so detection compares accounts without ever decrypting them
+- **Audit trail** of logins, imports, detection runs, reviews and bank-account views
 - **LLM privacy**: explanations get only invoice IDs, rule names and numbers
-- **Postgres row-level security** in `postgres/` for a production database
 
-## Run it locally
+## Quick start
 
 ```bash
 python -m venv .venv
 source .venv/bin/activate            # Windows PowerShell: .venv\Scripts\Activate.ps1
 pip install -e ".[dev]"
 
-python -m invoice_detector.cli init                  # creates .env with fresh secrets
-python -m invoice_detector.cli create-user alice admin
-python -m invoice_detector.cli seed                  # synthetic invoices with injected anomalies
-python -m invoice_detector.cli detect                # prints the ranked review queue
+python -m invoice_detector.cli init                       # creates .env with fresh secrets
+python -m invoice_detector.cli create-org "Acme Inc"
+python -m invoice_detector.cli create-user "Acme Inc" alice admin
+python -m invoice_detector.cli seed "Acme Inc"            # synthetic invoices with planted anomalies
+python -m invoice_detector.cli detect "Acme Inc"          # prints the ranked review queue
 uvicorn invoice_detector.api:create_app --factory --reload
 ```
 
-Open http://127.0.0.1:8000/docs, call `/login`, click **Authorize** and paste the token, then
-try `/detect`, `/review-queue` and `/anomalies`.
-
-### Use your own invoices
-
-```bash
-python -m invoice_detector.cli import-csv invoices.csv
-python -m invoice_detector.cli detect
-```
-
-The CSV needs the columns `id,vendor,amount,date` (date as `yyyy-mm-dd`) and may include
-`bank_account`. Bad rows and already-stored ids are skipped and counted.
+Then open http://127.0.0.1:8000/docs. The [tutorial](docs/TUTORIAL.md) walks through the web
+interface, loading your own CSV, the PostgreSQL setup and how to fit this into a payment process.
 
 ## API
 
 | Endpoint | Who | What |
 |---|---|---|
 | `POST /login` | anyone | Returns a bearer token (rate limited) |
-| `POST /invoices` | admin, accountant | Add an invoice |
+| `GET /me` | any role | Your username, role and company |
+| `POST /invoices`, `POST /invoices/bulk` | admin, accountant | Add one invoice, or up to 1,000 |
 | `GET /invoices` | any role | List invoices (no bank data) |
-| `GET /invoices/{id}/bank` | admin | Decrypt one bank account |
+| `GET /invoices/{id}/bank` | admin | Decrypt one bank account (audited) |
 | `POST /detect` | admin, accountant | Run detection and store the flags |
-| `GET /review-queue` | any role | Flagged invoices ranked by risk, with reasons |
+| `GET /review-queue` | any role | Flagged invoices ranked by risk, with reasons and status |
+| `POST /review/{id}` | admin, accountant | Mark a flagged invoice confirmed or dismissed |
+| `GET /metrics` | any role | Measured precision per rule and the weights in use |
 | `GET /anomalies` | any role | Every individual flag |
+| `GET`, `PUT /settings` | any role, admin | The company's approval threshold |
+| `GET`, `POST /users` | admin | List or add users in your own company |
+| `GET /audit` | admin, auditor | The company's audit trail |
 | `POST /explain` | any role | Plain-English summary (uses Claude if a key is set) |
+
+Everything is scoped to the caller's company.
 
 ## Test it
 
@@ -109,17 +138,18 @@ ruff check .
 ```
 
 Tests cover each detection rule, a quality bar on synthetic data (so a threshold change that
-hurts precision or recall fails the build), password hashing, token tampering and expiry,
-rate-limit lockouts, encryption, SQL-injection strings, CSV import and the API.
+hurts precision or recall fails the build), feedback learning, tenant isolation, password
+hashing, token tampering and expiry, rate-limit lockouts, encryption, SQL-injection strings,
+CSV import and the API. To include the PostgreSQL tests, see part 2 of the tutorial.
 
 ## Layout
 
 ```
-src/invoice_detector/   detection, evaluate, demo, api, cli, db, crypto, security, config, explain
+src/invoice_detector/   detection, evaluate, demo, api, cli, db, schema, crypto, security, config, explain
 tests/                  unit tests (unittest style, run by pytest)
-postgres/               row-level-security SQL and client (for production; untested here)
+docs/TUTORIAL.md        step-by-step guide
 prototypes/             the original Gleam version
-.github/workflows/      CI: lint, tests on Linux and Windows, quality report, dependency audit
+.github/workflows/      CI: lint, tests on Linux, Windows and PostgreSQL, Docker build, dependency audit
 ```
 
 ## Docker
@@ -128,14 +158,3 @@ prototypes/             the original Gleam version
 docker build -t invoice-detector .
 docker run -p 8000:8000 --env-file .env -v invoice-data:/data invoice-detector
 ```
-
-## Before real use
-
-- Move from SQLite to PostgreSQL and apply `postgres/rls_setup.sql`.
-- Keep keys in a secrets manager (AWS/GCP KMS, Vault), not a `.env` file. Losing the keys
-  makes the encrypted bank accounts unreadable.
-- Serve behind HTTPS. Behind a proxy, run uvicorn with `--proxy-headers` so rate limits see
-  real client IPs.
-- The login limiter is in memory; use Redis if you run more than one server.
-- Tune `DetectionConfig` on your own data, especially `approval_threshold`.
-- Check the model name in `explain.py` against current Anthropic docs.
