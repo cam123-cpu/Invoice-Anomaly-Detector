@@ -8,7 +8,8 @@ risk-ranked review queue, and each company's review decisions tune the scoring f
 It produces signals, not proof of fraud.
 
 It comes with a **web app** for accounts-payable teams: upload an Excel or CSV export, match its
-columns once, and work a ranked review queue with Confirm and Dismiss buttons.
+columns once, work a ranked review queue with Confirm and Dismiss buttons, and **download your own
+workbook back with every row's risk, status and reasons written in**.
 
 **New here? Follow the [tutorial](docs/TUTORIAL.md).**
 
@@ -123,6 +124,20 @@ payment process. The raw API is documented at http://127.0.0.1:8000/docs.
 | Activity log | The company's audit trail |
 | Settings | Approval threshold, people and roles |
 
+### Excel in, Excel out
+
+- **Reads real exports:** .xlsx (including multi-sheet workbooks, where you pick the sheet) and
+  .csv. Title rows, `$1,234.50` or `1.234,56`, Excel dates, day-first dates, blank and totals rows
+  are all handled, and every row that can't be used is listed with the reason.
+- **Writes results into your workbook:** "Download your file with flags" returns your own file
+  with Risk, Review status, Flags and Why flagged columns added to each row, risky rows shaded,
+  a ranked *Flagged invoices* sheet and an *About these flags* sheet. Your cells and formulas are
+  left exactly as they were (pictures and charts are not copied, a limit of the Excel library).
+- **Reports:** the review queue downloads as a formatted workbook from the Dashboard or Review queue.
+- **Safe to open:** text the app writes is always stored as text, so a vendor name like
+  `=HYPERLINK(...)` can never become a live formula in Excel.
+- **Samples:** four example files in [`samples/`](samples/), also one click away on the Upload page.
+
 It is plain HTML, CSS and JavaScript served by the API, with no third-party scripts, under a strict
 Content-Security-Policy. Uploaded text is always displayed as text, never run. CI tests it in a
 real browser (Chromium) against the real server, including a file with a hostile vendor name,
@@ -137,6 +152,9 @@ role restrictions, company isolation and a phone-sized screen.
 | `POST /import/preview`, `POST /import` | admin, accountant | Read an Excel/CSV file and suggest a column mapping; import it |
 | `POST /invoices`, `POST /invoices/bulk` | admin, accountant | Add one invoice, or up to 1,000 |
 | `GET /summary` | any role | Dashboard numbers |
+| `POST /export/annotated` | any role | Your uploaded workbook with results written in (.xlsx) |
+| `GET /export/review.xlsx` | any role | The review queue as an Excel report |
+| `GET /samples`, `GET /samples/{name}` | anyone | Sample Excel files and a blank template |
 | `GET /invoices` | any role | List invoices (no bank data) |
 | `GET /invoices/{id}/bank` | admin | Decrypt one bank account (audited) |
 | `POST /detect` | admin, accountant | Run detection and store the flags |
@@ -166,10 +184,11 @@ Excel/CSV parsing, the API and the web app in a real browser. To include the Pos
 ## Layout
 
 ```
-src/invoice_detector/   detection, evaluate, demo, importer, api, cli, db, schema, crypto, security, config, explain
+src/invoice_detector/   detection, evaluate, demo, importer, excel_out, samples, api, cli, db, schema, crypto, security, config, explain
 src/invoice_detector/web/  the web app (index.html, app.js, app.css)
 tests/                  unit tests (unittest style, run by pytest); tests/e2e is the browser test
 docs/TUTORIAL.md        step-by-step guide
+samples/                sample Excel files (regenerate with scripts/make_samples.py)
 prototypes/             the original Gleam version
 .github/workflows/      CI: lint, tests on Linux, Windows and PostgreSQL, browser test, Docker build, dependency audit
 ```

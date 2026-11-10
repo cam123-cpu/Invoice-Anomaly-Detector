@@ -6,7 +6,9 @@ Run:  uvicorn invoice_detector.api:create_app --factory
 """
 import base64
 import binascii
+import re
 from dataclasses import replace
+from urllib.parse import quote
 from datetime import date as Date
 from importlib.resources import files
 from typing import Literal
@@ -20,8 +22,10 @@ from .config import Settings
 from .db import Conflict, Database
 from .detection import (DEFAULT_CONFIG, RULE_WEIGHT, Anomaly, detect, learned_weights,
                         review_queue)
+from .excel_out import XLSX, annotate, review_report
 from .explain import explain
 from .importer import FIELDS, ID_PATTERN, FileProblem, convert, preview, read_table
+from .samples import SAMPLES, build as build_sample
 from .security import (DUMMY_HASH, AuthError, RateLimiter, RateLimitError, TokenSigner,
                        verify_password)
 
@@ -61,12 +65,25 @@ class ReviewIn(BaseModel):
 class FileIn(BaseModel):
     filename: str = Field(min_length=1, max_length=255)
     content_base64: str = Field(min_length=1, max_length=14_000_000)
+    sheet: str | None = Field(default=None, max_length=100)
 
 
-class ImportIn(FileIn):
+class MappedFileIn(FileIn):
     mapping: dict[str, str | None]
     date_order: Literal["MDY", "DMY"] = "MDY"
+
+
+class ImportIn(MappedFileIn):
     run_detection: bool = True
+
+
+def attachment(data: bytes, filename: str, media_type: str) -> Response:
+    """A file download. The plain filename is restricted to safe characters; the
+    original name goes in the RFC 5987 field for browsers that support it."""
+    plain = re.sub(r"[^A-Za-z0-9 ._-]", "_", filename)[:150] or "download.xlsx"
+    disposition = f"attachment; filename=\"{plain}\"; filename*=UTF-8''{quote(filename[:150])}"
+    return Response(data, media_type=media_type, headers={"Content-Disposition": disposition,
+                                                          "Cache-Control": "no-store"})
 
 
 class SettingsIn(BaseModel):
@@ -80,7 +97,7 @@ def create_app(settings: Settings | None = None, db: Database | None = None) -> 
     limiter = RateLimiter()
     bearer = HTTPBearer(auto_error=False)
 
-    app = FastAPI(title="Invoice Anomaly Detector", version="0.4.0")
+    app = FastAPI(title="Invoice Anomaly Detector", version="0.5.0")
     app.state.db, app.state.signer = db, signer
 
     def current_user(creds: HTTPAuthorizationCredentials | None = Depends(bearer)) -> dict:
@@ -119,7 +136,7 @@ def create_app(settings: Settings | None = None, db: Database | None = None) -> 
         except (binascii.Error, ValueError):
             raise HTTPException(422, "The file could not be read. Try uploading it again.") from None
         try:
-            return read_table(body.filename, data)
+            return read_table(body.filename, data, body.sheet)
         except FileProblem as exc:
             raise HTTPException(422, str(exc)) from None
 
@@ -148,6 +165,18 @@ def create_app(settings: Settings | None = None, db: Database | None = None) -> 
     @app.get("/app", include_in_schema=False)
     def web_redirect() -> RedirectResponse:
         return RedirectResponse("/")
+
+    # ---------------- sample files (synthetic, so no sign-in needed) ----------------
+    @app.get("/samples")
+    def list_samples() -> list[dict]:
+        """Sample Excel files in the shapes real exports take, plus a blank template."""
+        return [{"name": n, "title": t, "description": d} for n, (t, d, _) in SAMPLES.items()]
+
+    @app.get("/samples/{name}")
+    def get_sample(name: str) -> Response:
+        if name not in SAMPLES:
+            raise HTTPException(404, "No such sample")
+        return attachment(build_sample(name), name, XLSX)
 
     # ---------------- session ----------------
     @app.get("/health")
@@ -218,6 +247,53 @@ def create_app(settings: Settings | None = None, db: Database | None = None) -> 
         except Conflict:
             raise HTTPException(409, "Invoice id already exists") from None
         return {"id": inv.id}
+
+    def queue_items(org: str, ids=None) -> dict[str, dict]:
+        """Review-queue items (with invoice details) keyed by invoice id."""
+        items = [i for i in full_queue(org) if ids is None or i["invoice_id"] in ids]
+        details = db.get_invoices(org, [i["invoice_id"] for i in items])
+        for item in items:
+            inv = details.get(item["invoice_id"], {})
+            item.update(vendor=inv.get("vendor"), amount=inv.get("amount"), date=inv.get("invoice_date"))
+        return {i["invoice_id"]: i for i in items}
+
+    @app.post("/export/annotated")
+    def export_annotated(body: MappedFileIn, user: dict = Depends(current_user)) -> Response:
+        """Your own workbook back, with each row's risk, review status and reasons added in new
+        columns, risky rows highlighted, and a ranked 'Flagged invoices' sheet. Invoices are
+        matched by invoice number; import the file first so they have been checked."""
+        table = read_upload(body)
+        try:
+            result = convert(table, {f: body.mapping.get(f) for f in FIELDS}, body.date_order)
+        except FileProblem as exc:
+            raise HTTPException(422, str(exc)) from None
+        org = user["org"]
+        stored = db.get_invoices(org, list(result.lines))
+        lines = {i: line for i, line in result.lines.items() if i in stored}
+        queue = queue_items(org, set(lines))
+        try:
+            data, name, media = annotate(body.filename, base64.b64decode(body.content_base64), table, lines,
+                                         result.errors, queue, db.get_org(org)["name"])
+        except Exception:
+            raise HTTPException(422, "This workbook could not be rewritten. Try saving it as .xlsx "
+                                     "or .csv and uploading it again.") from None
+        db.audit(org, user["sub"], "workbook_exported",
+                 f"{body.filename[:80]}: {len(queue)} flagged of {len(lines)} matched")
+        return attachment(data, name, media)
+
+    @app.get("/export/review.xlsx")
+    def export_review(include_dismissed: bool = True, user: dict = Depends(current_user)) -> Response:
+        """The review queue as a formatted Excel workbook."""
+        org = user["org"]
+        items = sorted(queue_items(org).values(), key=lambda i: (-i["risk"], i["invoice_id"]))
+        if not include_dismissed:
+            items = [i for i in items if i["status"] != "dismissed"]
+        counts = {s: sum(i["status"] == s for i in items) for s in ("open", "confirmed", "dismissed")}
+        company = db.get_org(org)["name"]
+        data = review_report(items, company, {"invoices": db.count_invoices(org), "flagged": len(items), **counts})
+        db.audit(org, user["sub"], "report_exported", f"review queue, {len(items)} rows")
+        slug = re.sub(r"[^A-Za-z0-9]+", "-", company).strip("-").lower() or "company"
+        return attachment(data, f"review-queue-{slug}.xlsx", XLSX)
 
     @app.post("/invoices/bulk")
     def add_invoices(invoices: list[InvoiceIn],

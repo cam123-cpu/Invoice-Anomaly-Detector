@@ -64,6 +64,22 @@ RULE_WEIGHT = {
     "weekend_invoice": 0.10,
 }
 
+# Plain-English name and explanation of each rule, for people (web app, Excel output).
+RULE_INFO = {
+    "duplicate": ("Duplicate", "Same vendor, amount and date as an earlier invoice"),
+    "bank_account_change": ("New bank account", "First payment to a different bank account for an established vendor"),
+    "shared_bank_account": ("Shared bank account", "The same bank account is used by another vendor"),
+    "amount_outlier": ("Unusual amount", "Far above this vendor's normal invoice amount"),
+    "split_invoice": ("Possible split", "Several invoices in a few days that together pass the approval limit"),
+    "near_duplicate": ("Near-duplicate", "Same vendor and amount a few days apart"),
+    "similar_vendor_name": ("Look-alike vendor", "Vendor name is almost identical to another vendor's"),
+    "new_vendor_large": ("Large first invoice", "Large invoice from a vendor with almost no history"),
+    "ml_outlier": ("Unusual pattern", "Statistical model found an unusual mix of amount, timing and vendor history"),
+    "below_threshold": ("Just under limit", "Amount is just below the approval threshold"),
+    "round_amount": ("Round amount", "Suspiciously round figure"),
+    "weekend_invoice": ("Weekend date", "Invoice is dated on a weekend"),
+}
+
 
 def _day(inv: Invoice) -> Date:
     return Date.fromisoformat(inv.date)
