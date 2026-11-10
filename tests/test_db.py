@@ -81,6 +81,61 @@ class DatabaseTests(DbTestCase):
         self.app.audit(self.a, "alice", "second", "detail")
         self.assertEqual([e["action"] for e in self.app.list_audit(self.a)], ["second", "first"])
 
+    def test_review_actions_and_notes(self):
+        for i, date in (("A1", "2026-01-05"), ("A2", "2026-01-06"), ("A3", "2026-01-07")):
+            self.add(i, date=date)
+        self.app.save_flags(self.a, [Anomaly("A1", "duplicate", "high", "d"),
+                                     Anomaly("A2", "bank_account_change", "high", "b"),
+                                     Anomaly("A3", "round_amount", "low", "r")])
+        self.assertEqual(self.app.set_review(self.a, "A1", "confirmed", "alice"), "do_not_pay")
+        self.assertEqual(self.app.set_review(self.a, "A2", "confirmed", "alice", note=" called vendor "), "hold")
+        self.assertEqual(self.app.set_review(self.a, "A3", "dismissed", "alice", action="hold"), "pay")
+        self.assertEqual(self.app.set_review(self.a, "A1", "confirmed", "bob", action="hold"), "hold")
+        details = self.app.review_details(self.a)
+        self.assertEqual((details["A1"]["action"], details["A1"]["reviewer"]), ("hold", "bob"))
+        self.assertEqual((details["A2"]["action"], details["A2"]["note"]), ("hold", "called vendor"))
+        self.assertEqual(details["A3"]["action"], "pay")
+        with self.assertRaises(ValueError):
+            self.app.set_review(self.a, "A1", "confirmed", "alice", action="shred")
+        self.assertEqual(self.app.review_details(self.b), {})
+        self.assertEqual([i["id"] for i in self.app.all_invoices(self.a)], ["A1", "A2", "A3"])
+
+    def test_reset_password(self):
+        from invoice_detector.security import verify_password
+        self.app.create_user(self.a, "alice", "first-password-1", "admin")
+        self.assertTrue(self.admin.set_password("alice", "second-password-2"))
+        self.assertTrue(verify_password("second-password-2", self.app.auth_lookup("alice")["password_hash"]))
+        self.assertFalse(self.admin.set_password("nobody", "whatever-password"))
+
+
+class UpgradeTests(unittest.TestCase):
+    def test_database_from_the_previous_version_is_upgraded(self):
+        import os
+        import secrets
+        import sqlite3
+        import tempfile
+
+        from invoice_detector.db import Database
+        from invoice_detector.schema import SQLITE_SCHEMA
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "old.db")
+            old = sqlite3.connect(path)
+            old.executescript(SQLITE_SCHEMA.replace(
+                "  action TEXT CHECK (action IN ('pay', 'hold', 'do_not_pay')),\n  note TEXT,\n", ""))
+            old.execute("INSERT INTO orgs (id, name) VALUES ('o1', 'Old Co')")
+            old.execute("INSERT INTO invoices VALUES ('o1','I1','V',10,'2026-01-05',NULL,NULL,'x')")
+            old.execute("INSERT INTO anomalies VALUES ('o1','I1','duplicate','high','d')")
+            old.execute("INSERT INTO reviews (org_id, invoice_id, verdict, rules, reviewer, reviewed_at) "
+                        "VALUES ('o1','I1','confirmed','duplicate','kim','2026-01-06')")
+            old.commit()
+            self.assertNotIn("action", [r[1] for r in old.execute("PRAGMA table_info(reviews)")])
+            old.close()
+            db = Database(path, {1: secrets.token_bytes(32)}, secrets.token_bytes(32))
+            self.addCleanup(db.close)
+            self.assertEqual(db.review_details("o1")["I1"]["action"], None)  # old review kept
+            self.assertEqual(db.set_review("o1", "I1", "confirmed", "kim"), "do_not_pay")
+            Database(path, {1: secrets.token_bytes(32)}, secrets.token_bytes(32)).close()  # idempotent
+
 
 if __name__ == "__main__":
     unittest.main()

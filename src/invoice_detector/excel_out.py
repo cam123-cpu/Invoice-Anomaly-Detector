@@ -14,6 +14,7 @@ from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
 
+from .decisions import DECISION_TEXT, fix_steps, payment_decision
 from .detection import RULE_INFO
 from .importer import Table
 
@@ -26,6 +27,7 @@ HEAD_FONT = Font(bold=True, color="FFFFFF")
 BOLD = Font(bold=True)
 WRAP = Alignment(wrap_text=True, vertical="top")
 STATUS_TEXT = {"open": "Needs review", "confirmed": "Confirmed problem", "dismissed": "False alarm"}
+DECISION_FILL = {"do_not_pay": RED, "hold": AMBER, "review": GREY, "pay": GREEN}
 XLSX = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 XLSM = "application/vnd.ms-excel.sheet.macroEnabled.12"
 
@@ -72,21 +74,29 @@ def _header_row(ws, row: int, headers: list[str], start_col: int = 1, widths=Non
             ws.column_dimensions[get_column_letter(start_col + i)].width = widths[i]
 
 
+def decision_of(item: dict | None) -> str:
+    return item.get("decision") or payment_decision(item) if item else "pay"
+
+
 def _flagged_sheet(wb, items: list[dict], title: str = "Flagged invoices") -> None:
     ws = wb.create_sheet(_unique_title(wb, title))
-    headers = ["Risk", "Invoice", "Vendor", "Amount", "Date", "Status", "Flags", "Why"]
-    _header_row(ws, 1, headers, widths=[8, 16, 28, 14, 12, 18, 34, 80])
+    headers = ["Risk", "Invoice", "Vendor", "Amount", "Date", "Status", "Payment decision", "Flags",
+               "Why flagged", "What to do", "Reviewer note"]
+    _header_row(ws, 1, headers, widths=[8, 16, 28, 14, 12, 18, 16, 30, 60, 70, 30])
     for r, item in enumerate(items, start=2):
+        decision = decision_of(item)
         values = [item["risk"], item["invoice_id"], item.get("vendor"), item.get("amount"), item.get("date"),
-                  STATUS_TEXT.get(item.get("status", "open"), item.get("status")),
-                  ", ".join(label(x) for x in item["rules"]), "; ".join(item["details"])]
+                  STATUS_TEXT.get(item.get("status", "open"), item.get("status")), DECISION_TEXT[decision],
+                  ", ".join(label(x) for x in item["rules"]), "; ".join(item["details"]),
+                  " ".join(item.get("fixes") or fix_steps(item["rules"])), item.get("note")]
         for c, value in enumerate(values, start=1):
             put(ws, r, c, value, alignment=WRAP)
         ws.cell(row=r, column=1).fill = risk_fill(item["risk"])
+        ws.cell(row=r, column=7).fill = DECISION_FILL[decision]
         ws.cell(row=r, column=4).number_format = "#,##0.00"
-    ws.freeze_panes = "B2"
+    ws.freeze_panes = "C2"
     if items:
-        ws.auto_filter.ref = f"A1:H{len(items) + 1}"
+        ws.auto_filter.ref = f"A1:K{len(items) + 1}"
 
 
 def _about_sheet(wb, company: str, extra: list[tuple[str, str]] = ()) -> None:
@@ -100,6 +110,11 @@ def _about_sheet(wb, company: str, extra: list[tuple[str, str]] = ()) -> None:
             ("Important", "Flags are signals for human review, not proof of fraud or error."),
             ("Risk score", "0-100. Several weak signals add up, but never outrank one strong signal. "
                            "70+ is shaded red, 40-69 amber."),
+            ("Payment decision", "Pay: no flags, or flags dismissed as false alarms. Review first: flagged, "
+                                 "not reviewed yet. Hold: a confirmed problem to check before paying. "
+                                 "Do not pay: a confirmed problem such as a duplicate."),
+            ("Your invoices", "Invoices are never changed or deleted. Decisions apply to the payment, "
+                              "and the original record stays as the supplier sent it."),
             ("", ""),
             ("Flag", "Meaning")]
     rows += [(name, meaning) for name, meaning in RULE_INFO.values()]
@@ -114,6 +129,9 @@ def _save(wb) -> bytes:
     buf = io.BytesIO()
     wb.save(buf)
     return buf.getvalue()
+
+
+ANNOTATION_HEADERS = ["Risk", "Review status", "Payment decision", "Flags", "Why flagged", "What to do"]
 
 
 # ------------------------------------------------------------------ your file, annotated
@@ -149,24 +167,31 @@ def annotate(filename: str, data: bytes, table: Table, lines: dict[str, int], er
                 used = max(used, cell.column)
                 break
     col = used + 1
-    _header_row(ws, header, ["Risk", "Review status", "Flags", "Why flagged"], start_col=col,
-                widths=[8, 18, 30, 70])
+    _header_row(ws, header, ANNOTATION_HEADERS, start_col=col, widths=[8, 18, 16, 30, 60, 70])
 
     problems = {e["row"]: e["message"] for e in errors}
     for line in range(table.first_row_number, last + 1):
         if line in problems:
             put(ws, line, col + 1, "Not imported", fill=GREY)
-            put(ws, line, col + 3, problems[line], alignment=WRAP)
+            put(ws, line, col + 4, problems[line], alignment=WRAP)
+            put(ws, line, col + 5, "Fix this row in your file and upload it again.", alignment=WRAP)
     for inv_id, line in lines.items():
         item = queue.get(inv_id)
         if item is None:
             put(ws, line, col + 1, "No flags", fill=GREEN)
+            put(ws, line, col + 2, DECISION_TEXT["pay"], fill=GREEN)
             continue
         fill = risk_fill(item["risk"])
+        decision = decision_of(item)
         put(ws, line, col, item["risk"], fill=fill, font=BOLD)
         put(ws, line, col + 1, STATUS_TEXT.get(item["status"], item["status"]), fill=fill)
-        put(ws, line, col + 2, ", ".join(label(r) for r in item["rules"]), fill=fill, alignment=WRAP)
-        put(ws, line, col + 3, "; ".join(item["details"]), alignment=WRAP)
+        put(ws, line, col + 2, DECISION_TEXT[decision], fill=DECISION_FILL[decision], font=BOLD)
+        put(ws, line, col + 3, ", ".join(label(r) for r in item["rules"]), fill=fill, alignment=WRAP)
+        put(ws, line, col + 4, "; ".join(item["details"]), alignment=WRAP)
+        steps = " ".join(item.get("fixes") or fix_steps(item["rules"]))
+        if item.get("note"):
+            steps += f" Reviewer note: {item['note']}"
+        put(ws, line, col + 5, steps, alignment=WRAP)
 
     flagged = sorted((queue[i] for i in lines if i in queue), key=lambda x: (-x["risk"], x["invoice_id"]))
     _flagged_sheet(wb, flagged)
@@ -189,6 +214,65 @@ def review_report(items: list[dict], company: str, summary: dict) -> bytes:
                                ("Needs review", str(summary.get("open", ""))),
                                ("Confirmed problems", str(summary.get("confirmed", ""))),
                                ("False alarms", str(summary.get("dismissed", "")))])
+    return _save(wb)
+
+
+def payment_file(invoices: list[dict], queue: dict[str, dict], company: str) -> bytes:
+    """The corrected payment batch: every invoice sorted into Ready to pay, Review first,
+    On hold and Do not pay, with totals. invoices: id, vendor, amount, invoice_date."""
+    groups: dict[str, list[tuple[dict, dict | None]]] = {d: [] for d in ("pay", "review", "hold", "do_not_pay")}
+    for inv in invoices:
+        item = queue.get(inv["id"])
+        groups[decision_of(item)].append((inv, item))
+    totals = {d: round(sum(inv["amount"] for inv, _ in rows), 2) for d, rows in groups.items()}
+
+    wb = Workbook()
+    summary = wb.active
+    summary.title = "Summary"
+    summary.column_dimensions["A"].width = 22
+    summary.column_dimensions["B"].width = 12
+    summary.column_dimensions["C"].width = 16
+    summary.column_dimensions["D"].width = 70
+    put(summary, 1, 1, f"Payment file - {company}", font=Font(bold=True, size=14))
+    put(summary, 2, 1, "Created " + datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"))
+    _header_row(summary, 4, ["Decision", "Invoices", "Amount", "Meaning"])
+    meaning = {"pay": "No problems found, or flags dismissed as false alarms. Safe to pay.",
+               "review": "Flagged but not reviewed yet. Review in the app before paying.",
+               "hold": "Confirmed problem. Check it (see What to do) before paying.",
+               "do_not_pay": "Confirmed problem such as a duplicate. Do not pay."}
+    for r, d in enumerate(("pay", "review", "hold", "do_not_pay"), start=5):
+        put(summary, r, 1, DECISION_TEXT[d], fill=DECISION_FILL[d], font=BOLD)
+        put(summary, r, 2, len(groups[d]))
+        put(summary, r, 3, totals[d]).number_format = "#,##0.00"
+        put(summary, r, 4, meaning[d], alignment=WRAP)
+    put(summary, 9, 1, "Total", font=BOLD)
+    put(summary, 9, 2, len(invoices), font=BOLD)
+    put(summary, 9, 3, round(sum(totals.values()), 2), font=BOLD).number_format = "#,##0.00"
+    put(summary, 11, 1, "Note", font=BOLD)
+    put(summary, 11, 4, "Invoices are not changed. This file sorts them by what should happen to the payment. "
+                        "Run detection and finish reviews in the app before using it for a payment run.",
+        alignment=WRAP)
+
+    titles = {"pay": "Ready to pay", "review": "Review first", "hold": "On hold", "do_not_pay": "Do not pay"}
+    for d, rows in groups.items():
+        ws = wb.create_sheet(titles[d])
+        headers = ["Invoice", "Vendor", "Date", "Amount", "Risk", "Flags", "What to do", "Reviewer note"]
+        _header_row(ws, 1, headers, widths=[16, 28, 12, 14, 8, 30, 70, 30])
+        for r, (inv, item) in enumerate(rows, start=2):
+            values = [inv["id"], inv["vendor"], inv["invoice_date"], inv["amount"],
+                      item["risk"] if item else None,
+                      ", ".join(label(x) for x in item["rules"]) if item else None,
+                      " ".join(item.get("fixes") or fix_steps(item["rules"])) if item and d != "pay" else None,
+                      item.get("note") if item else None]
+            for c, value in enumerate(values, start=1):
+                put(ws, r, c, value, alignment=WRAP)
+            ws.cell(row=r, column=4).number_format = "#,##0.00"
+        total_row = len(rows) + 2
+        put(ws, total_row, 1, "Total", font=BOLD)
+        put(ws, total_row, 4, totals[d], font=BOLD).number_format = "#,##0.00"
+        ws.freeze_panes = "A2"
+        if rows:
+            ws.auto_filter.ref = f"A1:H{len(rows) + 1}"
     return _save(wb)
 
 

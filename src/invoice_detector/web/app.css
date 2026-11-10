@@ -141,6 +141,21 @@ tr.details td { background: var(--panel-2); padding-top: 4px; }
 .pill.open { background: var(--brand-soft); color: var(--brand); }
 .pill.confirmed { background: var(--red-soft); color: var(--red); }
 .pill.dismissed { background: var(--grey-soft); color: var(--muted); }
+.pill.d-do_not_pay { background: var(--red-soft); color: var(--red); }
+.pill.d-hold { background: var(--amber-soft); color: var(--amber); }
+.pill.d-review { background: var(--brand-soft); color: var(--brand); }
+.pill.d-pay { background: var(--green-soft); color: var(--green); }
+.d-card { border-top: 3px solid var(--line); }
+.d-card.d-pay { border-top-color: var(--green); }
+.d-card.d-review { border-top-color: var(--brand); }
+.d-card.d-hold { border-top-color: var(--amber); }
+.d-card.d-do_not_pay { border-top-color: var(--red); }
+.d-card .value { font-size: 22px; }
+.detail-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px 24px; }
+.detail-grid ul { margin: 4px 0 8px; }
+.fixes li { color: var(--text); }
+.editor { border-top: 1px solid var(--line); margin-top: 6px; padding-top: 10px; display: grid; gap: 6px; }
+.editor input[type=text] { flex: 1; min-width: 200px; }
 .hbar { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.4fr) 34px; gap: 10px; align-items: center; padding: 5px 0; }
 .hbar .track { height: 8px; background: var(--grey-soft); border-radius: 999px; overflow: hidden; }
 .hbar .fill { height: 100%; background: var(--brand); border-radius: 999px; }
@@ -214,4 +229,6 @@ th .maps { display: block; text-transform: none; letter-spacing: 0; color: var(-
   table.queue .c-act { grid-area: act; padding-top: 8px; }
   table.queue tr.details { display: block; }
   table.queue tr.details td { display: block; padding: 0 14px 12px; }
+  .detail-grid { grid-template-columns: 1fr; }
+  .editor input[type=text] { min-width: 0; width: 100%; }
 }

@@ -234,10 +234,12 @@ class ApiTests(DbTestCase):
         self.assertIn('filename="ap _march___X-Evil_ 1 - checked.xlsx"', disposition)
         wb = load_workbook(io.BytesIO(r.content))
         ws = wb["Invoices"]
-        self.assertEqual([ws.cell(1, c).value for c in range(5, 9)], ["Risk", "Review status", "Flags", "Why flagged"])
+        self.assertEqual([ws.cell(1, c).value for c in range(5, 11)],
+                         ["Risk", "Review status", "Payment decision", "Flags", "Why flagged", "What to do"])
         statuses = [ws.cell(row, 6).value for row in range(2, 6)]
         self.assertEqual(statuses[2:], ["No flags", "Not imported"])
-        self.assertIn("Duplicate", ws.cell(3, 7).value)
+        self.assertEqual(ws.cell(3, 7).value, "Review first")
+        self.assertIn("Duplicate", ws.cell(3, 8).value)
         self.assertEqual((ws.cell(2, 2).data_type, ws.cell(2, 2).value), ("s", "'=1+2 Corp"))
 
         report = self.client.get("/export/review.xlsx", headers=admin)
@@ -279,6 +281,51 @@ class ApiTests(DbTestCase):
         self.assertEqual(second["sheet"], "Q3 2026")
         missing = self.client.post("/import/preview", json={**body, "sheet": "Q9"}, headers=admin)
         self.assertEqual(missing.status_code, 422)
+
+    def test_confirming_sets_the_payment_decision(self):
+        admin, bob = self.auth("alice", PW_A), self.auth("bob", PW_B)
+        batch = [self.invoice("D1", amount=500.0), self.invoice("D2", amount=500.0),   # duplicate
+                 self.invoice("R1", vendor="Globex", amount=7000.0, date="2026-01-07",   # round amount
+                              bank_account="ACCT2"),
+                 self.invoice("OK", vendor="Initech", amount=12.34, date="2026-01-08",  # nothing wrong
+                              bank_account="ACCT3")]
+        self.client.post("/invoices/bulk", json=batch, headers=admin)
+        self.client.post("/detect", headers=admin)
+        queue = {q["invoice_id"]: q for q in self.client.get("/review-queue", headers=admin).json()}
+        self.assertEqual((queue["D2"]["decision"], queue["D2"]["suggested_action"]), ("review", "do_not_pay"))
+        self.assertTrue(queue["D2"]["fixes"][0].startswith("Don't pay"))
+
+        r = self.client.post("/review/D2", json={"verdict": "confirmed"}, headers=admin).json()
+        self.assertEqual((r["status"], r["action"]), ("confirmed", "do_not_pay"))
+        r = self.client.post("/review/R1", json={"verdict": "confirmed", "action": "hold",
+                                                "note": "asked for breakdown"}, headers=admin).json()
+        self.assertEqual(r["action"], "hold")
+        bad = self.client.post("/review/R1", json={"verdict": "confirmed", "action": "shred"}, headers=admin)
+        self.assertEqual(bad.status_code, 422)
+        long_note = self.client.post("/review/R1", json={"verdict": "confirmed", "note": "x" * 501}, headers=admin)
+        self.assertEqual(long_note.status_code, 422)
+
+        queue = {q["invoice_id"]: q for q in self.client.get("/review-queue", headers=admin).json()}
+        self.assertEqual((queue["R1"]["decision"], queue["R1"]["note"]), ("hold", "asked for breakdown"))
+        summary = self.client.get("/summary", headers=admin).json()
+        self.assertEqual(summary["decisions"], {"pay": 2, "review": 0, "hold": 1, "do_not_pay": 1})
+        self.assertEqual(summary["amounts"], {"pay": 512.34, "review": 0.0, "hold": 7000.0, "do_not_pay": 500.0})
+
+        r = self.client.get("/export/payment-file.xlsx", headers=admin)
+        self.assertIn('filename="payment-file-company-a.xlsx"', r.headers["content-disposition"])
+        wb = load_workbook(io.BytesIO(r.content))
+        self.assertEqual([wb["Do not pay"].cell(2, 1).value, wb["On hold"].cell(2, 8).value],
+                         ["D2", "asked for breakdown"])
+        self.assertEqual(sorted(wb["Ready to pay"].cell(row, 1).value for row in (2, 3)), ["D1", "OK"])
+        theirs = load_workbook(io.BytesIO(self.client.get("/export/payment-file.xlsx", headers=bob).content))
+        self.assertEqual(theirs["Summary"].cell(9, 2).value, 0)  # another company: no invoices at all
+        self.assertEqual(self.client.get("/export/payment-file.xlsx").status_code, 401)
+
+        auditor = self.auth("audit1", "auditor-password-123")
+        self.assertEqual(self.client.post("/review/D2", json={"verdict": "dismissed"}, headers=auditor).status_code, 403)
+        self.assertEqual(self.client.get("/export/payment-file.xlsx", headers=auditor).status_code, 200)
+        actions = [e["detail"] for e in self.client.get("/audit", headers=admin).json() if e["action"] == "invoice_reviewed"]
+        self.assertIn("D2: confirmed, do_not_pay", actions)
 
 
 if __name__ == "__main__":

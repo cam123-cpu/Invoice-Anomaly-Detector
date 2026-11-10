@@ -72,6 +72,13 @@ class CliTests(unittest.TestCase):
         with mock.patch("getpass.getpass", return_value="short"):
             self.assertEqual(cli.main(["create-user", "Acme Inc", "bob", "admin"]), 1)
         self.assertEqual(self.open_db().auth_lookup("alice")["role"], "admin")
+        with mock.patch("getpass.getpass", return_value="brand-new-password"):
+            self.assertEqual(cli.main(["reset-password", "alice"]), 0)
+            self.assertEqual(cli.main(["reset-password", "nobody"]), 1)
+        with mock.patch("getpass.getpass", return_value="short"):
+            self.assertEqual(cli.main(["reset-password", "alice"]), 1)
+        from invoice_detector.security import verify_password
+        self.assertTrue(verify_password("brand-new-password", self.open_db().auth_lookup("alice")["password_hash"]))
 
     def test_import_csv_skips_bad_rows(self):
         cli.main(["init"])

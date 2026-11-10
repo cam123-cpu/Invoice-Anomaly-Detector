@@ -5,6 +5,7 @@
   python -m invoice_detector.cli create-org COMPANY             # add a company
   python -m invoice_detector.cli list-orgs
   python -m invoice_detector.cli create-user COMPANY NAME ROLE  # role: admin|accountant|auditor
+  python -m invoice_detector.cli reset-password NAME            # set a new password for a user
   python -m invoice_detector.cli seed COMPANY                   # load synthetic demo invoices
   python -m invoice_detector.cli import COMPANY FILE            # Excel (.xlsx) or CSV; columns detected automatically
   python -m invoice_detector.cli detect COMPANY                 # run detection, print the review queue
@@ -73,7 +74,7 @@ def _create_user(company: str, name: str, role: str) -> int:
         org_id = _org(db, company)
         if org_id is None:
             return 1
-        password = getpass.getpass("Password (min 12 chars): ")
+        password = getpass.getpass("Password (min 12 chars, nothing shows while you type): ")
         if len(password) < 12:
             print("Password too short.")
             return 1
@@ -83,6 +84,19 @@ def _create_user(company: str, name: str, role: str) -> int:
             print(f"Username '{name}' is already taken.")
             return 1
     print(f"Created {role} user '{name}' in {company}.")
+    return 0
+
+
+def _reset_password(name: str) -> int:
+    password = getpass.getpass("New password (min 12 chars, nothing shows while you type): ")
+    if len(password) < 12:
+        print("Password too short.")
+        return 1
+    with _db() as db:
+        if not db.set_password(name, password):
+            print(f"No user called '{name}'.")
+            return 1
+    print(f"Password changed for '{name}'.")
     return 0
 
 
@@ -169,6 +183,8 @@ def main(argv: list[str]) -> int:
                 print(f"{org['name']}  (approval threshold {org['approval_threshold']:,.0f})")
     elif cmd == "create-user" and len(args) == 3:
         return _create_user(*args)
+    elif cmd == "reset-password" and len(args) == 1:
+        return _reset_password(args[0])
     elif cmd == "seed" and len(args) == 1:
         with _db() as db:
             org_id = _org(db, args[0])

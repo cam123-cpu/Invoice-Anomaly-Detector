@@ -8,8 +8,10 @@ risk-ranked review queue, and each company's review decisions tune the scoring f
 It produces signals, not proof of fraud.
 
 It comes with a **web app** for accounts-payable teams: upload an Excel or CSV export, match its
-columns once, work a ranked review queue with Confirm and Dismiss buttons, and **download your own
-workbook back with every row's risk, status and reasons written in**.
+columns once, and work a ranked review queue. **Confirming a problem decides what happens to the
+payment** (Do not pay, Hold, or Pay anyway) and shows what to do next. Download your own workbook
+back with every row's risk, decision and next steps written in, and a **payment file** that
+sorts every invoice into Ready to pay, Review first, On hold and Do not pay.
 
 **New here? Follow the [tutorial](docs/TUTORIAL.md).** To understand how the code works, read
 [How it works](docs/HOW-IT-WORKS.md): architecture, data structures, algorithms and security, explained in depth.
@@ -155,12 +157,13 @@ role restrictions, company isolation and a phone-sized screen.
 | `GET /summary` | any role | Dashboard numbers |
 | `POST /export/annotated` | any role | Your uploaded workbook with results written in (.xlsx) |
 | `GET /export/review.xlsx` | any role | The review queue as an Excel report |
+| `GET /export/payment-file.xlsx` | any role | Every invoice sorted by payment decision, with totals |
 | `GET /samples`, `GET /samples/{name}` | anyone | Sample Excel files and a blank template |
 | `GET /invoices` | any role | List invoices (no bank data) |
 | `GET /invoices/{id}/bank` | admin | Decrypt one bank account (audited) |
 | `POST /detect` | admin, accountant | Run detection and store the flags |
 | `GET /review-queue` | any role | Flagged invoices ranked by risk, with reasons and status |
-| `POST /review/{id}` | admin, accountant | Mark a flagged invoice confirmed or dismissed |
+| `POST /review/{id}` | admin, accountant | Confirm or dismiss; optional payment action and note |
 | `GET /metrics` | any role | Measured precision per rule and the weights in use |
 | `GET /anomalies` | any role | Every individual flag |
 | `GET`, `PUT /settings` | any role, admin | The company's approval threshold |
@@ -185,7 +188,7 @@ Excel/CSV parsing, the API and the web app in a real browser. To include the Pos
 ## Layout
 
 ```
-src/invoice_detector/   detection, evaluate, demo, importer, excel_out, samples, api, cli, db, schema, crypto, security, config, explain
+src/invoice_detector/   detection, decisions, evaluate, demo, importer, excel_out, samples, api, cli, db, schema, crypto, security, config, explain
 src/invoice_detector/web/  the web app (index.html, app.js, app.css)
 tests/                  unit tests (unittest style, run by pytest); tests/e2e is the browser test
 docs/TUTORIAL.md        step-by-step guide

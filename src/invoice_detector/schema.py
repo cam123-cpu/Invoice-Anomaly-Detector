@@ -43,6 +43,8 @@ CREATE TABLE IF NOT EXISTS reviews (
   org_id TEXT NOT NULL,
   invoice_id TEXT NOT NULL,
   verdict TEXT NOT NULL CHECK (verdict IN ('confirmed', 'dismissed')),
+  action TEXT CHECK (action IN ('pay', 'hold', 'do_not_pay')),
+  note TEXT,
   rules TEXT NOT NULL,
   reviewer TEXT NOT NULL,
   reviewed_at TEXT NOT NULL,
@@ -64,6 +66,13 @@ SQLITE_SCHEMA = (_TABLES.replace("{REAL}", "REAL")
 
 POSTGRES_TABLES = (_TABLES.replace("{REAL}", "DOUBLE PRECISION")
                    .replace("{AUTO_ID}", "BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY"))
+
+# Columns added after the first release. Each entry: (table, column, definition).
+# Databases created by older versions get them on start-up (SQLite) or `migrate` (PostgreSQL).
+ADDED_COLUMNS = [
+    ("reviews", "action", "TEXT CHECK (action IN ('pay', 'hold', 'do_not_pay'))"),
+    ("reviews", "note", "TEXT"),
+]
 
 # Idempotent: safe to run on every deploy.
 POSTGRES_SECURITY = """

@@ -22,7 +22,8 @@ from .config import Settings
 from .db import Conflict, Database
 from .detection import (DEFAULT_CONFIG, RULE_WEIGHT, Anomaly, detect, learned_weights,
                         review_queue)
-from .excel_out import XLSX, annotate, review_report
+from .decisions import fix_steps, payment_decision, suggested_action
+from .excel_out import XLSX, annotate, payment_file, review_report
 from .explain import explain
 from .importer import FIELDS, ID_PATTERN, FileProblem, convert, preview, read_table
 from .samples import SAMPLES, build as build_sample
@@ -60,6 +61,9 @@ class UserIn(BaseModel):
 
 class ReviewIn(BaseModel):
     verdict: Literal["confirmed", "dismissed"]
+    # What happens to the payment. Leave out to use the suggestion (e.g. "do_not_pay" for a duplicate).
+    action: Literal["pay", "hold", "do_not_pay"] | None = None
+    note: str | None = Field(default=None, max_length=500)
 
 
 class FileIn(BaseModel):
@@ -97,7 +101,7 @@ def create_app(settings: Settings | None = None, db: Database | None = None) -> 
     limiter = RateLimiter()
     bearer = HTTPBearer(auto_error=False)
 
-    app = FastAPI(title="Invoice Anomaly Detector", version="0.5.0")
+    app = FastAPI(title="Invoice Anomaly Detector", version="0.6.0")
     app.state.db, app.state.signer = db, signer
 
     def current_user(creds: HTTPAuthorizationCredentials | None = Depends(bearer)) -> dict:
@@ -295,6 +299,17 @@ def create_app(settings: Settings | None = None, db: Database | None = None) -> 
         slug = re.sub(r"[^A-Za-z0-9]+", "-", company).strip("-").lower() or "company"
         return attachment(data, f"review-queue-{slug}.xlsx", XLSX)
 
+    @app.get("/export/payment-file.xlsx")
+    def export_payment_file(user: dict = Depends(current_user)) -> Response:
+        """Every invoice sorted by what should happen to its payment: Ready to pay, Review first,
+        On hold, Do not pay, with totals. The corrected batch to hand to whoever pays."""
+        org = user["org"]
+        company = db.get_org(org)["name"]
+        data = payment_file(db.all_invoices(org), queue_items(org), company)
+        db.audit(org, user["sub"], "report_exported", "payment file")
+        slug = re.sub(r"[^A-Za-z0-9]+", "-", company).strip("-").lower() or "company"
+        return attachment(data, f"payment-file-{slug}.xlsx", XLSX)
+
     @app.post("/invoices/bulk")
     def add_invoices(invoices: list[InvoiceIn],
                      user: dict = Depends(require("admin", "accountant"))) -> dict:
@@ -381,10 +396,18 @@ def create_app(settings: Settings | None = None, db: Database | None = None) -> 
         return ranked
 
     def full_queue(org: str) -> list[dict]:
+        """Ranked flags with review status, payment decision and next steps."""
         ranked = review_queue([Anomaly(**a) for a in db.list_anomalies(org, 5000)], weights_for(org))
-        reviews = db.list_reviews(org)
+        reviews = db.review_details(org)
         for item in ranked:
-            item["status"] = reviews.get(item["invoice_id"], "open")
+            review = reviews.get(item["invoice_id"], {})
+            item["status"] = review.get("verdict", "open")
+            item["action"] = review.get("action")
+            item["note"] = review.get("note")
+            item["reviewer"] = review.get("reviewer")
+            item["suggested_action"] = suggested_action(item["rules"])
+            item["decision"] = payment_decision(item)
+            item["fixes"] = fix_steps(item["rules"])
         return ranked
 
     @app.get("/summary")
@@ -398,8 +421,16 @@ def create_app(settings: Settings | None = None, db: Database | None = None) -> 
             if item["status"] == "open":
                 for rule in set(item["rules"]):
                     open_rules[rule] = open_rules.get(rule, 0) + 1
+        decisions = {i["invoice_id"]: i["decision"] for i in queue}
+        money = {d: 0.0 for d in ("pay", "review", "hold", "do_not_pay")}
+        counts = dict.fromkeys(money, 0)
+        for inv in db.all_invoices(org):
+            decision = decisions.get(inv["id"], "pay")
+            money[decision] += inv["amount"]
+            counts[decision] += 1
         return {"company": db.get_org(org)["name"], "invoices": db.count_invoices(org),
                 "flagged": len(queue), **by_status,
+                "decisions": counts, "amounts": {k: round(v, 2) for k, v in money.items()},
                 "high_risk_open": sum(i["status"] == "open" and i["risk"] >= 70 for i in queue),
                 "open_by_rule": dict(sorted(open_rules.items(), key=lambda kv: -kv[1])),
                 "last_detection": db.last_audit(org, "detection_run"),
@@ -411,11 +442,11 @@ def create_app(settings: Settings | None = None, db: Database | None = None) -> 
         """Mark a flagged invoice as a real problem (confirmed) or a false alarm (dismissed).
         These decisions tune the rule weights for your company."""
         try:
-            db.set_review(user["org"], invoice_id, body.verdict, user["sub"])
+            action = db.set_review(user["org"], invoice_id, body.verdict, user["sub"], body.action, body.note)
         except KeyError:
             raise HTTPException(404, "No flags on that invoice") from None
-        db.audit(user["org"], user["sub"], "invoice_reviewed", f"{invoice_id}: {body.verdict}")
-        return {"invoice_id": invoice_id, "status": body.verdict}
+        db.audit(user["org"], user["sub"], "invoice_reviewed", f"{invoice_id}: {body.verdict}, {action}")
+        return {"invoice_id": invoice_id, "status": body.verdict, "action": action, "decision": action}
 
     @app.get("/metrics")
     def metrics(user: dict = Depends(current_user)) -> dict:
