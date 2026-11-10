@@ -131,9 +131,11 @@ class UpgradeTests(unittest.TestCase):
             self.assertNotIn("action", [r[1] for r in old.execute("PRAGMA table_info(reviews)")])
             old.close()
             db = Database(path, {1: secrets.token_bytes(32)}, secrets.token_bytes(32))
-            self.addCleanup(db.close)
-            self.assertEqual(db.review_details("o1")["I1"]["action"], None)  # old review kept
-            self.assertEqual(db.set_review("o1", "I1", "confirmed", "kim"), "do_not_pay")
+            try:
+                self.assertEqual(db.review_details("o1")["I1"]["action"], None)  # old review kept
+                self.assertEqual(db.set_review("o1", "I1", "confirmed", "kim"), "do_not_pay")
+            finally:
+                db.close()  # before the folder is deleted: Windows can't delete an open file
             Database(path, {1: secrets.token_bytes(32)}, secrets.token_bytes(32)).close()  # idempotent
 
 
