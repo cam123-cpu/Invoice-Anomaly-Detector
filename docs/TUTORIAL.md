@@ -16,9 +16,9 @@ You need Python 3.11, 3.12 or 3.13. Open a normal PowerShell window (not "as adm
 
 ```powershell
 cd $HOME\Downloads
-Invoke-WebRequest https://github.com/cam123-cpu/Invoice-Anomaly-Detector/archive/refs/heads/main.zip -OutFile iad.zip
-Expand-Archive iad.zip -DestinationPath . -Force
-cd Invoice-Anomaly-Detector-main
+Invoke-WebRequest https://github.com/cam123-cpu/Invoice-Anomaly-Detector/archive/refs/heads/main.zip -OutFile invoice-app.zip
+Expand-Archive invoice-app.zip -DestinationPath invoice-app
+cd invoice-app\Invoice-Anomaly-Detector-main
 
 py -3.13 -m venv .venv
 .venv\Scripts\Activate.ps1
@@ -28,8 +28,9 @@ pytest
 
 All tests should pass. Some are reported as skipped: those need PostgreSQL (Part 2) or the browser test setup.
 
-> Upgrading from an earlier copy? Start in a fresh folder as above. The old `invoices.db`
-> has no companies in it and cannot be reused.
+> If `Expand-Archive` says the folder already exists, you have an older copy. Pick a new name,
+> for example `-DestinationPath invoice-app-2`, and `cd` into that instead. Starting fresh
+> avoids reusing an old `invoices.db`, which earlier versions created without companies.
 
 ### 2. Create your secrets, a company and a login
 
