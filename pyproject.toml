@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "invoice-detector"
-version = "0.1.0"
-description = "Invoice anomaly detector: rules + Isolation Forest, encrypted storage, rate-limited auth"
+version = "0.2.0"
+description = "Invoice anomaly detector: 11 audit rules + Isolation Forest, risk-ranked review queue, encrypted storage"
 requires-python = ">=3.11"
 dependencies = [
   "fastapi>=0.110",

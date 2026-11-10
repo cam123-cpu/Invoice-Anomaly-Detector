@@ -12,7 +12,7 @@ from pydantic import BaseModel, Field
 from .config import Settings
 from .crypto import Vault
 from .db import Database
-from .detection import detect
+from .detection import Anomaly, detect, review_queue
 from .explain import explain
 from .security import (DUMMY_HASH, AuthError, RateLimiter, RateLimitError, TokenSigner,
                        verify_password)
@@ -38,7 +38,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     limiter = RateLimiter()
     bearer = HTTPBearer(auto_error=False)
 
-    app = FastAPI(title="Invoice Anomaly Detector", version="0.1.0")
+    app = FastAPI(title="Invoice Anomaly Detector", version="0.2.0")
     app.state.db, app.state.signer = db, signer
 
     def current_user(creds: HTTPAuthorizationCredentials | None = Depends(bearer)) -> dict:
@@ -111,6 +111,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.get("/anomalies")
     def anomalies(user: dict = Depends(current_user)) -> list[dict]:
         return db.list_anomalies()
+
+    @app.get("/review-queue")
+    def queue(limit: int = 50, user: dict = Depends(current_user)) -> list[dict]:
+        """Flagged invoices ranked by combined risk (0-100), with the reasons."""
+        ranked = review_queue([Anomaly(**a) for a in db.list_anomalies(1000)])
+        return ranked[:max(1, min(limit, 500))]
 
     @app.post("/explain")
     def explain_anomalies(user: dict = Depends(current_user)) -> dict:

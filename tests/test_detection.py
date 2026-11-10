@@ -1,55 +1,94 @@
 import unittest
 
 from invoice_detector.demo import generate_demo
-from invoice_detector.detection import (Invoice, detect, find_amount_outliers, find_duplicates,
-                                        find_ml_outliers, find_shared_bank_accounts, risk_scores)
+from invoice_detector.detection import (DetectionConfig, Invoice, detect, find_amount_outliers,
+                                        find_bank_account_changes, find_ml_outliers,
+                                        find_near_duplicates, find_similar_vendor_names,
+                                        find_split_invoices, review_queue, risk_scores)
+from invoice_detector.evaluate import to_invoices
 
 
-def to_invoices(rows):
-    # in the real app, bank_idx is a keyed hash; here the raw string is fine for matching
-    return [Invoice(r["id"], r["vendor"], r["amount"], r["date"], r["bank_account"]) for r in rows]
+def inv(i, vendor="V", amount=100.0, date="2026-01-05", bank=None):
+    return Invoice(str(i), vendor, amount, date, bank)
 
 
-class DetectionTests(unittest.TestCase):
+class DemoDataTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         rows, cls.injected = generate_demo(seed=0)
         cls.invoices = to_invoices(rows)
         cls.found = detect(cls.invoices)
-        cls.pairs = {(a.invoice_id, a.rule) for a in cls.found}
+        cls.fired = {}
+        for a in cls.found:
+            cls.fired.setdefault(a.invoice_id, set()).add(a.rule)
 
     def test_every_injected_anomaly_is_caught_by_its_rule(self):
-        for rule, inv_id in self.injected.items():
-            self.assertIn((inv_id, rule), self.pairs, f"{rule} on {inv_id} was missed")
+        for inv_id, rules in self.injected.items():
+            self.assertLessEqual(rules, self.fired.get(inv_id, set()), f"missed on {inv_id}")
 
-    def test_ml_flags_the_extreme_outlier(self):
+    def test_few_false_flags_on_clean_invoices(self):
+        false_flags = [a for a in self.found if a.invoice_id not in self.injected]
+        self.assertLessEqual(len(false_flags), 3)
+
+    def test_ml_flags_are_mostly_real(self):
         flagged = {a.invoice_id for a in find_ml_outliers(self.invoices)}
-        self.assertIn(self.injected["amount_outlier"], flagged)
-
-    def test_few_false_positives_on_clean_data(self):
-        injected_ids = set(self.injected.values())
-        noisy = [a for a in find_amount_outliers(self.invoices) if a.invoice_id not in injected_ids]
-        self.assertLessEqual(len(noisy), 2)
-        self.assertEqual(len(find_duplicates(self.invoices)), 1)
-        # shared bank account: only the minority vendor's invoice is flagged
-        self.assertEqual([a.invoice_id for a in find_shared_bank_accounts(self.invoices)],
-                         [self.injected["shared_bank_account"]])
+        self.assertTrue(flagged)
+        self.assertGreaterEqual(len(flagged & self.injected.keys()) / len(flagged), 0.8)
 
     def test_deterministic(self):
         self.assertEqual(detect(self.invoices), detect(self.invoices))
 
-    def test_results_sorted_high_first_and_risk_ranking(self):
-        ranks = [a.severity for a in self.found]
-        self.assertEqual(ranks, sorted(ranks, key=["high", "medium", "low"].index))
-        top = next(iter(risk_scores(self.found)))
-        self.assertIn(top, self.injected.values())
+    def test_review_queue_ranks_real_anomalies_first(self):
+        queue = review_queue(self.found)
+        risks = [q["risk"] for q in queue]
+        self.assertEqual(risks, sorted(risks, reverse=True))
+        self.assertTrue(all(q["invoice_id"] in self.injected for q in queue[:10]))
+        self.assertTrue(all(0 <= r <= 100 for r in risks))
 
-    def test_edge_cases(self):
+
+class RuleTests(unittest.TestCase):
+    def test_edge_cases_do_not_crash_or_flag(self):
         self.assertEqual(detect([]), [])
-        one = [Invoice("A", "V", 10.0, "2026-01-05")]
-        self.assertEqual(detect(one), [])  # tiny datasets don't crash or flag
-        same = [Invoice(str(i), "V", 100.0, f"2026-01-{5 + i:02d}") for i in range(6)]
-        self.assertEqual(find_amount_outliers(same), [])  # zero spread, no division by zero
+        self.assertEqual(detect([inv(1)]), [])
+        same = [inv(i, date=f"2026-01-{5 + i:02d}") for i in range(0, 20, 2)]
+        self.assertEqual(find_amount_outliers(same), [])  # zero spread: no division by zero
+
+    def test_outlier_cannot_hide_by_inflating_the_baseline(self):
+        history = [inv(i, amount=100.0 + i, date=f"2026-02-{i + 1:02d}") for i in range(10)]
+        flagged = find_amount_outliers(history + [inv("big", amount=50_000.0, date="2026-03-02")])
+        self.assertEqual([(a.invoice_id, a.severity) for a in flagged], [("big", "high")])
+
+    def test_near_duplicate_ignores_monthly_subscriptions(self):
+        monthly = [inv(i, amount=2400.0, date=f"2026-{m:02d}-05") for i, m in enumerate(range(1, 7))]
+        self.assertEqual(find_near_duplicates(monthly), [])
+        resubmitted = monthly + [inv("again", amount=2400.0, date="2026-03-09")]
+        self.assertEqual([a.invoice_id for a in find_near_duplicates(resubmitted)], ["again"])
+
+    def test_bank_account_change_needs_history_and_flags_first_use_only(self):
+        usual = [inv(i, date=f"2026-01-{i + 5:02d}", bank="A") for i in range(4)]
+        new = [inv("n1", date="2026-02-01", bank="B"), inv("n2", date="2026-02-08", bank="B")]
+        self.assertEqual([a.invoice_id for a in find_bank_account_changes(usual + new)], ["n1"])
+        self.assertEqual(find_bank_account_changes(usual[:2] + new), [])  # too little history
+
+    def test_split_invoices_respect_window_and_threshold(self):
+        split = [inv(1, amount=4000.0, date="2026-03-02"), inv(2, amount=3500.0, date="2026-03-03"),
+                 inv(3, amount=3000.0, date="2026-03-04")]
+        self.assertEqual({a.invoice_id for a in find_split_invoices(split)}, {"1", "2", "3"})
+        spread_out = [inv(1, amount=6000.0, date="2026-03-02"), inv(2, amount=6000.0, date="2026-03-20")]
+        self.assertEqual(find_split_invoices(spread_out), [])
+        cfg = DetectionConfig(approval_threshold=50_000.0)
+        self.assertEqual(find_split_invoices(split, cfg), [])
+
+    def test_similar_vendor_names_flag_the_smaller_vendor(self):
+        data = [inv(i, vendor="Acme Supplies", date=f"2026-01-{i + 5:02d}") for i in range(5)]
+        data += [inv("x", vendor="Acme Suppiles"), inv("y", vendor="Globex Corp")]
+        self.assertEqual([a.invoice_id for a in find_similar_vendor_names(data)], ["x"])
+
+    def test_risk_combines_signals_but_stays_bounded(self):
+        found = detect([inv(1, amount=5000.0, date="2026-01-03"), inv(2, amount=5000.0, date="2026-01-03")])
+        risks = risk_scores(found)
+        self.assertGreater(risks["2"], risks["1"])  # the duplicate outranks the original
+        self.assertLessEqual(max(risks.values()), 100)
 
 
 if __name__ == "__main__":

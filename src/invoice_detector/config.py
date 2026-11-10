@@ -9,16 +9,19 @@ from dataclasses import dataclass, field
 
 
 def load_dotenv(path: str = ".env") -> None:
-    """Tiny .env reader. Real environment variables win over the file."""
+    """Tiny .env reader. Real environment variables win over the file.
+    Also accepts UTF-16 files, which Windows PowerShell's `>` redirect produces."""
     if not os.path.exists(path):
         return
-    with open(path, encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line or line.startswith("#") or "=" not in line:
-                continue
-            key, _, value = line.partition("=")
-            os.environ.setdefault(key.strip(), value.strip().strip("'\""))
+    with open(path, "rb") as f:
+        raw = f.read()
+    encoding = "utf-16" if raw[:2] in (b"\xff\xfe", b"\xfe\xff") else "utf-8-sig"
+    for line in raw.decode(encoding).splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        os.environ.setdefault(key.strip(), value.strip().strip("'\""))
 
 
 def _require(name: str) -> str:

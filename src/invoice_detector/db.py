@@ -49,6 +49,9 @@ class Database:
         self.conn.execute("PRAGMA foreign_keys = ON")
         self.conn.executescript(SCHEMA)
 
+    def close(self) -> None:
+        self.conn.close()
+
     # ----- users -----
     def create_user(self, username: str, password: str, role: str) -> None:
         with self._lock, self.conn:

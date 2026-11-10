@@ -1,12 +1,14 @@
-"""Anomaly detection: transparent rules plus an Isolation Forest.
+"""Anomaly detection: transparent rules, an Isolation Forest, and a combined risk score.
 
-Rules are explainable and auditable; the ML model catches unusual combinations the
-rules don't anticipate. Output is a list of signals for HUMAN review, not proof of fraud.
+Rules are explainable and auditable; the ML model catches unusual combinations the rules
+don't anticipate. Output is a ranked list of signals for HUMAN review, not proof of fraud.
 """
 import math
-from collections import defaultdict
+import re
+from collections import Counter, defaultdict
 from dataclasses import dataclass
 from datetime import date as Date
+from difflib import SequenceMatcher
 from statistics import median
 
 
@@ -27,15 +29,68 @@ class Anomaly:
     detail: str
 
 
+@dataclass(frozen=True)
+class DetectionConfig:
+    approval_threshold: float = 10_000.0  # amounts at/above this need extra sign-off
+    below_threshold_pct: float = 0.05     # "just under" = within 5% below the threshold
+    near_duplicate_days: int = 10
+    split_window_days: int = 3
+    outlier_z: float = 4.0                # robust z-score on log amounts
+    min_history: int = 8                  # invoices a vendor needs before outlier checks
+    name_similarity: float = 0.85
+    new_vendor_max_invoices: int = 2
+    new_vendor_multiple: float = 5.0      # x the overall median amount
+    use_ml: bool = True
+    ml_min_rows: int = 50
+    ml_sensitivity: float = 6.0           # lower = more ML flags
+
+
+DEFAULT_CONFIG = DetectionConfig()
 SEVERITY_RANK = {"high": 0, "medium": 1, "low": 2}
-SEVERITY_WEIGHT = {"high": 3, "medium": 2, "low": 1}
+
+# How strongly each rule suggests a problem (0-1). Combined with a noisy-OR in risk_scores.
+RULE_WEIGHT = {
+    "duplicate": 0.80,
+    "bank_account_change": 0.80,
+    "shared_bank_account": 0.70,
+    "amount_outlier": 0.55,
+    "split_invoice": 0.50,
+    "near_duplicate": 0.50,
+    "similar_vendor_name": 0.50,
+    "new_vendor_large": 0.40,
+    "ml_outlier": 0.35,
+    "below_threshold": 0.20,
+    "round_amount": 0.15,
+    "weekend_invoice": 0.10,
+}
 
 
+def _day(inv: Invoice) -> Date:
+    return Date.fromisoformat(inv.date)
+
+
+def _by_vendor(invoices: list[Invoice]) -> dict[str, list[Invoice]]:
+    groups: dict[str, list[Invoice]] = defaultdict(list)
+    for inv in sorted(invoices, key=lambda i: (i.date, i.id)):
+        groups[inv.vendor].append(inv)
+    return groups
+
+
+def _robust_log_z(amount: float, log_amounts: list[float]) -> float:
+    """Robust z-score of log(amount) against a vendor's history (median / MAD).
+    The MAD is floored at 5% so very consistent vendors don't trigger on tiny changes,
+    and one huge invoice can't hide itself by inflating the baseline."""
+    med = median(log_amounts)
+    mad = max(median(abs(x - med) for x in log_amounts), 0.05)
+    return 0.6745 * (math.log(amount) - med) / mad
+
+
+# ---------------------------------------------------------------- rules
 def find_duplicates(invoices: list[Invoice]) -> list[Anomaly]:
     """Same vendor + amount + date as an earlier invoice."""
     seen: dict[tuple, str] = {}
     out = []
-    for inv in invoices:
+    for inv in sorted(invoices, key=lambda i: (i.date, i.id)):
         key = (inv.vendor, inv.amount, inv.date)
         if key in seen:
             out.append(Anomaly(inv.id, "duplicate", "high", f"duplicate of {seen[key]}"))
@@ -44,37 +99,59 @@ def find_duplicates(invoices: list[Invoice]) -> list[Anomaly]:
     return out
 
 
-def find_amount_outliers(invoices: list[Invoice], min_history: int = 5,
-                         threshold: float = 3.5) -> list[Anomaly]:
-    """Robust z-score (median/MAD) per vendor. Unlike mean/stdev, one huge invoice
-    can't hide itself by inflating the baseline."""
-    by_vendor: dict[str, list[Invoice]] = defaultdict(list)
-    for inv in invoices:
-        by_vendor[inv.vendor].append(inv)
+def find_near_duplicates(invoices: list[Invoice], cfg: DetectionConfig = DEFAULT_CONFIG) -> list[Anomaly]:
+    """Same vendor + amount a few days apart (a re-submitted invoice with a new date).
+    Monthly fixed-price subscriptions are further apart than the window, so they pass."""
+    groups: dict[tuple, list[Invoice]] = defaultdict(list)
+    for inv in sorted(invoices, key=lambda i: (i.date, i.id)):
+        groups[(inv.vendor, inv.amount)].append(inv)
     out = []
-    for group in by_vendor.values():
-        if len(group) < min_history:
+    for group in groups.values():
+        for prev, cur in zip(group, group[1:]):
+            gap = (_day(cur) - _day(prev)).days
+            if 0 < gap <= cfg.near_duplicate_days:
+                out.append(Anomaly(cur.id, "near_duplicate", "medium",
+                                   f"same vendor and amount as {prev.id}, {gap} day(s) later"))
+    return out
+
+
+def find_amount_outliers(invoices: list[Invoice], cfg: DetectionConfig = DEFAULT_CONFIG) -> list[Anomaly]:
+    """Amount far above the vendor's own history."""
+    out = []
+    for group in _by_vendor(invoices).values():
+        if len(group) < cfg.min_history:
             continue
-        amounts = [i.amount for i in group]
-        med = median(amounts)
-        mad = median(abs(a - med) for a in amounts)
+        logs = [math.log(i.amount) for i in group]
+        typical = math.exp(median(logs))
         for inv in group:
-            if mad == 0:
-                if inv.amount > 3 * med:
-                    out.append(Anomaly(inv.id, "amount_outlier", "medium",
-                                       f"amount {inv.amount:,.2f} vs vendor median {med:,.2f}"))
-                continue
-            z = 0.6745 * (inv.amount - med) / mad
-            if abs(z) > threshold:
-                sev = "high" if abs(z) > 7 else "medium"
+            z = _robust_log_z(inv.amount, logs)
+            if z > cfg.outlier_z:
+                sev = "high" if z > 2 * cfg.outlier_z else "medium"
                 out.append(Anomaly(inv.id, "amount_outlier", sev,
-                                   f"amount {inv.amount:,.2f} vs vendor median {med:,.2f} "
-                                   f"(robust z = {z:.1f})"))
+                                   f"amount {inv.amount:,.2f} is {inv.amount / typical:.1f}x the "
+                                   f"vendor's typical {typical:,.2f} (robust z = {z:.1f})"))
+    return out
+
+
+def find_bank_account_changes(invoices: list[Invoice]) -> list[Anomaly]:
+    """First payment to a new bank account for an established vendor: the classic
+    'we changed our bank details' email scam."""
+    out = []
+    for group in _by_vendor(invoices).values():
+        seen: Counter = Counter()
+        for inv in group:
+            if inv.bank_idx is None:
+                continue
+            if sum(seen.values()) >= 3 and inv.bank_idx not in seen:
+                out.append(Anomaly(inv.id, "bank_account_change", "high",
+                                   f"first payment to a new bank account after "
+                                   f"{sum(seen.values())} invoices to the usual one(s)"))
+            seen[inv.bank_idx] += 1
     return out
 
 
 def find_shared_bank_accounts(invoices: list[Invoice]) -> list[Anomaly]:
-    """One bank account paid out to several vendors: a classic fake-vendor signal.
+    """One bank account paid out to several vendors: a fake-vendor signal.
     Only the minority vendor's invoices are flagged, to limit noise."""
     by_bank: dict[str, dict[str, list[Invoice]]] = defaultdict(lambda: defaultdict(list))
     for inv in invoices:
@@ -95,6 +172,72 @@ def find_shared_bank_accounts(invoices: list[Invoice]) -> list[Anomaly]:
     return out
 
 
+def find_split_invoices(invoices: list[Invoice], cfg: DetectionConfig = DEFAULT_CONFIG) -> list[Anomaly]:
+    """Several invoices from one vendor within a few days, each under the approval
+    threshold but together over it (splitting a bill to dodge sign-off)."""
+    limit = cfg.approval_threshold
+    flagged: dict[str, str] = {}
+    for group in _by_vendor(invoices).values():
+        small = [i for i in group if i.amount < limit]
+        start = 0
+        for end in range(len(small)):
+            while (_day(small[end]) - _day(small[start])).days > cfg.split_window_days:
+                start += 1
+            window = small[start:end + 1]
+            total = sum(i.amount for i in window)
+            if len(window) >= 2 and total >= limit:
+                for inv in window:
+                    flagged[inv.id] = (f"{len(window)} invoices within {cfg.split_window_days} days "
+                                       f"total {total:,.2f}, over the {limit:,.0f} approval threshold")
+    return [Anomaly(inv_id, "split_invoice", "medium", detail) for inv_id, detail in flagged.items()]
+
+
+def find_below_threshold(invoices: list[Invoice], cfg: DetectionConfig = DEFAULT_CONFIG) -> list[Anomaly]:
+    floor = cfg.approval_threshold * (1 - cfg.below_threshold_pct)
+    return [Anomaly(i.id, "below_threshold", "low",
+                    f"amount {i.amount:,.2f} is just under the {cfg.approval_threshold:,.0f} approval threshold")
+            for i in invoices if floor <= i.amount < cfg.approval_threshold]
+
+
+def _normalize_name(name: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", name.lower())
+
+
+def find_similar_vendor_names(invoices: list[Invoice], cfg: DetectionConfig = DEFAULT_CONFIG) -> list[Anomaly]:
+    """A vendor whose name is almost, but not exactly, another vendor's name
+    (look-alike vendors, or typos that split one vendor's history in two)."""
+    groups = _by_vendor(invoices)
+    names = sorted(groups)
+    out = []
+    for i, a in enumerate(names):
+        for b in names[i + 1:]:
+            ratio = SequenceMatcher(None, _normalize_name(a), _normalize_name(b)).ratio()
+            if ratio < cfg.name_similarity:
+                continue
+            minor, major = (a, b) if len(groups[a]) <= len(groups[b]) else (b, a)
+            for inv in groups[minor]:
+                out.append(Anomaly(inv.id, "similar_vendor_name", "medium",
+                                   f"vendor '{minor}' looks like existing vendor '{major}'"))
+    return out
+
+
+def find_new_vendor_large(invoices: list[Invoice], cfg: DetectionConfig = DEFAULT_CONFIG) -> list[Anomaly]:
+    """A large invoice from a vendor with almost no history."""
+    if len(invoices) < 10:
+        return []
+    overall = median(i.amount for i in invoices)
+    out = []
+    for group in _by_vendor(invoices).values():
+        if len(group) > cfg.new_vendor_max_invoices:
+            continue
+        for inv in group:
+            if inv.amount > cfg.new_vendor_multiple * overall:
+                out.append(Anomaly(inv.id, "new_vendor_large", "medium",
+                                   f"new vendor with a large invoice ({inv.amount:,.2f} vs overall "
+                                   f"median {overall:,.2f})"))
+    return out
+
+
 def find_round_amounts(invoices: list[Invoice]) -> list[Anomaly]:
     return [Anomaly(i.id, "round_amount", "low", f"suspiciously round amount {i.amount:,.2f}")
             for i in invoices if i.amount >= 1000 and i.amount % 1000 == 0]
@@ -102,50 +245,108 @@ def find_round_amounts(invoices: list[Invoice]) -> list[Anomaly]:
 
 def find_weekend_invoices(invoices: list[Invoice]) -> list[Anomaly]:
     return [Anomaly(i.id, "weekend_invoice", "low", f"dated on a weekend ({i.date})")
-            for i in invoices if Date.fromisoformat(i.date).weekday() >= 5]
+            for i in invoices if _day(i).weekday() >= 5]
 
 
-def find_ml_outliers(invoices: list[Invoice], min_rows: int = 30,
-                     contamination: float = 0.03) -> list[Anomaly]:
-    """Isolation Forest over amount, amount vs vendor median, weekday and day of month.
-    Skipped on small datasets, where it would mostly produce noise."""
-    if len(invoices) < min_rows:
-        return []
+# ---------------------------------------------------------------- machine learning
+def ml_features(invoices: list[Invoice]) -> list[list[float]]:
+    """One row per invoice: size, deviation from the vendor's norm, timing and vendor history."""
+    groups = _by_vendor(invoices)
+    logs = {v: [math.log(i.amount) for i in g] for v, g in groups.items()}
+    gap_before: dict[str, float] = {}
+    for group in groups.values():
+        gaps = [(_day(b) - _day(a)).days for a, b in zip(group, group[1:])]
+        typical_gap = median(gaps) if gaps else 0
+        gap_before[group[0].id] = typical_gap
+        for inv, gap in zip(group[1:], gaps):
+            gap_before[inv.id] = gap
+    rows = []
+    for inv in invoices:
+        d = _day(inv)
+        z = _robust_log_z(inv.amount, logs[inv.vendor]) if len(logs[inv.vendor]) >= 3 else 0.0
+        rows.append([
+            math.log1p(inv.amount),
+            max(-10.0, min(10.0, z)),
+            1.0 if d.weekday() >= 5 else 0.0,
+            float(d.day),
+            math.log1p(gap_before[inv.id]),
+            math.log1p(len(groups[inv.vendor])),
+        ])
+    return rows
+
+
+def ml_scores(invoices: list[Invoice]) -> dict[str, float]:
+    """Isolation Forest anomaly score per invoice (higher = more unusual).
+    Returns {} if scikit-learn isn't installed."""
     try:
         import numpy as np
         from sklearn.ensemble import IsolationForest
     except ImportError:
+        return {}
+    ordered = sorted(invoices, key=lambda i: i.id)  # stable order => reproducible scores
+    x = np.array(ml_features(ordered))
+    model = IsolationForest(n_estimators=300, random_state=0).fit(x)
+    return {inv.id: float(-s) for inv, s in zip(ordered, model.score_samples(x))}
+
+
+def find_ml_outliers(invoices: list[Invoice], cfg: DetectionConfig = DEFAULT_CONFIG) -> list[Anomaly]:
+    """Flags invoices whose Isolation Forest score stands far out from the rest.
+    Uses a data-driven cut-off (median + k x MAD of the scores) instead of a fixed
+    percentage, so a clean dataset isn't forced to produce flags."""
+    if len(invoices) < cfg.ml_min_rows:
         return []
-    vendor_median = {v: median(i.amount for i in invoices if i.vendor == v)
-                     for v in {i.vendor for i in invoices}}
-    rows = []
-    for inv in invoices:
-        d = Date.fromisoformat(inv.date)
-        rows.append([math.log1p(inv.amount), math.log(inv.amount / vendor_median[inv.vendor]),
-                     d.weekday(), d.day])
-    labels = IsolationForest(n_estimators=200, contamination=contamination,
-                             random_state=0).fit_predict(np.array(rows))
-    return [Anomaly(inv.id, "ml_outlier", "medium",
-                    "unusual mix of amount, vendor history and timing (Isolation Forest)")
-            for inv, label in zip(invoices, labels) if label == -1]
+    scores = ml_scores(invoices)
+    if not scores:
+        return []
+    values = list(scores.values())
+    med = median(values)
+    mad = median(abs(v - med) for v in values) or 1e-9
+    cutoff = med + cfg.ml_sensitivity * mad
+    return [Anomaly(inv_id, "ml_outlier", "medium",
+                    f"unusual mix of amount, vendor history and timing "
+                    f"(Isolation Forest score {score:.2f}, cut-off {cutoff:.2f})")
+            for inv_id, score in scores.items() if score > cutoff]
 
 
-def detect(invoices: list[Invoice], use_ml: bool = True) -> list[Anomaly]:
+# ---------------------------------------------------------------- combine
+def detect(invoices: list[Invoice], cfg: DetectionConfig = DEFAULT_CONFIG) -> list[Anomaly]:
     found = [
         *find_duplicates(invoices),
-        *find_amount_outliers(invoices),
+        *find_near_duplicates(invoices, cfg),
+        *find_amount_outliers(invoices, cfg),
+        *find_bank_account_changes(invoices),
         *find_shared_bank_accounts(invoices),
+        *find_split_invoices(invoices, cfg),
+        *find_below_threshold(invoices, cfg),
+        *find_similar_vendor_names(invoices, cfg),
+        *find_new_vendor_large(invoices, cfg),
         *find_round_amounts(invoices),
         *find_weekend_invoices(invoices),
     ]
-    if use_ml:
-        found += find_ml_outliers(invoices)
+    if cfg.use_ml:
+        found += find_ml_outliers(invoices, cfg)
     return sorted(found, key=lambda a: (SEVERITY_RANK[a.severity], a.invoice_id, a.rule))
 
 
 def risk_scores(anomalies: list[Anomaly]) -> dict[str, int]:
-    """Sum of severity weights per invoice, for ranking a review queue."""
-    scores: dict[str, int] = defaultdict(int)
+    """Risk 0-100 per invoice. Signals combine as a noisy-OR: independent weak signals
+    add up, but no amount of weak signals outranks certainty. Highest first."""
+    miss: dict[str, float] = defaultdict(lambda: 1.0)
     for a in anomalies:
-        scores[a.invoice_id] += SEVERITY_WEIGHT[a.severity]
-    return dict(sorted(scores.items(), key=lambda kv: -kv[1]))
+        weight = RULE_WEIGHT.get(a.rule, 0.3)
+        if a.rule == "amount_outlier" and a.severity == "high":
+            weight = 0.75
+        miss[a.invoice_id] *= 1 - weight
+    scores = {inv_id: round(100 * (1 - m)) for inv_id, m in miss.items()}
+    return dict(sorted(scores.items(), key=lambda kv: (-kv[1], kv[0])))
+
+
+def review_queue(anomalies: list[Anomaly]) -> list[dict]:
+    """Invoices ranked by risk, each with the reasons it was flagged."""
+    reasons: dict[str, list[Anomaly]] = defaultdict(list)
+    for a in anomalies:
+        reasons[a.invoice_id].append(a)
+    return [{"invoice_id": inv_id, "risk": risk,
+             "rules": [a.rule for a in reasons[inv_id]],
+             "details": [a.detail for a in reasons[inv_id]]}
+            for inv_id, risk in risk_scores(anomalies).items()]
