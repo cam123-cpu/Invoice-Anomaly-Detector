@@ -18,7 +18,8 @@ from datetime import datetime, timezone
 from .config import Settings
 from .crypto import Vault
 from .detection import Anomaly, Invoice
-from .schema import POSTGRES_SECURITY, POSTGRES_TABLES, SQLITE_SCHEMA
+from .decisions import ACTIONS, suggested_action
+from .schema import ADDED_COLUMNS, POSTGRES_SECURITY, POSTGRES_TABLES, SQLITE_SCHEMA
 from .security import hash_password
 
 SORTABLE = {"id", "vendor", "amount", "invoice_date"}  # column names can't be parameters
@@ -56,6 +57,7 @@ class Database:
             self.conn.execute("PRAGMA foreign_keys = ON")
             self._check_not_old_format()
             self.conn.executescript(SQLITE_SCHEMA)
+            self._add_missing_columns()
 
     @classmethod
     def from_settings(cls, settings: Settings, admin: bool = False) -> "Database":
@@ -73,6 +75,14 @@ class Database:
             raise RuntimeError("This database file is from an older version without companies. "
                                "Delete it (or set DB_PATH to a new file) and load your data again.")
 
+    def _add_missing_columns(self) -> None:
+        """Upgrade a SQLite file made by an older version: add any newer columns."""
+        for table, column, definition in ADDED_COLUMNS:
+            existing = {r["name"] for r in self.conn.execute(f"PRAGMA table_info({table})")}
+            if column not in existing:
+                self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+        self.conn.commit()
+
     def close(self) -> None:
         self.conn.close()
 
@@ -85,6 +95,8 @@ class Database:
         from psycopg import sql
         with self._lock, self.conn.transaction():
             self.conn.execute(POSTGRES_TABLES)
+            for table, column, definition in ADDED_COLUMNS:
+                self.conn.execute(f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {column} {definition}")
             self.conn.execute(POSTGRES_SECURITY)
             password = os.environ.get("APP_DB_PASSWORD")
             if password:
@@ -154,6 +166,14 @@ class Database:
         with self._tx(org_id) as run:
             run("INSERT INTO users (username, org_id, password_hash, role) VALUES (?, ?, ?, ?)",
                 (username, org_id, hash_password(password), role))
+
+    def set_password(self, username: str, password: str) -> bool:
+        """Operator tool (owner connection): replace a user's password. False if no such user."""
+        query = "UPDATE users SET password_hash = ? WHERE username = ?"
+        with self._tx():
+            cur = self.conn.execute(query.replace("?", "%s") if self.is_postgres else query,
+                                    (hash_password(password), username))
+            return cur.rowcount == 1
 
     def auth_lookup(self, username: str) -> dict | None:
         """Used only by login, before the company is known."""
@@ -267,22 +287,47 @@ class Database:
                        "invoice_id, rule LIMIT ?", (org_id, limit))
 
     # ----- reviewer feedback -----
-    def set_review(self, org_id: str, invoice_id: str, verdict: str, reviewer: str) -> None:
-        """Record a reviewer's decision, with a snapshot of the rules that fired."""
+    def set_review(self, org_id: str, invoice_id: str, verdict: str, reviewer: str,
+                   action: str | None = None, note: str | None = None) -> str:
+        """Record a reviewer's decision, with a snapshot of the rules that fired, and the
+        payment action that follows from it. Confirming without choosing an action applies
+        the suggested one (e.g. 'do_not_pay' for a duplicate); dismissing means 'pay'.
+        Returns the action stored."""
         if verdict not in VERDICTS:
             raise ValueError("Invalid verdict")
+        if action is not None and action not in ACTIONS:
+            raise ValueError("Invalid action")
         with self._tx(org_id) as run:
             rules = [r["rule"] for r in run(
                 "SELECT rule FROM anomalies WHERE org_id = ? AND invoice_id = ? ORDER BY rule",
                 (org_id, invoice_id))]
             if not rules:
                 raise KeyError(invoice_id)
-            run("INSERT INTO reviews (org_id, invoice_id, verdict, rules, reviewer, reviewed_at) "
-                "VALUES (?, ?, ?, ?, ?, ?) "
+            if verdict == "dismissed":
+                action = "pay"
+            elif action is None:
+                action = suggested_action(rules)
+            run("INSERT INTO reviews (org_id, invoice_id, verdict, action, note, rules, reviewer, reviewed_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
                 "ON CONFLICT (org_id, invoice_id) DO UPDATE SET verdict = excluded.verdict, "
-                "rules = excluded.rules, reviewer = excluded.reviewer, "
-                "reviewed_at = excluded.reviewed_at",
-                (org_id, invoice_id, verdict, ",".join(rules), reviewer, _now()))
+                "action = excluded.action, note = excluded.note, rules = excluded.rules, "
+                "reviewer = excluded.reviewer, reviewed_at = excluded.reviewed_at",
+                (org_id, invoice_id, verdict, action, (note or "").strip()[:500] or None,
+                 ",".join(rules), reviewer, _now()))
+        return action
+
+    def review_details(self, org_id: str) -> dict[str, dict]:
+        """{invoice id: {verdict, action, note, reviewer, reviewed_at}} for this company."""
+        with self._tx(org_id) as run:
+            rows = run("SELECT invoice_id, verdict, action, note, reviewer, reviewed_at FROM reviews "
+                       "WHERE org_id = ?", (org_id,))
+        return {r.pop("invoice_id"): r for r in rows}
+
+    def all_invoices(self, org_id: str) -> list[dict]:
+        """Every invoice of this company (no bank data), oldest first."""
+        with self._tx(org_id) as run:
+            return run("SELECT id, vendor, amount, invoice_date FROM invoices WHERE org_id = ? "
+                       "ORDER BY invoice_date, id", (org_id,))
 
     def list_reviews(self, org_id: str) -> dict[str, str]:
         with self._tx(org_id) as run:

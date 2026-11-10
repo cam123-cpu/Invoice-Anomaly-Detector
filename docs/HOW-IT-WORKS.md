@@ -30,8 +30,9 @@ Companies pay suppliers by invoice, and some invoices are wrong: paid twice, sen
 fraudster's bank account, split to dodge an approval limit, or simply far larger than usual.
 This system reads a company's invoices (typically an Excel export from its accounting software),
 runs **twelve checks** on them, and produces a **review queue** ranked by a 0–100 risk score, with
-a plain-English reason for every flag. Accountants confirm or dismiss each flag, and those
-decisions tune the scoring for their company. Results can be downloaded as the company's own
+a plain-English reason for every flag. Accountants confirm or dismiss each flag. Confirming
+sets what happens to the payment (**Do not pay** or **Hold**) and lists what to do next, and the
+decisions also tune the scoring for that company. Results can be downloaded as the company's own
 spreadsheet with the findings written in.
 
 Many companies can share one installation. Each sees only its own data, and that separation is
@@ -39,11 +40,12 @@ enforced in three places: the login token, the application code, and the databas
 
 Under the hood it is a **Python web service** (FastAPI) with a **browser front end** (plain
 JavaScript), storing data in **SQLite** for a single machine or **PostgreSQL** in production.
-Sensitive fields are encrypted, every query is parameterized, and 115 automated tests run on
+Sensitive fields are encrypted, every query is parameterized, and 124 automated tests run on
 every change, including a test that drives the app in a real browser.
 
 Remember the core idea: **flags are signals for a human, not verdicts.** The system never
-blocks a payment by itself.
+blocks a payment by itself, and it never edits or deletes an invoice. A person confirms the
+problem, the payment decision follows, and the original record stays as the supplier sent it.
 
 ---
 
@@ -174,6 +176,7 @@ src/invoice_detector/
   web/index.html   16 lines  The empty page that loads app.js and app.css
   importer.py    ~410 lines  Reads Excel/CSV, guesses columns, parses amounts and dates
   detection.py   ~390 lines  The 12 checks, the ML model, risk scoring, learning from reviews
+  decisions.py    ~90 lines  Payment decision and next steps for each flagged invoice
   db.py          ~310 lines  All database reads and writes, scoped to one company
   excel_out.py   ~220 lines  Writes results into workbooks, reports, the template
   cli.py         ~190 lines  Command-line tool: init, create-org, import, detect, ...
@@ -185,7 +188,7 @@ src/invoice_detector/
   config.py       ~70 lines  Reads settings and secrets from the environment
   crypto.py       ~55 lines  AES-GCM encryption, per-company keys, blind index
   explain.py      ~50 lines  Optional plain-English summary via the Claude API
-tests/                       115 automated tests (unit, API, database, browser)
+tests/                       124 automated tests (unit, API, database, browser)
 samples/                     The four sample Excel files
 docs/                        TUTORIAL.md and this guide
 prototypes/                  The original Gleam version
@@ -271,12 +274,18 @@ workbook, the browser simply sends the file again, which it still holds in memor
 2. The server loads this company's anomalies and reviews, computes **learned rule weights** from
    past reviews, combines each invoice's flags into a risk score, sorts, and adds vendor, amount
    and date.
-3. The accountant clicks **Dismiss** on one item. The browser sends
-   `POST /review/INV-0255 {"verdict": "dismissed"}`.
-4. The server stores the verdict with a **snapshot of which rules fired**, and writes an audit
-   entry.
-5. Next time the queue is computed, every rule that fired on that invoice counts slightly less
-   for this company.
+3. The accountant clicks **Confirm** on a duplicate. The browser sends
+   `POST /review/INV-0245 {"verdict": "confirmed"}`.
+4. The server stores the verdict with a **snapshot of which rules fired**, and the **payment
+   action** that follows: none was chosen, so `suggested_action(["duplicate"])` supplies
+   `do_not_pay`. It writes an audit entry and returns the action, and the browser shows
+   "Do not pay".
+5. The accountant can then pick a different action (say, *Hold*) and add a note; that is the same
+   request with `"action"` and `"note"` filled in. **Dismiss** stores the action `pay`.
+6. Next time the queue is computed, every rule that fired on a dismissed invoice counts slightly
+   less for this company, and confirmed ones keep their weight.
+7. The payment file and the annotated workbook read the same decisions, so Excel always shows
+   the latest outcome.
 
 ### 4.4 One request, end to end
 
@@ -339,6 +348,8 @@ erDiagram
         text org_id PK
         text invoice_id PK
         text verdict "confirmed | dismissed"
+        text action "pay | hold | do_not_pay"
+        text note "reviewer's note, optional"
         text rules "snapshot of rules that fired"
         text reviewer
         text reviewed_at
@@ -367,6 +378,11 @@ Concepts at work:
   tables refer to it by `org_id`.
 - **Derived data:** `anomalies` can always be recomputed from `invoices`, and `save_flags` simply
   replaces them. `reviews` are human decisions and are kept, so they survive re-runs.
+- **Upgrading old databases:** the `action` and `note` columns were added after the first
+  release. `schema.py` lists them in `ADDED_COLUMNS`. On start-up, SQLite files from older versions
+  get them with `ALTER TABLE ... ADD COLUMN`, and on PostgreSQL `migrate` uses
+  `ADD COLUMN IF NOT EXISTS`. Existing data is kept. This is a **schema migration**: changing the
+  shape of stored data without losing it.
 - **One schema, two databases:** `schema.py` writes the table definitions once with placeholders
   such as `{REAL}`, then fills them in for SQLite (`REAL`) and PostgreSQL (`DOUBLE PRECISION`).
 
@@ -564,10 +580,13 @@ names and types.
 
 ### 6.6 `excel_out.py`: writing results into workbooks
 
-- `annotate` opens the user's own workbook, finds the last used column, and adds four columns:
-  Risk, Review status, Flags and Why flagged. It fills them in using the `lines` map, adds a
-  ranked **Flagged invoices** sheet and an **About these flags** sheet, and saves to bytes in
-  memory. CSV uploads are first rebuilt as a worksheet.
+- `annotate` opens the user's own workbook, finds the last used column, and adds six columns:
+  Risk, Review status, Payment decision, Flags, Why flagged and What to do. It fills them in using
+  the `lines` map, adds a ranked **Flagged invoices** sheet and an **About these flags** sheet,
+  and saves to bytes in memory. CSV uploads are first rebuilt as a worksheet.
+- `payment_file` sorts **every** invoice (not just flagged ones) by payment decision into sheets
+  (Ready to pay, Review first, On hold, Do not pay) with totals and a summary. This is the
+  "corrected" output: nothing in the invoices changes, but the batch to pay is now clean.
 - **It never changes an existing cell**, so the user's data and formulas survive. `.xlsm` files
   keep their macros (`keep_vba=True`).
 - **Formula injection** (also called CSV injection): if a vendor name is `=HYPERLINK(...)` and you
@@ -597,9 +616,9 @@ names and types.
 | `POST /detect` | admin, accountant | Run all checks |
 | `GET /anomalies` | signed in | Every individual flag |
 | `GET /review-queue` | signed in | Ranked flags with reasons and status |
-| `POST /review/{id}` | admin, accountant | Confirm or dismiss |
+| `POST /review/{id}` | admin, accountant | Confirm or dismiss; optional payment action and note |
 | `GET /metrics`, `/summary` | signed in | Accuracy per rule; dashboard numbers |
-| `POST /export/annotated`, `GET /export/review.xlsx` | signed in | Excel downloads |
+| `POST /export/annotated`, `GET /export/review.xlsx`, `GET /export/payment-file.xlsx` | signed in | Excel downloads |
 | `POST /explain` | signed in | Plain-English summary |
 
 Concepts used:
@@ -639,8 +658,39 @@ A small **command dispatcher**: `main(argv)` looks at the first word (`init`, `c
 success, 1 for failure), the Unix convention scripts rely on. `_db()` is a context manager that
 always closes the database, even on errors. The CLI uses the database *owner* connection, because
 operators need to create companies, which the web server's limited role can't do.
+`reset-password NAME` sets a new password for a user who forgot theirs.
 
-### 6.9 `explain.py`: optional AI summary
+### 6.9 `decisions.py`: what to do about a flag
+
+A small, pure module that answers two questions for a flagged invoice:
+
+- **What should happen to the payment?** `RULE_FIX` maps each rule to a suggested action and a
+  plain-English next step. `suggested_action(rules)` picks the **strictest** action among the rules
+  that fired (`do_not_pay` beats `hold`), a simple *max by severity*.
+- **What is the decision right now?** `payment_decision(item)` is a small **state machine** over
+  the review status:
+
+```mermaid
+stateDiagram-v2
+    [*] --> Pay: no flags
+    [*] --> ReviewFirst: flagged
+    ReviewFirst --> DoNotPay: Confirm (duplicate)
+    ReviewFirst --> Hold: Confirm (needs checking)
+    ReviewFirst --> Pay: Dismiss
+    Hold --> Pay: Pay anyway, after checking
+    Hold --> DoNotPay: reviewer changes it
+    DoNotPay --> Hold: reviewer changes it
+    Pay --> DoNotPay: Confirm instead
+    Pay --> Hold: Confirm instead
+```
+
+**Design choice: it never edits invoices.** "Fixing" a duplicate means not paying it, and fixing a
+suspicious bank change means calling the vendor; neither is a data edit. Invoices are immutable,
+so the audit trail always shows what the supplier actually sent, and decisions live separately
+in `reviews`. This is the **event / decision log** idea used in accounting systems: you record
+what was decided, you don't overwrite what happened.
+
+### 6.10 `explain.py`: optional AI summary
 
 Builds a prompt containing **only invoice IDs, rule names and numbers**, with no vendor names or
 bank details (**data minimization**), and calls the Anthropic Messages API. The HTTP function is
@@ -648,17 +698,17 @@ a parameter (`post=_default_post`), so tests pass a fake and never touch the net
 (no key, network down, bad response) falls back to a plain template: **graceful degradation**.
 The model name in this file should be checked against Anthropic's current docs.
 
-### 6.10 `demo.py`, `evaluate.py`, `samples.py`: data for testing and demos
+### 6.11 `demo.py`, `evaluate.py`, `samples.py`: data for testing and demos
 
 - `demo.py` generates **synthetic invoices**: eight vendors with realistic amounts drawn from a
   **log-normal distribution** (amounts are skewed: many ordinary, a few large), regular invoice
   cadences, one fixed-price subscription, and 14 **planted anomalies** of known types. A
   **random seed** makes it **reproducible**: seed 0 always produces the same data.
-- `evaluate.py` runs detection on 10 seeds and measures quality ([section 7.6](#76-measuring-quality)).
+- `evaluate.py` runs detection on 10 seeds and measures quality ([section 7.7](#77-measuring-quality)).
 - `samples.py` reshapes the demo data into four realistic workbook styles. Timestamps inside the
   files are fixed, so the output is deterministic.
 
-### 6.11 `web/`: the browser app
+### 6.12 `web/`: the browser app
 
 It is a **single-page application** (SPA): the browser loads one page once, and JavaScript
 redraws the content as you navigate. There is no framework, just about 760 lines of plain
@@ -949,9 +999,9 @@ Everything is near-linear except the vendor-name comparison, which is quadratic 
 ```mermaid
 flowchart TB
     E2E["Browser tests (6)<br/>Playwright drives Chromium against the real server"]
-    API["API tests (14)<br/>FastAPI TestClient: sign-in, roles, isolation, uploads, downloads"]
-    DB["Database and tenancy tests (~25)<br/>SQLite always; real PostgreSQL in CI, including raw SQL against RLS"]
-    UNIT["Unit tests (~70)<br/>rules, parsing, crypto, tokens, rate limiter, Excel output, CLI"]
+    API["API tests (15)<br/>FastAPI TestClient: sign-in, roles, isolation, uploads, downloads, decisions"]
+    DB["Database and tenancy tests (28)<br/>SQLite always; real PostgreSQL in CI, including raw SQL against RLS"]
+    UNIT["Unit tests (75)<br/>rules, decisions, parsing, crypto, tokens, rate limiter, Excel output, CLI"]
     E2E --- API --- DB --- UNIT
 ```
 
@@ -1035,6 +1085,9 @@ that learns from their decisions."
   database-enforced row-level security, and per-company encryption keys. Tests try to break each.
 - *Why is the bank account encrypted but searchable?* Encryption protects it; a keyed blind index
   allows equality checks without decrypting.
+- *Does it fix the problems automatically?* It decides what happens to the payment (Do not pay
+  or Hold) as soon as someone confirms, lists the follow-up steps, and produces a clean payment
+  file. It deliberately doesn't edit invoices: those are the legal record of what was billed.
 - *What happens if the AI service is down?* Nothing important: explanations fall back to a
   template, and detection doesn't use it at all.
 - *How accurate is it?* 97% precision and 88% recall on synthetic data, which is an upper bound.

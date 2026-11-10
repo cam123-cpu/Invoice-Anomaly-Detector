@@ -169,13 +169,32 @@ class BrowserTest(unittest.TestCase):
         p.wait_for_selector("tr.details:not(.hidden) li")
         open_before = int(p.inner_text(".tabs button.on").split("(")[1].rstrip(")"))
         p.click("button[aria-label='Confirm INV-0249 is a problem']")
-        p.wait_for_selector("text=INV-0249 marked as a real problem")
+        p.wait_for_selector("text=INV-0249 confirmed: hold")  # a bank-account change is held, not refused
         p.click("button[aria-label='Dismiss INV-0255 as a false alarm']")
         p.wait_for_selector("text=INV-0255 dismissed as a false alarm")
         self.assertEqual(int(p.inner_text(".tabs button.on").split("(")[1].rstrip(")")), open_before - 2)
         self.assertEqual(p.locator("td.mono:text-is('INV-0249')").count(), 0)  # left the Open tab
         p.click(".tabs button:text('Confirmed')")
         p.wait_for_selector("td.mono:text-is('INV-0249')")
+        # decide what happens to the payment, with a note
+        row = "tr.clickable:has(td.mono:text-is('INV-0249'))"
+        self.assertEqual(p.get_attribute(row, "aria-expanded"), "true")  # opened earlier, stays open
+        p.wait_for_selector("tr.details:not(.hidden) >> text=What to do")
+        self.assertIn("phone number you already had", p.inner_text("tr.details:not(.hidden)"))
+        p.select_option("select[aria-label='Payment decision for INV-0249']", "do_not_pay")
+        p.fill("input[aria-label='Note for INV-0249']", "Vendor says they never changed banks")
+        p.click("button:text('Save decision')")
+        p.wait_for_selector("text=INV-0249: do not pay, note saved")
+        self.assertEqual(p.inner_text("tr:has(td.mono:text-is('INV-0249')) .pill"), "Do not pay")
+        self.assertTrue(p.is_visible("select[aria-label='Payment decision for INV-0249']"))  # row stays open
+        self.shot("03b-decision")
+        with p.expect_download() as dl:
+            p.click("button:text('Download payment file')")
+        pay = xlsx(dl.value.path())
+        self.assertEqual(pay.sheetnames, ["Summary", "Ready to pay", "Review first", "On hold", "Do not pay"])
+        stopped = pay["Do not pay"]
+        self.assertEqual((stopped.cell(2, 1).value, stopped.cell(2, 8).value),
+                         ("INV-0249", "Vendor says they never changed banks"))
         p.fill("input[type=search]", "nothing-matches-this")
         p.wait_for_selector("text=No matches")
 
@@ -183,6 +202,7 @@ class BrowserTest(unittest.TestCase):
         p.click("nav a[href='#/dashboard']")
         p.wait_for_selector("text=How each check is performing")
         self.assertIn("1", p.inner_text(".kpi:has-text('Confirmed problems') .value"))
+        self.assertIn("1 invoice", p.inner_text(".d-card.d-do_not_pay"))
         self.shot("02-dashboard")
 
         # upload a messy Excel export
@@ -210,11 +230,14 @@ class BrowserTest(unittest.TestCase):
         self.assertEqual(dl.value.suggested_filename, "ap-export - checked.xlsx")
         wb = xlsx(dl.value.path())
         ws = wb["AP export"]
-        self.assertEqual([ws.cell(3, c).value for c in range(7, 11)], ["Risk", "Review status", "Flags", "Why flagged"])
+        self.assertEqual([ws.cell(3, c).value for c in range(7, 13)],
+                         ["Risk", "Review status", "Payment decision", "Flags", "Why flagged", "What to do"])
         self.assertEqual(ws.cell(1, 1).value, "Accounts payable register - Q1 2026")  # original untouched
         by_id = {ws.cell(r, 1).value: r for r in range(4, 10)}
         self.assertGreater(ws.cell(by_id["Q1-005"], 7).value, 0)
-        self.assertIn("Duplicate", ws.cell(by_id["Q1-005"], 9).value)
+        self.assertEqual(ws.cell(by_id["Q1-005"], 9).value, "Review first")
+        self.assertIn("Duplicate", ws.cell(by_id["Q1-005"], 10).value)
+        self.assertTrue(ws.cell(by_id["Q1-005"], 12).value.startswith("Don't pay"))
         self.assertEqual(ws.cell(by_id["Q1-004"], 8).value, "Not imported")
         self.assertEqual(ws.cell(by_id["Q1-003"], 2).value, XSS_VENDOR)
         self.assertIn("Flagged invoices", wb.sheetnames)

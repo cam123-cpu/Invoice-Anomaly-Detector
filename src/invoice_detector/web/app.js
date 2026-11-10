@@ -19,10 +19,17 @@ const RULES = {
 };
 const ACTIONS = {
   login: "Signed in", login_failed: "Failed sign-in", file_imported: "Imported a file",
+  report_exported: "Downloaded a report", workbook_exported: "Downloaded a checked workbook",
   invoices_imported: "Imported invoices", detection_run: "Ran detection", invoice_reviewed: "Reviewed an invoice",
   bank_account_viewed: "Viewed a bank account", user_created: "Added a user", settings_changed: "Changed settings",
 };
 const CAN_EDIT = ["admin", "accountant"];
+const DECISIONS = {
+  do_not_pay: ["Do not pay", "Confirmed problem. Don't pay this invoice."],
+  hold: ["Hold", "Confirmed problem. Check it before paying."],
+  review: ["Review first", "Flagged, not reviewed yet."],
+  pay: ["Pay", "No problem found."],
+};
 
 /* ------------------------------------------------------------ helpers */
 function h(tag, props, ...kids) {
@@ -314,6 +321,13 @@ async function dashboardView() {
     kpi("Flag accuracy", m.precision === null ? "—" : Math.round(m.precision * 100) + "%",
       m.reviewed ? `from ${whole.format(m.reviewed)} reviews` : "after your first reviews"));
 
+  const money = (d, label, alert) => h("div", { class: "card kpi d-card d-" + d + (alert ? " alert" : "") },
+    h("div", { class: "label" }, label), h("div", { class: "value" }, fmtAmount(s.amounts[d])),
+    h("div", { class: "sub" }, `${whole.format(s.decisions[d])} invoice${s.decisions[d] === 1 ? "" : "s"} · ${DECISIONS[d][1]}`));
+  const payments = h("div", {}, h("div", { class: "row" }, h("h2", {}, "Payments"), h("span", { class: "spacer" }),
+    downloadButton("Download payment file", "GET", "/export/payment-file.xlsx", undefined, "sm")),
+    h("div", { class: "kpis" }, money("pay", "Ready to pay"), money("review", "Review first"),
+      money("hold", "On hold"), money("do_not_pay", "Stopped (do not pay)", s.amounts.do_not_pay > 0)));
   const maxRule = Math.max(1, ...Object.values(s.open_by_rule));
   const reasons = h("div", { class: "card" }, h("h2", {}, "Why open invoices were flagged"),
     Object.keys(s.open_by_rule).length
@@ -340,7 +354,7 @@ async function dashboardView() {
   const last = s.last_detection
     ? h("p", { class: "muted small" }, `Detection last ran ${fmtDate(s.last_detection.at)} by ${s.last_detection.username}: ${s.last_detection.detail}.`)
     : h("p", { class: "muted small" }, "Detection hasn't run yet.");
-  return h("div", {}, head, kpis, h("div", { class: "grid grid-2" }, reasons, perf), spacer(12), last);
+  return h("div", {}, head, kpis, payments, h("div", { class: "grid grid-2" }, reasons, perf), spacer(12), last);
 }
 
 /* ------------------------------------------------------------ review queue */
@@ -352,6 +366,7 @@ async function reviewView() {
   items.forEach((i) => { counts[i.status] += 1; });
   openCount = counts.open;
   let query = "";
+  const expanded = new Set(); // rows the user has opened stay open after a decision
 
   const body = h("tbody");
   const wrap = h("div", { class: "table-wrap" });
@@ -372,21 +387,37 @@ async function reviewView() {
         ? "New flags appear here after an upload or a detection run." : ""));
   }
 
+  function decisionPill(item) {
+    const [text, help] = DECISIONS[item.decision] || [item.decision, ""];
+    return h("span", { class: "pill d-" + item.decision, title: help }, text);
+  }
+
+  async function send(item, body, message) {
+    const r = await api("POST", "/review/" + encodeURIComponent(item.invoice_id), body);
+    if (item.status !== body.verdict) {
+      counts[item.status] -= 1;
+      counts[body.verdict] += 1;
+    }
+    item.status = body.verdict;
+    item.action = r.action;
+    item.decision = body.verdict === "dismissed" ? "pay" : r.action;
+    if (body.note !== undefined) item.note = body.note || null;
+    openCount = counts.open;
+    toast(message(item));
+    updateTabs();
+    drawRows();
+    updateNavCount();
+  }
+
   function actionsFor(item) {
-    if (!canEdit) return h("span", { class: "pill " + item.status }, item.status === "dismissed" ? "false alarm" : item.status);
+    if (!canEdit) return decisionPill(item);
     const decide = (verdict) => async (e) => {
       e.stopPropagation();
       e.currentTarget.disabled = true;
       try {
-        await api("POST", "/review/" + encodeURIComponent(item.invoice_id), { verdict });
-        counts[item.status] -= 1;
-        item.status = verdict;
-        counts[verdict] += 1;
-        openCount = counts.open;
-        toast(verdict === "confirmed" ? `${item.invoice_id} marked as a real problem` : `${item.invoice_id} dismissed as a false alarm`);
-        updateTabs();
-        drawRows();
-        updateNavCount();
+        await send(item, { verdict, note: item.note || undefined }, (it) => verdict === "confirmed"
+          ? `${it.invoice_id} confirmed: ${DECISIONS[it.decision][0].toLowerCase()}`
+          : `${it.invoice_id} dismissed as a false alarm`);
       } catch (err) {
         toast(err.message, true);
         e.currentTarget.disabled = false;
@@ -394,13 +425,32 @@ async function reviewView() {
     };
     if (item.status === "open") {
       return h("div", { class: "row" },
-        h("button", { class: "btn sm danger", onclick: decide("confirmed"), "aria-label": `Confirm ${item.invoice_id} is a problem` }, "Confirm"),
+        h("button", { class: "btn sm danger", onclick: decide("confirmed"), "aria-label": `Confirm ${item.invoice_id} is a problem`,
+          title: `Confirming marks it: ${DECISIONS[item.suggested_action][0]}` }, "Confirm"),
         h("button", { class: "btn sm", onclick: decide("dismissed"), "aria-label": `Dismiss ${item.invoice_id} as a false alarm` }, "Dismiss"));
     }
     const other = item.status === "confirmed" ? "dismissed" : "confirmed";
-    return h("div", { class: "row" },
-      h("span", { class: "pill " + item.status }, item.status === "dismissed" ? "false alarm" : "confirmed"),
+    return h("div", { class: "row" }, decisionPill(item),
       h("button", { class: "btn link small", onclick: decide(other) }, other === "confirmed" ? "Confirm instead" : "Dismiss instead"));
+  }
+
+  function decisionEditor(item) {
+    // Only for confirmed problems: choose what happens to the payment and leave a note.
+    const sel = h("select", { "aria-label": `Payment decision for ${item.invoice_id}` },
+      h("option", { value: "do_not_pay" }, "Do not pay"), h("option", { value: "hold" }, "Hold until checked"),
+      h("option", { value: "pay" }, "Pay anyway (checked, it's fine)"));
+    sel.value = item.action || item.suggested_action;
+    const note = h("input", { type: "text", maxlength: "500", placeholder: "Note, e.g. \"Called vendor 12 Nov, bank change is genuine\"",
+      "aria-label": `Note for ${item.invoice_id}`, value: item.note || "" });
+    const save = h("button", { class: "btn sm primary", onclick: async () => {
+      save.disabled = true;
+      try {
+        await send(item, { verdict: "confirmed", action: sel.value, note: note.value },
+          (it) => `${it.invoice_id}: ${DECISIONS[it.decision][0].toLowerCase()}${it.note ? ", note saved" : ""}`);
+      } catch (err) { toast(err.message, true); save.disabled = false; }
+    } }, "Save decision");
+    return h("div", { class: "editor" }, h("strong", {}, "Payment decision"),
+      h("div", { class: "row" }, sel, note, save));
   }
 
   function addRow(item) {
@@ -408,9 +458,17 @@ async function reviewView() {
     const fill = h("div", { class: "fill" });
     fill.style.width = item.risk + "%";
     const details = h("tr", { class: "details hidden" }, h("td", { colspan: 7 },
-      h("ul", {}, item.details.map((d, i) => h("li", {}, h("strong", {}, ruleLabel(item.rules[i]) + ": "), d)))));
+      h("div", { class: "detail-grid" },
+        h("div", {}, h("strong", {}, "Why it was flagged"),
+          h("ul", {}, item.details.map((d, i) => h("li", {}, h("strong", {}, ruleLabel(item.rules[i]) + ": "), d)))),
+        h("div", {}, h("strong", {}, "What to do"),
+          h("ul", { class: "fixes" }, (item.fixes || []).map((f) => h("li", {}, f))),
+          item.status === "open" ? h("p", { class: "muted small" },
+            `Confirming marks it “${DECISIONS[item.suggested_action][0]}”. You can change that afterwards.`) : null,
+          item.note && !(canEdit && item.status === "confirmed") ? h("p", { class: "small" }, h("strong", {}, "Note: "), item.note) : null)),
+      canEdit && item.status === "confirmed" ? decisionEditor(item) : null));
     const row = h("tr", { class: "clickable", tabindex: 0, "aria-expanded": "false",
-      onclick: () => toggle(), onkeydown: (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); toggle(); } } },
+      onclick: () => toggle(), onkeydown: (e) => { if (e.target === row && (e.key === "Enter" || e.key === " ")) { e.preventDefault(); toggle(); } } },
       h("td", { class: "c-risk" }, h("span", { class: "risk " + level, title: `Risk ${item.risk} of 100` },
         h("span", { class: "n" }, item.risk), h("span", { class: "bar" }, fill))),
       h("td", { class: "mono c-id" }, item.invoice_id),
@@ -423,7 +481,9 @@ async function reviewView() {
     function toggle() {
       const open = details.classList.toggle("hidden") === false;
       row.setAttribute("aria-expanded", String(open));
+      if (open) expanded.add(item.invoice_id); else expanded.delete(item.invoice_id);
     }
+    if (expanded.has(item.invoice_id)) { details.classList.remove("hidden"); row.setAttribute("aria-expanded", "true"); }
     body.append(row, details);
   }
 
@@ -451,12 +511,13 @@ async function reviewView() {
   wrap.append(h("table", { class: "queue" },
     h("thead", {}, h("tr", {}, h("th", {}, "Risk"), h("th", {}, "Invoice"), h("th", {}, "Vendor"),
       h("th", { class: "num" }, "Amount"), h("th", {}, "Date"), h("th", {}, "Why flagged"),
-      h("th", {}, canEdit ? "Decision" : "Status"))),
+      h("th", {}, canEdit ? "Decision" : "Payment"))),
     body));
   drawRows();
   return h("div", {},
-    pageHead("Review queue", "Highest risk first. Click a row to see the reasons. Your decisions tune the scoring for your company.",
-      items.length ? downloadButton("Download Excel", "GET", "/export/review.xlsx") : null, runBtn),
+    pageHead("Review queue", "Highest risk first. Click a row for the reasons and what to do. Confirming sets what happens to the payment; your decisions also tune the scoring.",
+      items.length ? downloadButton("Download Excel", "GET", "/export/review.xlsx") : null,
+      items.length ? downloadButton("Download payment file", "GET", "/export/payment-file.xlsx") : null, runBtn),
     h("div", { class: "row" }, tabs, h("span", { class: "spacer" }), search),
     spacer(12), wrap, emptyBox);
 }

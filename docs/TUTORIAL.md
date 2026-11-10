@@ -95,8 +95,9 @@ quarter, use the **Import sheet "..."** button on the results page to work throu
 On the results page, click **Download your file with flags**. You get your own workbook back,
 named "... - checked.xlsx", with:
 
-- four new columns on the right of your data: **Risk** (0-100), **Review status**, **Flags** and
-  **Why flagged**, filled in for every row, with high-risk rows shaded red and medium amber;
+- six new columns on the right of your data: **Risk** (0-100), **Review status**, **Payment
+  decision**, **Flags**, **Why flagged** and **What to do**, filled in for every row, with
+  high-risk rows shaded red and medium amber;
 - "No flags" in green for rows that passed, and "Not imported" with the reason for rows that
   couldn't be read;
 - a **Flagged invoices** sheet listing just the problems, highest risk first, with filters;
@@ -112,20 +113,50 @@ the Review queue page or **Download Excel report** on the Dashboard.
 ### 7. Work the review queue
 
 Each row shows a **risk score** from 0 to 100, the invoice, and coloured tags saying why it was
-flagged. Click a row for the full explanation, then decide:
+flagged. Click a row to see **why it was flagged** and **what to do**, then decide:
 
-- **Confirm** if it's a real problem, such as a duplicate payment or a changed bank account you
-  didn't expect.
-- **Dismiss** if it's a false alarm.
+- **Confirm** if it's a real problem. Confirming also decides what happens to the payment:
+  - **Do not pay** for duplicates (the money would be paid twice);
+  - **Hold** for anything that needs checking first, such as a changed bank account or an
+    unusual amount.
+- **Dismiss** if it's a false alarm. The invoice goes back to **Pay**.
+
+After confirming, the row stays open with a **Payment decision** box: change it (for example to
+*Pay anyway* once the vendor has confirmed their new bank details) and add a note, then click
+**Save decision**.
+
+The app never edits or deletes your invoices. They stay exactly as the supplier sent them,
+which auditors need. "Fixing" a problem means stopping or holding the payment and doing the
+follow-up the **What to do** list describes, such as calling the vendor on a number you already
+had.
 
 Decided invoices leave the **Open** tab; the other tabs show them again, and you can change your
-mind. Your decisions teach the app: checks that keep raising false alarms at your company count
-for less from then on, and the Dashboard shows how each check is performing.
+mind. Your decisions also teach the app: checks that keep raising false alarms at your company
+count for less from then on.
 
 **Run detection** at the top of the queue re-checks everything, for example after you change the
 approval threshold in Settings.
 
-### 8. Add colleagues
+### 8. Get the corrected payment list
+
+When reviewing is done, click **Download payment file** (on the Review queue or the Dashboard).
+It's an Excel workbook that sorts **every** invoice by what should happen to its payment:
+
+| Sheet | What's in it |
+|---|---|
+| Summary | Count and total amount for each decision |
+| Ready to pay | No problems, or flags dismissed as false alarms |
+| Review first | Flagged but not reviewed yet: finish these before the payment run |
+| On hold | Confirmed problems to check first, with what to do and your notes |
+| Do not pay | Confirmed problems such as duplicates |
+
+Hand the **Ready to pay** sheet to whoever runs payments. The Dashboard's **Payments** section
+shows the same totals, including how much money was stopped.
+
+Your own workbook (step 6) also gets **Payment decision** and **What to do** columns, so
+downloading it again after reviewing shows every row's outcome next to your original data.
+
+### 9. Add colleagues
 
 In **Settings**, an admin adds people with a temporary password and one of three roles:
 
@@ -135,7 +166,7 @@ In **Settings**, an admin adds people with a temporary password and one of three
 | Accountant | Also upload, run detection and review flags |
 | Admin | Also manage people and settings, and reveal bank accounts |
 
-### 9. Add a second company
+### 10. Add a second company
 
 Each company's data is completely separate. To see it for yourself:
 
@@ -147,7 +178,7 @@ python -m invoice_detector.cli create-user "Globex" bob admin
 Sign out, sign in as `bob`, and Globex starts empty. Nothing from Acme is visible, even by
 typing an invoice address directly.
 
-### 10. Without the browser
+### 11. Without the browser
 
 The same steps work from the command line, which is handy for scheduled jobs:
 
@@ -276,5 +307,7 @@ for item in api.get("/review-queue").json():
 | The page won't open | The `uvicorn` window must stay open while you use the app. Start it again |
 | "Your session expired" | Sign-ins last one hour. Sign in again |
 | "Too many attempts" on sign-in | Five wrong passwords. Wait 15 minutes or restart the app |
+| Forgot a password | `python -m invoice_detector.cli reset-password alice` (nothing shows while you type the new one) |
+| "Username ... is already taken" | That login already exists. Sign in with it, or reset its password as above |
 | An upload says ".xls isn't supported" | In Excel, use File > Save As and choose .xlsx or .csv |
 | A package fails to build during install | Use Python 3.11 to 3.13. The newest Python release may not have builds for every library yet |

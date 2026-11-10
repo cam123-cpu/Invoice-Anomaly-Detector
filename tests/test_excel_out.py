@@ -4,7 +4,7 @@ from datetime import datetime
 
 from openpyxl import Workbook, load_workbook
 
-from invoice_detector.excel_out import annotate, review_report, safe, template
+from invoice_detector.excel_out import ANNOTATION_HEADERS, annotate, payment_file, review_report, safe, template
 from invoice_detector.importer import convert, preview, read_table
 
 EVIL = '=HYPERLINK("http://evil.example","click")'
@@ -55,12 +55,14 @@ class AnnotateTests(unittest.TestCase):
 
     def test_results_are_written_beside_each_row(self):
         ws = self.wb["AP"]
-        self.assertEqual([ws.cell(3, c).value for c in range(6, 10)], ["Risk", "Review status", "Flags", "Why flagged"])
-        self.assertEqual(ws.cell(4, 7).value, "No flags")
-        self.assertEqual((ws.cell(5, 6).value, ws.cell(5, 7).value, ws.cell(5, 8).value),
-                         (85, "Confirmed problem", "Duplicate"))
+        self.assertEqual([ws.cell(3, c).value for c in range(6, 12)], ANNOTATION_HEADERS)
+        self.assertEqual((ws.cell(4, 7).value, ws.cell(4, 8).value), ("No flags", "Pay"))
+        self.assertEqual([ws.cell(5, c).value for c in range(6, 10)],
+                         [85, "Confirmed problem", "Do not pay", "Duplicate"])
+        self.assertTrue(ws.cell(5, 11).value.startswith("Don't pay"))  # what to do
         self.assertEqual(ws.cell(5, 6).fill.fgColor.rgb[-6:], "FDE2E0")  # red for high risk
-        self.assertEqual((ws.cell(6, 7).value, ws.cell(6, 9).value[:4]), ("Not imported", "date"))
+        self.assertEqual((ws.cell(6, 7).value, ws.cell(6, 10).value[:4]), ("Not imported", "date"))
+        self.assertEqual(ws.cell(7, 8).value, "Review first")  # flagged but not reviewed
         self.assertEqual(ws.cell(7, 6).fill.fgColor.rgb[-6:], "EEF0F3")  # grey for low risk
         self.assertEqual(self.wb.active.title, "AP")
         self.assertEqual((self.name, self.media.endswith("sheet")), ("ap - checked.xlsx", True))
@@ -115,10 +117,28 @@ class ReportAndTemplateTests(unittest.TestCase):
         items[0]["vendor"] = EVIL
         wb = load_workbook(io.BytesIO(review_report(items, "Acme Inc", {"invoices": 9, "open": 1})))
         ws = wb["Review queue"]
-        self.assertEqual([ws.cell(2, c).value for c in (1, 2, 6, 7)], [90, "B", "Needs review", "Duplicate, Round amount"])
-        self.assertEqual(ws.cell(3, 6).value, "False alarm")
+        self.assertEqual([ws.cell(2, c).value for c in (1, 2, 6, 7, 8)],
+                         [90, "B", "Needs review", "Review first", "Duplicate, Round amount"])
+        self.assertEqual((ws.cell(3, 6).value, ws.cell(3, 7).value), ("False alarm", "Pay"))
         self.assertEqual(ws.cell(2, 3).data_type, "s")
-        self.assertEqual(ws.auto_filter.ref, "A1:H3")
+        self.assertEqual(ws.auto_filter.ref, "A1:K3")
+
+    def test_payment_file_sorts_every_invoice(self):
+        invoices = [{"id": i, "vendor": "V", "amount": a, "invoice_date": "2026-01-05"}
+                    for i, a in (("P1", 100.0), ("D1", 250.0), ("H1", 40.0), ("R1", 7.5), ("X1", 1.0))]
+        queue = {"D1": item("D1", 90, ["duplicate"], "confirmed"),
+                 "H1": {**item("H1", 80, ["bank_account_change"], "confirmed"), "note": "calling them"},
+                 "R1": item("R1", 50, ["round_amount"]),
+                 "X1": item("X1", 20, ["weekend_invoice"], "dismissed")}
+        wb = load_workbook(io.BytesIO(payment_file(invoices, queue, "Acme Inc")))
+        self.assertEqual(wb.sheetnames, ["Summary", "Ready to pay", "Review first", "On hold", "Do not pay"])
+        ids = {name: [wb[name].cell(r, 1).value for r in range(2, wb[name].max_row)] for name in wb.sheetnames[1:]}
+        self.assertEqual(ids, {"Ready to pay": ["P1", "X1"], "Review first": ["R1"], "On hold": ["H1"], "Do not pay": ["D1"]})
+        summary = wb["Summary"]
+        self.assertEqual([summary.cell(r, 3).value for r in range(5, 10)], [101.0, 7.5, 40.0, 250.0, 398.5])
+        self.assertEqual(wb["On hold"].cell(2, 8).value, "calling them")
+        self.assertIn("phone number", wb["On hold"].cell(2, 7).value)
+        self.assertEqual(wb["Do not pay"].cell(3, 4).value, 250.0)  # total row
 
     def test_template_round_trips_through_the_importer(self):
         table = read_table("template.xlsx", template())
