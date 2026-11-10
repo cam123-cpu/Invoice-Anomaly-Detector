@@ -4,11 +4,15 @@ company inside the caller's signed token.
 
 Run:  uvicorn invoice_detector.api:create_app --factory
 """
+import base64
+import binascii
 from dataclasses import replace
 from datetime import date as Date
+from importlib.resources import files
 from typing import Literal
 
 from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi.responses import RedirectResponse, Response
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field
 
@@ -17,10 +21,18 @@ from .db import Conflict, Database
 from .detection import (DEFAULT_CONFIG, RULE_WEIGHT, Anomaly, detect, learned_weights,
                         review_queue)
 from .explain import explain
+from .importer import FIELDS, ID_PATTERN, FileProblem, convert, preview, read_table
 from .security import (DUMMY_HASH, AuthError, RateLimiter, RateLimitError, TokenSigner,
                        verify_password)
 
 MAX_BULK = 1000
+WEB = files("invoice_detector") / "web"
+WEB_FILES = {"index.html": "text/html", "app.js": "text/javascript", "app.css": "text/css"}
+# The web app loads nothing from other sites and never runs inline script, so a strict
+# Content-Security-Policy blocks injected script even if some text slipped through.
+APP_CSP = ("default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; "
+           "connect-src 'self'; font-src 'self'; object-src 'none'; base-uri 'none'; "
+           "form-action 'self'; frame-ancestors 'none'")
 
 
 class LoginIn(BaseModel):
@@ -29,7 +41,7 @@ class LoginIn(BaseModel):
 
 
 class InvoiceIn(BaseModel):
-    id: str = Field(pattern=r"^[A-Za-z0-9_-]{1,40}$")
+    id: str = Field(pattern=ID_PATTERN.pattern)
     vendor: str = Field(min_length=1, max_length=120)
     amount: float = Field(gt=0, lt=1e12)
     date: Date
@@ -46,6 +58,17 @@ class ReviewIn(BaseModel):
     verdict: Literal["confirmed", "dismissed"]
 
 
+class FileIn(BaseModel):
+    filename: str = Field(min_length=1, max_length=255)
+    content_base64: str = Field(min_length=1, max_length=14_000_000)
+
+
+class ImportIn(FileIn):
+    mapping: dict[str, str | None]
+    date_order: Literal["MDY", "DMY"] = "MDY"
+    run_detection: bool = True
+
+
 class SettingsIn(BaseModel):
     approval_threshold: float = Field(gt=0, lt=1e12)
 
@@ -57,7 +80,7 @@ def create_app(settings: Settings | None = None, db: Database | None = None) -> 
     limiter = RateLimiter()
     bearer = HTTPBearer(auto_error=False)
 
-    app = FastAPI(title="Invoice Anomaly Detector", version="0.3.0")
+    app = FastAPI(title="Invoice Anomaly Detector", version="0.4.0")
     app.state.db, app.state.signer = db, signer
 
     def current_user(creds: HTTPAuthorizationCredentials | None = Depends(bearer)) -> dict:
@@ -77,6 +100,54 @@ def create_app(settings: Settings | None = None, db: Database | None = None) -> 
 
     def weights_for(org: str) -> dict[str, float]:
         return learned_weights(db.feedback_counts(org))
+
+    def run_detection_for(user: dict) -> dict:
+        org = db.get_org(user["org"])
+        cfg = replace(DEFAULT_CONFIG, approval_threshold=org["approval_threshold"])
+        invoices = db.detection_inputs(user["org"])
+        found = detect(invoices, cfg)
+        db.save_flags(user["org"], found)
+        flagged = len({a.invoice_id for a in found})
+        db.audit(user["org"], user["sub"], "detection_run",
+                 f"{len(invoices)} invoices, {flagged} flagged")
+        return {"invoices_checked": len(invoices), "invoices_flagged": flagged,
+                "anomalies": len(found)}
+
+    def read_upload(body: FileIn):
+        try:
+            data = base64.b64decode(body.content_base64, validate=True)
+        except (binascii.Error, ValueError):
+            raise HTTPException(422, "The file could not be read. Try uploading it again.") from None
+        try:
+            return read_table(body.filename, data)
+        except FileProblem as exc:
+            raise HTTPException(422, str(exc)) from None
+
+    @app.middleware("http")
+    async def security_headers(request: Request, call_next):
+        response = await call_next(request)
+        response.headers.setdefault("X-Content-Type-Options", "nosniff")
+        response.headers.setdefault("Referrer-Policy", "no-referrer")
+        response.headers.setdefault("X-Frame-Options", "DENY")
+        if request.url.path == "/" or request.url.path.startswith("/app/"):
+            response.headers["Content-Security-Policy"] = APP_CSP
+            response.headers["Cache-Control"] = "no-cache"
+        return response
+
+    # ---------------- web app ----------------
+    @app.get("/", include_in_schema=False)
+    def web_index() -> Response:
+        return Response((WEB / "index.html").read_bytes(), media_type="text/html")
+
+    @app.get("/app/{name}", include_in_schema=False)
+    def web_asset(name: str) -> Response:
+        if name not in WEB_FILES or name == "index.html":
+            raise HTTPException(404, "Not found")
+        return Response((WEB / name).read_bytes(), media_type=WEB_FILES[name])
+
+    @app.get("/app", include_in_schema=False)
+    def web_redirect() -> RedirectResponse:
+        return RedirectResponse("/")
 
     # ---------------- session ----------------
     @app.get("/health")
@@ -154,14 +225,12 @@ def create_app(settings: Settings | None = None, db: Database | None = None) -> 
         """Load up to 1,000 invoices per call (for ERP exports). Existing ids are skipped."""
         if len(invoices) > MAX_BULK:
             raise HTTPException(413, f"At most {MAX_BULK} invoices per request")
-        added, skipped = 0, []
-        for inv in invoices:
-            try:
-                db.add_invoice(user["org"], inv.id, inv.vendor, inv.amount, inv.date.isoformat(),
-                               inv.bank_account, user["sub"])
-                added += 1
-            except Conflict:
-                skipped.append(inv.id)
+        rows = [{"id": i.id, "vendor": i.vendor, "amount": i.amount, "date": i.date.isoformat(),
+                 "bank_account": i.bank_account} for i in invoices]
+        if len({r["id"] for r in rows}) != len(rows):
+            raise HTTPException(422, "The same invoice id appears twice in this request")
+        skipped = db.add_invoices(user["org"], rows, user["sub"])
+        added = len(rows) - len(skipped)
         db.audit(user["org"], user["sub"], "invoices_imported", f"{added} added, {len(skipped)} skipped")
         return {"added": added, "skipped": skipped}
 
@@ -173,7 +242,37 @@ def create_app(settings: Settings | None = None, db: Database | None = None) -> 
         except ValueError:
             raise HTTPException(422, "Invalid sort column") from None
 
-    @app.get("/invoices/{inv_id}/bank")
+    @app.post("/import/preview")
+    def import_preview(body: FileIn, user: dict = Depends(require("admin", "accountant"))) -> dict:
+        """Read an uploaded Excel or CSV file and suggest which column is which."""
+        return preview(read_upload(body))
+
+    @app.post("/import")
+    def import_file(body: ImportIn, user: dict = Depends(require("admin", "accountant"))) -> dict:
+        """Import an uploaded file using the confirmed column mapping, then (by default)
+        run detection so the review queue is up to date."""
+        table = read_upload(body)
+        mapping = {f: body.mapping.get(f) for f in FIELDS}
+        try:
+            result = convert(table, mapping, body.date_order)
+        except FileProblem as exc:
+            raise HTTPException(422, str(exc)) from None
+        existing = db.add_invoices(user["org"], result.invoices, user["sub"])
+        added = len(result.invoices) - len(existing)
+        db.audit(user["org"], user["sub"], "file_imported",
+                 f"{body.filename[:80]}: {added} added, {len(existing)} already stored, "
+                 f"{len(result.errors)} rows with problems")
+        detection = None
+        if body.run_detection and added:
+            detection = run_detection_for(user)
+            new_ids = {inv["id"] for inv in result.invoices} - set(existing)
+            detection["flagged_from_file"] = len({a["invoice_id"] for a in db.list_anomalies(user["org"], 5000)
+                                                  if a["invoice_id"] in new_ids})
+        return {"added": added, "already_stored": len(existing), "blank_rows": result.blank_rows,
+                "error_count": len(result.errors), "errors": result.errors[:200],
+                "detection": detection}
+
+    @app.get("/invoices/{inv_id:path}/bank")
     def bank_account(inv_id: str, user: dict = Depends(require("admin"))) -> dict:
         try:
             account = db.get_bank_account(user["org"], inv_id)
@@ -185,16 +284,7 @@ def create_app(settings: Settings | None = None, db: Database | None = None) -> 
     # ---------------- detection and review ----------------
     @app.post("/detect")
     def run_detection(user: dict = Depends(require("admin", "accountant"))) -> dict:
-        org = db.get_org(user["org"])
-        cfg = replace(DEFAULT_CONFIG, approval_threshold=org["approval_threshold"])
-        invoices = db.detection_inputs(user["org"])
-        found = detect(invoices, cfg)
-        db.save_flags(user["org"], found)
-        flagged = len({a.invoice_id for a in found})
-        db.audit(user["org"], user["sub"], "detection_run",
-                 f"{len(invoices)} invoices, {flagged} flagged")
-        return {"invoices_checked": len(invoices), "invoices_flagged": flagged,
-                "anomalies": len(found)}
+        return run_detection_for(user)
 
     @app.get("/anomalies")
     def anomalies(user: dict = Depends(current_user)) -> list[dict]:
@@ -205,16 +295,42 @@ def create_app(settings: Settings | None = None, db: Database | None = None) -> 
               user: dict = Depends(current_user)) -> list[dict]:
         """Flagged invoices ranked by risk (0-100), with reasons and review status.
         Risk uses this company's learned rule weights."""
-        org = user["org"]
+        ranked = full_queue(user["org"])
+        if not include_dismissed:
+            ranked = [i for i in ranked if i["status"] != "dismissed"]
+        ranked = ranked[:max(1, min(limit, 500))]
+        details = db.get_invoices(user["org"], [i["invoice_id"] for i in ranked])
+        for item in ranked:
+            inv = details.get(item["invoice_id"], {})
+            item.update(vendor=inv.get("vendor"), amount=inv.get("amount"), date=inv.get("invoice_date"))
+        return ranked
+
+    def full_queue(org: str) -> list[dict]:
         ranked = review_queue([Anomaly(**a) for a in db.list_anomalies(org, 5000)], weights_for(org))
         reviews = db.list_reviews(org)
         for item in ranked:
             item["status"] = reviews.get(item["invoice_id"], "open")
-        if not include_dismissed:
-            ranked = [i for i in ranked if i["status"] != "dismissed"]
-        return ranked[:max(1, min(limit, 500))]
+        return ranked
 
-    @app.post("/review/{invoice_id}")
+    @app.get("/summary")
+    def summary(user: dict = Depends(current_user)) -> dict:
+        """Numbers for the dashboard."""
+        org = user["org"]
+        queue = full_queue(org)
+        by_status = {s: sum(i["status"] == s for i in queue) for s in ("open", "confirmed", "dismissed")}
+        open_rules: dict[str, int] = {}
+        for item in queue:
+            if item["status"] == "open":
+                for rule in set(item["rules"]):
+                    open_rules[rule] = open_rules.get(rule, 0) + 1
+        return {"company": db.get_org(org)["name"], "invoices": db.count_invoices(org),
+                "flagged": len(queue), **by_status,
+                "high_risk_open": sum(i["status"] == "open" and i["risk"] >= 70 for i in queue),
+                "open_by_rule": dict(sorted(open_rules.items(), key=lambda kv: -kv[1])),
+                "last_detection": db.last_audit(org, "detection_run"),
+                "last_import": db.last_audit(org, "file_imported")}
+
+    @app.post("/review/{invoice_id:path}")
     def review(invoice_id: str, body: ReviewIn,
                user: dict = Depends(require("admin", "accountant"))) -> dict:
         """Mark a flagged invoice as a real problem (confirmed) or a false alarm (dismissed).

@@ -6,13 +6,12 @@
   python -m invoice_detector.cli list-orgs
   python -m invoice_detector.cli create-user COMPANY NAME ROLE  # role: admin|accountant|auditor
   python -m invoice_detector.cli seed COMPANY                   # load synthetic demo invoices
-  python -m invoice_detector.cli import-csv COMPANY FILE        # columns: id,vendor,amount,date[,bank_account]
+  python -m invoice_detector.cli import COMPANY FILE            # Excel (.xlsx) or CSV; columns detected automatically
   python -m invoice_detector.cli detect COMPANY                 # run detection, print the review queue
   python -m invoice_detector.cli evaluate                       # score the detector on synthetic data
   python -m invoice_detector.cli gen-keys                       # print fresh secrets (for a secrets manager)
 """
 import base64
-import csv
 import getpass
 import os
 import secrets
@@ -26,6 +25,7 @@ from .db import ROLES, Conflict, Database
 from .demo import generate_demo
 from .detection import DEFAULT_CONFIG, detect, learned_weights, review_queue
 from .evaluate import evaluate, format_report
+from .importer import FileProblem, convert, preview, read_table
 
 
 @contextmanager
@@ -100,6 +100,32 @@ def _load(db: Database, org_id: str, rows) -> tuple[int, int]:
     return added, skipped
 
 
+def _import(company: str, path: str) -> int:
+    try:
+        with open(path, "rb") as f:
+            table = read_table(path, f.read())
+        info = preview(table)
+        result = convert(table, info["mapping"], info["date_order"])
+    except (OSError, FileProblem) as exc:
+        print(f"Could not import {path}: {exc}")
+        return 1
+    print("Columns used: " + ", ".join(f"{k} <- '{v}'" for k, v in info["mapping"].items() if v))
+    if info["date_order_ambiguous"]:
+        print("Note: dates like 05/03/2026 were read as month/day/year. If that's wrong, use the "
+              "web app's upload page, which lets you choose.")
+    with _db() as db:
+        org_id = _org(db, company)
+        if org_id is None:
+            return 1
+        existing = db.add_invoices(org_id, result.invoices, "import")
+    added = len(result.invoices) - len(existing)
+    print(f"Imported {added} invoices into {company}; {len(existing)} were already stored, "
+          f"{len(result.errors)} rows had problems.")
+    for err in result.errors[:20]:
+        print(f"  row {err['row']}: {err['message']}")
+    return 0
+
+
 def _detect(company: str) -> int:
     with _db() as db:
         org_id = _org(db, company)
@@ -152,13 +178,8 @@ def main(argv: list[str]) -> int:
             added, skipped = _load(db, org_id, rows)
         print(f"Loaded {added} synthetic invoices into {args[0]} ({skipped} skipped), "
               f"including {len(injected)} injected anomalies.")
-    elif cmd == "import-csv" and len(args) == 2:
-        with open(args[1], newline="", encoding="utf-8-sig") as f, _db() as db:
-            org_id = _org(db, args[0])
-            if org_id is None:
-                return 1
-            added, skipped = _load(db, org_id, csv.DictReader(f))
-        print(f"Imported {added} invoices into {args[0]}, skipped {skipped} (bad rows or existing ids).")
+    elif cmd in ("import", "import-csv") and len(args) == 2:
+        return _import(*args)
     elif cmd == "detect" and len(args) == 1:
         return _detect(args[0])
     else:
