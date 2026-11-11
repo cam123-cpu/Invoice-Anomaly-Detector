@@ -5,6 +5,7 @@
 - None: email isn't configured; features that need it say so.
 """
 import os
+import secrets
 import smtplib
 import ssl
 import time
@@ -58,7 +59,9 @@ class FolderMailer(Mailer):
     def send(self, to: str, subject: str, body: str) -> None:
         os.makedirs(self.folder, exist_ok=True)
         msg = _message(self.sender, to, subject, body)
-        name = f"{time.time():.6f}-{''.join(c if c.isalnum() else '_' for c in to)}.eml"
+        # Time first so files sort in order; a random part so two emails written in the same
+        # instant (they are sent from background threads) never overwrite each other.
+        name = f"{time.time():.6f}-{secrets.token_hex(4)}-{''.join(c if c.isalnum() else '_' for c in to)}.eml"
         with open(os.path.join(self.folder, name), "wb") as f:
             f.write(bytes(msg))
 
