@@ -577,7 +577,7 @@ async function dashboardView() {
     kpi("Confirmed problems", whole.format(s.confirmed)),
     kpi("False alarms", whole.format(s.dismissed)),
     kpi("Flag accuracy", m.precision === null ? "Not yet" : Math.round(m.precision * 100) + "%",
-      m.reviewed ? `from ${whole.format(m.reviewed)} reviews` : "after your first reviews"));
+      m.reviewed ? `from ${whole.format(m.reviewed)} review${m.reviewed === 1 ? "" : "s"}` : "after your first reviews"));
 
   // Payments: how the money splits by decision, as a bar over a small ledger.
   const order = [["pay", "Ready to pay"], ["review", "Review first"], ["hold", "On hold"], ["do_not_pay", "Stopped"]];
