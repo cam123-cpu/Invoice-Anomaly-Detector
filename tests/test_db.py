@@ -55,7 +55,8 @@ class DatabaseTests(DbTestCase):
         self.assertNotIn("a-long-password", user["password_hash"])
         self.assertEqual((user["role"], user["org_id"]), ("admin", self.a))
         self.assertEqual(self.app.list_users(self.a),
-                         [{"username": "alice", "role": "admin", "two_factor": False, "sso_only": False}])
+                         [{"username": "alice", "role": "admin", "two_factor": False, "sso_only": False,
+                           "disabled": False}])
 
     def test_reviews_snapshot_rules_and_feed_back(self):
         self.add("A1")

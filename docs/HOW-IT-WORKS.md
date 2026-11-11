@@ -1201,6 +1201,15 @@ company's real, labelled invoices.
 | Bots trying many accounts | 30 failed sign-ins per address, any usernames; bounded limiter memory | `accounts.py`, `security.py` |
 | Hostile uploads | Real file type checked (zip/workbook, text), zip bombs refused, size capped | `importer.py`, `BodyLimit` |
 | Secrets in git history | gitleaks scans every commit in CI | `.gitleaks.toml` |
+| Stolen session token used after sign-out | Sign-out raises a per-user counter every token is tied to | `accounts.py` `logout`, `security.py` |
+| A leaver keeps access | Admin removes access: sessions, password, reset and SSO all refuse | `accounts.py` `admin_set_access` |
+| One employee impersonating another through SSO | Microsoft: directory sign-in name, not the unverified email claim | `oidc.py` `email_from` |
+| Two-factor code guessed or reused | Every code check rate limited; use recorded by one conditional UPDATE | `accounts.py`, `db.py` `claim_totp_step` |
+| Finding out who has an account | Same answer and same timing: reset emails go out in the background | `accounts.py` `_send_later` |
+| Attacker's text shown on the real sign-in page | Messages travel as signed tokens | `accounts.py` `notice` |
+| Huge or crafted vendor list freezes detection | Impossible pairs skipped; hard ceiling on comparisons | `detection.py` `_name_pairs` |
+| XML-bomb spreadsheet | defusedxml required; list uploads parsed in the isolated process | `pyproject.toml`, `api.py` |
+| Long but obvious passwords | Common words, key runs and the username refused | `security.py` `password_problem` |
 | Hostile or broken document hangs the server | Parsed in a child process with time and memory limits | `isolation.py` |
 | Same invoice file imported twice | File fingerprint is the documents table's key | `schema.py`, `intake.py` |
 | Look-alike vendor hidden by "auto-correct" | Only formatting differences are merged | `intake.py` `_canonical` |

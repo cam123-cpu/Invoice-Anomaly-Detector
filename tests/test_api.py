@@ -500,6 +500,53 @@ class SignInApiTests(DbTestCase):
         self.assertIn("max-age=0", out.headers["set-cookie"].lower())
         self.assertEqual(browser.get("/me").status_code, 401)
 
+    def test_sign_out_ends_the_session_on_the_server(self):
+        """A copy of the token must stop working when its owner signs out."""
+        token = self.token()
+        self.assertEqual(self.client.get("/me", headers=self.h(token)).status_code, 200)
+        self.assertEqual(self.client.post("/logout", headers=self.h(token)).json(), {"signed_out": True})
+        self.assertEqual(self.client.get("/me", headers=self.h(token)).status_code, 401)
+        self.assertEqual(self.client.post("/logout").status_code, 200)   # signing out twice is harmless
+
+    def test_the_web_app_is_never_handed_a_token(self):
+        browser = self.TestClient(self.make_app(), base_url="https://testserver")
+        signed = browser.post("/login", json={"username": "alice@acme.example", "password": PW_A},
+                              headers={"X-Requested-With": "fetch"})
+        self.assertEqual(signed.json(), {"signed_in": True})
+        self.assertIn("httponly", signed.headers["set-cookie"].lower())
+        program = self.client.post("/login", json={"username": "alice@acme.example", "password": PW_A})
+        self.assertIn("access_token", program.json())
+
+    def test_removing_a_persons_access(self):
+        admin = self.h(self.token())
+        made = self.client.post("/users", json={"username": "leaver@acme.example", "role": "accountant",
+                                                "password": "leaver-password-1"}, headers=admin)
+        self.assertEqual(made.status_code, 201)
+        leaver = self.h(self.client.post("/login", json={"username": "leaver@acme.example",
+                                                         "password": "leaver-password-1"}).json()["access_token"])
+        self.assertEqual(self.client.post("/users/leaver@acme.example/access", json={"enabled": False},
+                                          headers=leaver).status_code, 403)          # not an admin
+        off = self.client.post("/users/leaver@acme.example/access", json={"enabled": False}, headers=admin)
+        self.assertEqual(off.json(), {"username": "leaver@acme.example", "disabled": True})
+        self.assertEqual(self.client.get("/me", headers=leaver).status_code, 401)   # signed out at once
+        again = self.client.post("/login", json={"username": "leaver@acme.example", "password": "leaver-password-1"})
+        self.assertEqual(again.status_code, 401)
+        listed = {u["username"]: u["disabled"] for u in self.client.get("/users", headers=admin).json()}
+        self.assertTrue(listed["leaver@acme.example"])
+        own = self.client.post("/users/alice@acme.example/access", json={"enabled": False}, headers=admin)
+        self.assertEqual(own.status_code, 409)
+
+    def test_sign_in_page_only_shows_messages_the_server_signed(self):
+        for forged in ("Your account is locked. Call 555-0100.", "a.b", ""):
+            self.assertIn(self.client.get("/auth/notice", params={"token": forged}).status_code, (400, 422))
+
+    def test_obvious_passwords_are_refused(self):
+        admin = self.h(self.token())
+        for weak in ("password1234", "qwertyuiop12", "weakling1234"):
+            r = self.client.post("/users", json={"username": "weakling@acme.example", "role": "auditor",
+                                                 "password": weak}, headers=admin)
+            self.assertEqual(r.status_code, 422, weak)
+
     def test_unknown_fields_are_refused(self):
         token = self.token()
         tampered = {"username": "zed@acme.example", "role": "auditor", "password": "zed-password-1234",
@@ -545,7 +592,7 @@ class SignInApiTests(DbTestCase):
         """A new route that forgets its sign-in check fails this test."""
         public = {"/", "/app", "/app/{name}", "/samples", "/samples/{name}", "/samples/documents",
                   "/samples/documents/{name}", "/health", "/health/ready",
-                  "/login", "/login/2fa", "/logout", "/auth/providers", "/auth/{name}/start",
+                  "/login", "/login/2fa", "/logout", "/auth/providers", "/auth/notice", "/auth/{name}/start",
                   "/auth/{name}/callback", "/password/forgot", "/password/reset",
                   "/docs", "/docs/oauth2-redirect", "/openapi.json"}
         checked = 0

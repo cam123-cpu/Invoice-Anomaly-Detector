@@ -222,21 +222,69 @@ def _normalize_name(name: str) -> str:
     return re.sub(r"[^a-z0-9]", "", name.lower())
 
 
+EXACT_NAME_COMPARE_LIMIT = 2000   # vendors; above this, only names sharing a start or an end are compared
+NAME_COMPARE_BUDGET = 4_000_000   # cheap comparisons per run: a ceiling of a few seconds, whatever the data
+
+
+def _name_pairs(names: list[str], norm: dict[str, str], threshold: float):
+    """Pairs of vendor names that could be look-alikes, without comparing every name with
+    every other (which takes minutes for a few thousand vendors and would let one large
+    upload freeze the server).
+
+    Cheap tests rule most pairs out before the expensive comparison:
+    - length: two names can't be 85% alike if one is much longer than the other;
+    - letters: an upper bound from the letters they share (quick_ratio).
+    Above EXACT_NAME_COMPARE_LIMIT vendors, names are also grouped by their first two and
+    last three characters and only compared within a group: a look-alike nearly always
+    keeps one end of the name it imitates."""
+    by_length = sorted(names, key=lambda n: (len(norm[n]), n))
+    budget = NAME_COMPARE_BUDGET
+
+    def window(group: list[str]):
+        nonlocal budget
+        for i, a in enumerate(group):
+            na = norm[a]
+            longest = len(na) * (2 - threshold) / threshold
+            matcher = SequenceMatcher(None, "", na)
+            for b in group[i + 1:]:
+                nb = norm[b]
+                if len(nb) > longest:
+                    break   # sorted by length: every later name is longer still
+                budget -= 1
+                if budget < 0:   # data built to be slow (or truly enormous): stop, stay responsive
+                    return
+                matcher.set_seq1(nb)
+                if matcher.real_quick_ratio() >= threshold and matcher.quick_ratio() >= threshold:
+                    yield (a, b) if a < b else (b, a)
+
+    if len(names) <= EXACT_NAME_COMPARE_LIMIT:
+        yield from window(by_length)
+        return
+    blocks: dict[str, list[str]] = defaultdict(list)
+    for name in by_length:
+        blocks["^" + norm[name][:2]].append(name)
+        blocks["$" + norm[name][-3:]].append(name)
+    seen = set()
+    for group in blocks.values():
+        for pair in window(group):
+            if pair not in seen:
+                seen.add(pair)
+                yield pair
+
+
 def find_similar_vendor_names(invoices: list[Invoice], cfg: DetectionConfig = DEFAULT_CONFIG) -> list[Anomaly]:
     """A vendor whose name is almost, but not exactly, another vendor's name
     (look-alike vendors, or typos that split one vendor's history in two)."""
     groups = _by_vendor(invoices)
-    names = sorted(groups)
+    norm = {name: _normalize_name(name) for name in groups}
     out = []
-    for i, a in enumerate(names):
-        for b in names[i + 1:]:
-            ratio = SequenceMatcher(None, _normalize_name(a), _normalize_name(b)).ratio()
-            if ratio < cfg.name_similarity:
-                continue
-            minor, major = (a, b) if len(groups[a]) <= len(groups[b]) else (b, a)
-            for inv in groups[minor]:
-                out.append(Anomaly(inv.id, "similar_vendor_name", "medium",
-                                   f"vendor '{minor}' looks like existing vendor '{major}'"))
+    for a, b in sorted(_name_pairs(list(groups), norm, cfg.name_similarity)):
+        if SequenceMatcher(None, norm[a], norm[b]).ratio() < cfg.name_similarity:
+            continue
+        minor, major = (a, b) if len(groups[a]) <= len(groups[b]) else (b, a)
+        for inv in groups[minor]:
+            out.append(Anomaly(inv.id, "similar_vendor_name", "medium",
+                               f"vendor '{minor}' looks like existing vendor '{major}'"))
     return out
 
 

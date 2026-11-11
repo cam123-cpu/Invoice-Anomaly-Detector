@@ -258,6 +258,11 @@ People who sign in with Microsoft or Google get their second factor from that ac
 The tenant ID must be your company's own: the app refuses `common`, `organizations` and
 `consumers`, so only accounts from your directory can sign in.
 
+Add each person in Settings under their **Microsoft sign-in name** (the name they type to sign
+in to Microsoft 365, usually the same as their email address). The app identifies people by
+that name, which your directory controls, not by the "email" field on their profile, which
+Microsoft doesn't guarantee is theirs.
+
 ### Single sign-on with Google Workspace
 
 1. In Google Cloud console: **APIs & Services → OAuth consent screen**: user type
@@ -271,6 +276,15 @@ The tenant ID must be your company's own: the app refuses `common`, `organizatio
 Set `OIDC_ISSUER` (e.g. `https://yourcompany.okta.com`), `OIDC_CLIENT_ID`,
 `OIDC_CLIENT_SECRET`, and optionally `OIDC_LABEL` (button text). Redirect URI:
 `https://invoices.yourcompany.com/auth/sso/callback`.
+
+### When someone leaves
+
+In **Settings → People**, click **Remove access** next to their name. They are signed out
+immediately and can no longer sign in by password, reset link or single sign-on. Their name
+stays in the activity log. (Removing them from Microsoft or Google stops single sign-on, but
+not a password they may also have, so do both.)
+
+Signing out ends that person's sessions on every device, not just the one they clicked on.
 
 ### Who can sign in with SSO
 

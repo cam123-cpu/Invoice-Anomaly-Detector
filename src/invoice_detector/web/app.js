@@ -21,6 +21,8 @@ const RULES = {
 const ACTIONS = {
   login: "Signed in", login_failed: "Failed sign-in", file_imported: "Imported a file",
   documents_imported: "Imported invoice documents", ai_document_read: "Sent a document for AI reading",
+  logout: "Signed out", access_removed: "Removed a person's access", access_restored: "Gave a person access back",
+  ai_summary: "Asked for an AI summary",
   report_exported: "Downloaded a report", workbook_exported: "Downloaded a checked workbook",
   invoices_imported: "Imported invoices", detection_run: "Ran detection", invoice_reviewed: "Reviewed an invoice",
   bank_account_viewed: "Viewed a bank account", user_created: "Added a user", settings_changed: "Changed settings",
@@ -311,8 +313,14 @@ function authCard(subtitle, ...content) {
 
 function loginView() {
   const err = h("div", { class: "error-box hidden", role: "alert" });
-  const fromSso = hashParams().get("error");
-  if (fromSso) { err.textContent = fromSso; err.classList.remove("hidden"); }
+  // A message from a failed single sign-on arrives as a token signed by the server. Only
+  // text the server vouches for is shown: a crafted link can't make this page say anything.
+  const notice = hashParams().get("notice");
+  if (notice) {
+    api("GET", "/auth/notice?token=" + encodeURIComponent(notice))
+      .then((r) => { err.textContent = r.message; err.classList.remove("hidden"); })
+      .catch(() => {});
+  }
   const user = h("input", { id: "username", name: "username", autocomplete: "username", required: true, autofocus: true });
   const pass = h("input", { id: "password", name: "password", type: "password", autocomplete: "current-password", required: true });
   const submit = h("button", { class: "btn primary", type: "submit" }, "Sign in");
@@ -1278,7 +1286,7 @@ async function settingsView() {
         : "People without it are asked to set it up the next time they sign in. Single sign-on users are covered by their provider's own two-factor."),
       h("label", { class: "row", for: "ai-reading" }, aiReading, "Use AI to read invoices the app can't read by itself"),
       h("p", { class: "muted small" }, cfg.ai_available
-        ? "Only for scans, photos and unusual layouts that come back incomplete. Those files are sent to Anthropic (Claude) to be read, and each one is noted in the activity log. Everything else is read on this server."
+        ? "Only for scans, photos and unusual layouts that come back incomplete. Those files are sent to Anthropic (Claude) to be read, and each one is noted in the activity log. Everything else is read on this server. This switch also allows AI-written summaries of flags."
         : "Not available: the server has no Anthropic API key (ANTHROPIC_API_KEY). Invoices are read on this server only."),
       isAdmin ? h("div", {}, h("button", { class: "btn primary", type: "submit" }, "Save")) : h("p", { class: "muted small" }, "Only admins can change these.")));
 
@@ -1294,8 +1302,15 @@ async function settingsView() {
     const cell = h("td", { class: "user-actions" });
     function menu() {
       put(cell, h("div", { class: "row" },
-        u.sso_only ? null : h("button", { class: "btn link small", onclick: resetForm }, "Reset password"),
-        u.two_factor && u.username !== session.username ? h("button", { class: "btn link small", onclick: async () => {
+        u.sso_only || u.disabled ? null : h("button", { class: "btn link small", onclick: resetForm }, "Reset password"),
+        u.username !== session.username ? h("button", { class: "btn link small", onclick: async () => {
+          try {
+            await api("POST", `/users/${encodeURIComponent(u.username)}/access`, { enabled: u.disabled });
+            toast(u.disabled ? `${u.username} can sign in again.` : `${u.username} was signed out and can no longer sign in.`);
+            render();
+          } catch (ex) { toast(ex.message, true); }
+        } }, u.disabled ? "Give access back" : "Remove access") : null,
+        u.two_factor && !u.disabled && u.username !== session.username ? h("button", { class: "btn link small", onclick: async () => {
           try {
             await api("POST", `/users/${encodeURIComponent(u.username)}/2fa/reset`);
             toast(`Two-factor turned off for ${u.username}. They can set it up again.`);
@@ -1335,8 +1350,8 @@ async function settingsView() {
     h("div", { class: "table-wrap" }, h("table", {},
       h("thead", {}, h("tr", {}, h("th", {}, "Username"), h("th", {}, "Role"), h("th", {}, "Sign-in"), h("th", {}, ""))),
       h("tbody", {}, users.map((u) => h("tr", {}, h("td", {}, u.username), h("td", {}, u.role),
-        h("td", {}, u.sso_only ? "Single sign-on" : "Password", " ",
-          u.two_factor ? h("span", { class: "pill d-pay" }, "2FA") : null),
+        h("td", {}, u.disabled ? h("span", { class: "pill dismissed" }, "Access removed")
+          : [u.sso_only ? "Single sign-on" : "Password", " ", u.two_factor ? h("span", { class: "pill d-pay" }, "2FA") : null]),
         userActions(u)))))),
     spacer(16), h("h2", {}, "Add a person"),
     h("form", { class: "form", onsubmit: async (e) => {
