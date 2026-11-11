@@ -507,7 +507,12 @@ class BrowserTest(unittest.TestCase):
         p.fill("#username", "frank@acme.example")
         p.click("button:text('Email me a reset link')")
         p.wait_for_selector("text=we've sent a link")
-        files = glob.glob(os.path.join(self.mail_dir, "*frank*.eml"))
+        files = []
+        for _ in range(50):   # the email is sent in the background, a moment after the page answers
+            files = glob.glob(os.path.join(self.mail_dir, "*frank*.eml"))
+            if files:
+                break
+            time.sleep(0.1)
         self.assertEqual(len(files), 1)
         with open(files[0], "rb") as f:
             body = email.message_from_bytes(f.read()).get_payload(decode=True).decode()
