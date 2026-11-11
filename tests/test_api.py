@@ -147,12 +147,14 @@ class ApiTests(DbTestCase):
         self.assertEqual(self.client.get("/anomalies", headers=admin).json(), [])
         put = self.client.put("/settings", json={"approval_threshold": 500}, headers=admin)
         self.assertEqual(put.status_code, 200)
-        self.assertEqual(self.client.get("/settings", headers=admin).json(), {"approval_threshold": 500, "require_2fa": False})
+        self.assertEqual(self.client.get("/settings", headers=admin).json(), {"approval_threshold": 500, "require_2fa": False,
+                                                                           "ai_extraction": False, "ai_available": False})
         self.client.post("/detect", headers=admin)
         rules = [a["rule"] for a in self.client.get("/anomalies", headers=admin).json()]
         self.assertEqual(rules, ["below_threshold"])
         bob = self.auth("bob", PW_B)
-        self.assertEqual(self.client.get("/settings", headers=bob).json(), {"approval_threshold": 10000, "require_2fa": False})
+        self.assertEqual(self.client.get("/settings", headers=bob).json(), {"approval_threshold": 10000, "require_2fa": False,
+                                                                         "ai_extraction": False, "ai_available": False})
 
     def upload(self, headers, text, filename="export.csv", **extra):
         body = {"filename": filename, "content_base64": base64.b64encode(text.encode()).decode(), **extra}
@@ -541,7 +543,8 @@ class SignInApiTests(DbTestCase):
 
     def test_every_route_needs_sign_in_except_the_public_ones(self):
         """A new route that forgets its sign-in check fails this test."""
-        public = {"/", "/app", "/app/{name}", "/samples", "/samples/{name}", "/health", "/health/ready",
+        public = {"/", "/app", "/app/{name}", "/samples", "/samples/{name}", "/samples/documents",
+                  "/samples/documents/{name}", "/health", "/health/ready",
                   "/login", "/login/2fa", "/logout", "/auth/providers", "/auth/{name}/start",
                   "/auth/{name}/callback", "/password/forgot", "/password/reset",
                   "/docs", "/docs/oauth2-redirect", "/openapi.json"}

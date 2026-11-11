@@ -24,6 +24,7 @@ sorts every invoice into Ready to pay, Review first, On hold and Do not pay.
 | `bank_account_change` | 0.80 | Established vendor, first payment to a new bank account |
 | `shared_bank_account` | 0.70 | One bank account paid to several vendors |
 | `amount_outlier` | 0.55–0.75 | Far above the vendor's own history (robust z-score on log amounts) |
+| `totals_mismatch` | 0.45 | The invoice's own line items, subtotal, tax and total don't agree (invoices read from documents) |
 | `split_invoice` | 0.50 | Several invoices in a few days, each under the approval threshold, together over it |
 | `near_duplicate` | 0.50 | Same vendor + amount a few days apart |
 | `similar_vendor_name` | 0.50 | Vendor name almost identical to another vendor's |
@@ -41,6 +42,45 @@ signals add up, but they never outrank one strong signal. Thresholds live in `De
 rule's weight for that company is multiplied by `(confirmed + 5) / (confirmed + dismissed + 5)`.
 Rules that keep raising false alarms fade, and `GET /metrics` reports the measured precision
 per rule. This re-weights the rules; it does not retrain the Isolation Forest.
+
+## Invoice documents (PDF, Excel invoices, scans)
+
+Besides exports (one invoice per row), the app reads the invoices themselves, one per file:
+
+| File | How it's read | Where |
+|---|---|---|
+| PDF made by software | Its text and where each word sits on the page (pdfplumber) | On your server |
+| Excel invoice form (like Microsoft's invoice templates) | Each cell's value and position | On your server |
+| Photo or scanned PDF | OCR with Tesseract, then the same reading | On your server (optional extra) |
+| Anything the above can't read | Claude, through a fixed JSON form | Only if an admin switches on AI reading |
+
+All of them become the same thing, positioned pieces of text, and one reader finds the fields
+the way a person reads a form: a label ("Invoice #", "Amount due", "Bill to") and the value
+after it, beside it or under it. The vendor comes from the payee line or the name at the top,
+never the customer. Every field gets a confidence, and the invoice's own arithmetic is checked
+(line items → subtotal → + tax and shipping − discount and deposit → total).
+
+Nothing is saved until a person has checked each invoice: the review screen outlines unsure
+fields in amber and missing ones in red, and shows the text each value came from. Then:
+
+- the same file can't be imported twice (its fingerprint is stored, not the file);
+- a vendor spelled differently only in formatting ("Inc." vs "INC") is matched to the existing
+  vendor, but a different spelling ("Acme Suplies") is kept as printed and pointed out, since
+  that's what a look-alike vendor looks like;
+- corrections are recorded, and totals that don't add up become a detection flag.
+
+**How accurate?** `python -m invoice_detector.cli evaluate-documents 200` reads 200 generated
+invoices (PDF and Excel, four layouts, many label wordings, date and number formats, some with
+wrong totals). Current result: every field 100%, all planted totals errors caught, no false
+alarms. CI fails if any field drops below 97%. The tests also read replicas of five popular free
+invoice templates, and OCR on simulated scans (tilted, blurred, JPEG). Real invoices vary more
+than any test set; that's why a person checks every one.
+
+**Safety:** uploaded files are parsed in a separate process with a time limit (and a memory
+limit on Linux), so a broken or hostile file can't hang the server. Files must really be what
+their name says, and oversized images are refused. AI reading sends the file to Anthropic, so
+it is off by default, switched on per company, rate limited and written to the activity log;
+text inside an invoice is treated as data, never as instructions.
 
 ## How good is it?
 
@@ -150,6 +190,10 @@ python -m invoice_detector.cli seed "Acme Inc"            # optional: synthetic 
 uvicorn invoice_detector.api:create_app --factory --reload
 ```
 
+Reading photos and scans of invoices is optional: `pip install -e ".[ocr]"` plus the Tesseract
+program (Windows: the UB Mannheim installer; macOS: `brew install tesseract`; Linux:
+`apt install tesseract-ocr`). PDFs and Excel invoices work without it. The Docker image includes it.
+
 Then open http://127.0.0.1:8000 and sign in. The [tutorial](docs/TUTORIAL.md) walks through
 uploading your own files, the review queue, the PostgreSQL setup and how to fit this into a
 payment process. The raw API is documented at http://127.0.0.1:8000/docs.
@@ -198,6 +242,10 @@ role restrictions, company isolation and a phone-sized screen.
 | `POST /users/{name}/password`, `POST /users/{name}/2fa/reset` | admin | Help someone who is locked out |
 | `GET /health`, `GET /health/ready` | anyone | Up; database reachable (for load balancers) |
 | `POST /import/preview`, `POST /import` | admin, accountant | Read an Excel/CSV file and suggest a column mapping; import it |
+| `POST /documents/extract` | admin, accountant | Read one invoice document (PDF, Excel form, scan) into a draft; saves nothing |
+| `POST /documents/import` | admin, accountant | Save checked drafts as invoices, then run detection |
+| `GET /documents/stats` | any role | Documents read, by method, and fields people corrected |
+| `GET /samples/documents`, `GET /samples/invoice-documents.zip` | anyone | Sample invoice documents |
 | `POST /invoices`, `POST /invoices/bulk` | admin, accountant | Add one invoice, or up to 1,000 |
 | `GET /summary` | any role | Dashboard numbers |
 | `POST /export/annotated` | any role | Your uploaded workbook with results written in (.xlsx) |
@@ -211,7 +259,7 @@ role restrictions, company isolation and a phone-sized screen.
 | `POST /review/{id}` | admin, accountant | Confirm or dismiss; optional payment action and note |
 | `GET /metrics` | any role | Measured precision per rule and the weights in use |
 | `GET /anomalies` | any role | Every individual flag |
-| `GET`, `PUT /settings` | any role, admin | Approval threshold; require two-factor |
+| `GET`, `PUT /settings` | any role, admin | Approval threshold; require two-factor; AI reading |
 | `GET`, `POST /users` | admin | List or add users in your own company |
 | `GET /audit` | admin, auditor | The company's audit trail |
 | `POST /explain` | any role | Plain-English summary (uses Claude if a key is set) |
@@ -233,7 +281,7 @@ Excel/CSV parsing, the API and the web app in a real browser. To include the Pos
 ## Layout
 
 ```
-src/invoice_detector/   detection, decisions, evaluate, demo, importer, excel_out, samples, api, accounts, oidc, totp, qr, mailer, cli, db, schema, crypto, security, config, explain
+src/invoice_detector/   detection, decisions, evaluate, demo, importer, documents, intake, isolation, ai_extract, doc_samples, excel_out, samples, api, accounts, oidc, totp, qr, mailer, cli, db, schema, crypto, security, config, explain
 src/invoice_detector/web/  the web app (index.html, app.js, app.css)
 tests/                  unit tests (unittest style, run by pytest); tests/e2e is the browser test
 docs/TUTORIAL.md        step-by-step guide
