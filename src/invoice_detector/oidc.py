@@ -62,9 +62,13 @@ def providers_from_env(env=os.environ) -> dict[str, Provider]:
         if not tenant or tenant in ("common", "organizations", "consumers"):
             raise RuntimeError("Set MICROSOFT_TENANT_ID to your directory (tenant) ID, so only "
                                "accounts from your organisation can sign in.")
+        # Microsoft's "email" claim is not proof of ownership (it can hold an address the
+        # person doesn't control), so the sign-in name your directory assigns
+        # (preferred_username, the UPN) comes first. "email" is used only when Microsoft marks
+        # it as domain-verified (xms_edov).
         found["microsoft"] = Provider("microsoft", "Microsoft", f"https://login.microsoftonline.com/{tenant}/v2.0",
                                       env["MICROSOFT_CLIENT_ID"], env.get("MICROSOFT_CLIENT_SECRET", ""),
-                                      email_claims=("email", "preferred_username"))
+                                      email_claims=("preferred_username", "email"))
     if env.get("OIDC_ISSUER"):
         found["sso"] = Provider("sso", env.get("OIDC_LABEL", "single sign-on"), env["OIDC_ISSUER"].rstrip("/"),
                                 env.get("OIDC_CLIENT_ID", ""), env.get("OIDC_CLIENT_SECRET", ""),
@@ -237,10 +241,17 @@ class OIDCClient:
         return claims
 
     def email_from(self, claims: dict) -> str:
+        # An address the provider itself says is unverified is never accepted, whatever the settings.
+        unverified = claims.get("email_verified") is False or (
+            self.provider.name == "microsoft" and claims.get("xms_edov") is not True)
         if self.provider.require_verified_email and claims.get("email_verified") is not True:
             raise SSOError("Your email address isn't verified with the sign-in provider.")
         for name in self.provider.email_claims:
             value = claims.get(name)
+            if name == "email" and unverified:
+                continue
             if isinstance(value, str) and "@" in value:
                 return value.strip().lower()
+        if unverified and isinstance(claims.get("email"), str):
+            raise SSOError("Your email address isn't verified with the sign-in provider.")
         raise SSOError("The sign-in provider didn't share an email address.")

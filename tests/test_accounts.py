@@ -43,6 +43,7 @@ class AccountsTestCase(DbTestCase):
         return secret.replace(" ", ""), enabled
 
     def emails(self):
+        self.acc.wait_for_mail()   # emails are sent on a background thread
         files = sorted(os.listdir(self.mail_dir))
         return [open(os.path.join(self.mail_dir, f), encoding="utf-8").read() for f in files]
 
@@ -246,7 +247,7 @@ class ResetTests(AccountsTestCase):
         self.turn_on_2fa(bob)
         self.acc.admin_reset_2fa(admin, "bob")
         self.assertIn("access_token", self.acc.login("bob", "temporary-password-1", "1.2.3.4"))
-        for action in (lambda: self.acc.admin_set_password(admin, "carol@globex.example", "x" * 12),
+        for action in (lambda: self.acc.admin_set_password(admin, "carol@globex.example", "temporary-password-1"),
                        lambda: self.acc.admin_reset_2fa(admin, "carol@globex.example")):
             with self.assertRaises(AccountError) as cm:
                 action()  # another company's user
@@ -279,9 +280,14 @@ class SingleSignOnTests(AccountsTestCase):
             "cancelled": self.go("alice@acme.example", query={"error": "access_denied"}),
         }
         for case, (where, token) in cases.items():
-            self.assertTrue(where.startswith("/#/login?error="), case)
+            self.assertTrue(where.startswith("/#/login?notice="), case)
             self.assertIsNone(token, case)
-        self.assertIn("no%20account%20for%20stranger%40acme.example", cases["unknown person"][0])
+        # The message is signed by the server; a made-up or altered one is refused.
+        notice = cases["unknown person"][0].split("notice=")[1]
+        self.assertIn("no account for stranger@acme.example", self.acc.notice(notice))
+        for forged in ("Your account is locked. Call 555-0100.", notice[:-2] + "xx"):
+            with self.assertRaises(AccountError):
+                self.acc.notice(forged)
         with self.assertRaises(AccountError):
             self.acc.sso_start("google")
 

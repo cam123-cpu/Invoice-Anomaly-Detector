@@ -247,13 +247,48 @@ class Database:
         """Password hash and two-factor state of one user in this company."""
         with self._tx(org_id) as run:
             rows = run("SELECT username, role, password_hash, totp_secret, totp_enabled, totp_last_step, "
-                       "recovery_codes FROM users WHERE org_id = ? AND username = ?", (org_id, username))
+                       "recovery_codes, session_epoch, disabled FROM users WHERE org_id = ? AND username = ?",
+                       (org_id, username))
         if not rows:
             return None
         user = rows[0]
         user["totp_enabled"] = bool(user["totp_enabled"])
+        user["disabled"] = bool(user["disabled"])
         user["recovery_codes"] = json.loads(user["recovery_codes"]) if user["recovery_codes"] else []
         return user
+
+    def claim_totp_step(self, org_id: str, username: str, step: int) -> bool:
+        """Mark a two-factor code's time-step as used, only if no code at or after it has
+        been used. One statement, so two requests with the same code can't both succeed."""
+        with self._tx(org_id):
+            cur = self._execute("UPDATE users SET totp_last_step = ? WHERE org_id = ? AND username = ? "
+                                "AND (totp_last_step IS NULL OR totp_last_step < ?)", (step, org_id, username, step))
+            return cur.rowcount == 1
+
+    def swap_recovery_codes(self, org_id: str, username: str, before: list[str], after: list[str]) -> bool:
+        """Replace the stored recovery codes only if they are still what we read, so one
+        recovery code can't be spent twice by two simultaneous requests."""
+        with self._tx(org_id):
+            cur = self._execute("UPDATE users SET recovery_codes = ? WHERE org_id = ? AND username = ? "
+                                "AND recovery_codes = ?", (json.dumps(after), org_id, username, json.dumps(before)))
+            return cur.rowcount == 1
+
+    def end_sessions(self, org_id: str, username: str) -> None:
+        """Sign this person out everywhere: tokens carry the epoch, so older ones stop working."""
+        with self._tx(org_id):
+            self._execute("UPDATE users SET session_epoch = session_epoch + 1 WHERE org_id = ? AND username = ?",
+                          (org_id, username))
+
+    def set_user_disabled(self, org_id: str, username: str, disabled: bool) -> bool:
+        with self._tx(org_id):
+            cur = self._execute("UPDATE users SET disabled = ?, session_epoch = session_epoch + 1 "
+                                "WHERE org_id = ? AND username = ?", (int(disabled), org_id, username))
+            return cur.rowcount == 1
+
+    def active_admins(self, org_id: str) -> int:
+        with self._tx(org_id) as run:
+            return run("SELECT count(*) AS n FROM users WHERE org_id = ? AND role = 'admin' AND disabled = 0",
+                       (org_id,))[0]["n"]
 
     def update_user_security(self, org_id: str, username: str, **fields) -> None:
         """Change two-factor fields. Only the allow-listed column names can be set."""
@@ -271,23 +306,24 @@ class Database:
         """Used only by login, before the company is known."""
         with self._tx() as run:
             if self.is_postgres:
-                rows = run("SELECT username, password_hash, role, org_id, totp_enabled FROM auth_lookup(?)",
-                           (username,))
+                rows = run("SELECT username, password_hash, role, org_id, totp_enabled, session_epoch, disabled "
+                           "FROM auth_lookup(?)", (username,))
             else:  # case-insensitive, so Alice@Acme.com and alice@acme.com are the same person
-                rows = run("SELECT username, password_hash, role, org_id, totp_enabled FROM users "
-                           "WHERE lower(username) = lower(?) ORDER BY username LIMIT 1", (username,))
+                rows = run("SELECT username, password_hash, role, org_id, totp_enabled, session_epoch, disabled "
+                           "FROM users WHERE lower(username) = lower(?) ORDER BY username LIMIT 1", (username,))
         if not rows:
             return None
         user = rows[0]
         user["totp_enabled"] = bool(user["totp_enabled"])
+        user["disabled"] = bool(user["disabled"])
         return user
 
     def list_users(self, org_id: str) -> list[dict]:
         with self._tx(org_id) as run:
-            rows = run("SELECT username, role, totp_enabled, password_hash FROM users WHERE org_id = ? "
+            rows = run("SELECT username, role, totp_enabled, password_hash, disabled FROM users WHERE org_id = ? "
                        "ORDER BY username", (org_id,))
         return [{"username": r["username"], "role": r["role"], "two_factor": bool(r["totp_enabled"]),
-                 "sso_only": r["password_hash"] == SSO_ONLY} for r in rows]
+                 "sso_only": r["password_hash"] == SSO_ONLY, "disabled": bool(r["disabled"])} for r in rows]
 
     # ----- invoices -----
     def add_invoice(self, org_id: str, inv_id: str, vendor: str, amount: float,

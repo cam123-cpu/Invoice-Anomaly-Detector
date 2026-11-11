@@ -23,7 +23,9 @@ CREATE TABLE IF NOT EXISTS users (
   totp_secret TEXT,
   totp_enabled INTEGER NOT NULL DEFAULT 0,
   totp_last_step INTEGER,
-  recovery_codes TEXT
+  recovery_codes TEXT,
+  session_epoch INTEGER NOT NULL DEFAULT 0,   -- raised on sign-out: every earlier session ends
+  disabled INTEGER NOT NULL DEFAULT 0         -- access removed (the record stays, for the audit trail)
 );
 CREATE TABLE IF NOT EXISTS invoices (
   org_id TEXT NOT NULL REFERENCES orgs(id),
@@ -104,6 +106,8 @@ ADDED_COLUMNS = [
     ("users", "totp_last_step", "INTEGER"),
     ("users", "recovery_codes", "TEXT"),
     ("orgs", "ai_extraction", "INTEGER NOT NULL DEFAULT 0"),
+    ("users", "session_epoch", "INTEGER NOT NULL DEFAULT 0"),
+    ("users", "disabled", "INTEGER NOT NULL DEFAULT 0"),
 ]
 
 # Idempotent: safe to run on every deploy.
@@ -123,9 +127,10 @@ LANGUAGE sql STABLE AS $$ SELECT nullif(current_setting('app.org_id', true), '')
 -- only what deciding "password OK? second factor needed?" requires.
 DROP FUNCTION IF EXISTS auth_lookup(text);
 CREATE FUNCTION auth_lookup(p_username text)
-RETURNS TABLE (username text, password_hash text, role text, org_id text, totp_enabled integer)
+RETURNS TABLE (username text, password_hash text, role text, org_id text, totp_enabled integer,
+               session_epoch integer, disabled integer)
 LANGUAGE sql STABLE SECURITY DEFINER SET search_path = public, pg_temp AS $$
-  SELECT u.username, u.password_hash, u.role, u.org_id, u.totp_enabled FROM users u
+  SELECT u.username, u.password_hash, u.role, u.org_id, u.totp_enabled, u.session_epoch, u.disabled FROM users u
   WHERE lower(u.username) = lower(p_username) ORDER BY u.username LIMIT 1
 $$;
 REVOKE ALL ON FUNCTION auth_lookup(text) FROM PUBLIC;
@@ -139,7 +144,8 @@ GRANT SELECT ON orgs TO invoice_app;
 GRANT UPDATE (approval_threshold, require_2fa, ai_extraction) ON orgs TO invoice_app;
 GRANT SELECT, INSERT ON documents TO invoice_app;  -- a record of what was imported: never edited
 GRANT SELECT, INSERT ON users TO invoice_app;
-GRANT UPDATE (password_hash, totp_secret, totp_enabled, totp_last_step, recovery_codes) ON users TO invoice_app;
+GRANT UPDATE (password_hash, totp_secret, totp_enabled, totp_last_step, recovery_codes, session_epoch, disabled)
+  ON users TO invoice_app;
 GRANT SELECT, INSERT ON meta TO invoice_app;  -- holds only the encryption-key check
 GRANT SELECT, INSERT ON invoices TO invoice_app;
 GRANT SELECT, INSERT, DELETE ON anomalies TO invoice_app;

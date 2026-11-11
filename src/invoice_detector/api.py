@@ -13,7 +13,7 @@ from datetime import date as Date
 from importlib.resources import files
 from typing import Literal
 
-from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.responses import JSONResponse, RedirectResponse, Response
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, ConfigDict, Field
@@ -31,7 +31,8 @@ from .doc_samples import sample_docs, sample_zip
 from .intake import DocumentIntake, IntakeError
 from .accounts import AccountError, Accounts
 from .mailer import from_settings as mailer_from_settings
-from .security import TokenSigner
+from .isolation import run_isolated
+from .security import RateLimiter, RateLimitError, TokenSigner, password_problem
 
 MAX_BULK = 1000
 MAX_BODY = 16 * 1024 * 1024   # an upload is at most 10 MB, about 13.4 MB once base64-encoded
@@ -177,6 +178,10 @@ class SettingsIn(StrictModel):
     ai_extraction: bool | None = None
 
 
+class AccessIn(StrictModel):
+    enabled: bool
+
+
 class DocumentIn(StrictModel):
     filename: str = Field(min_length=1, max_length=255)
     content_base64: str = Field(min_length=1, max_length=14_000_000)
@@ -247,13 +252,29 @@ def create_app(settings: Settings | None = None, db: Database | None = None,
         """For the pages a user needs to set up two-factor or change their password."""
         return _user(request, creds, enforce_2fa=False)
 
-    def start_session(response: Response, result: dict) -> dict:
-        """When a sign-in step produced an access token, also put it in the session cookie.
-        (The token stays in the JSON too, for programs that use the API directly.)"""
+    def start_session(request: Request, response: Response, result: dict) -> dict:
+        """When a sign-in step produced an access token, put it in the session cookie.
+        Programs get the token in the JSON as well. The web app (which marks its requests
+        with X-Requested-With) does not: its scripts never hold a token at all, so there is
+        nothing for an injected script to steal."""
         if isinstance(result, dict) and result.get("access_token"):
             response.set_cookie(session_cookie, result["access_token"], max_age=SESSION_TTL, path="/",
                                 httponly=True, secure=https, samesite="strict")
+            if request.headers.get("x-requested-with") == "fetch":
+                result = {k: v for k, v in result.items() if k not in ("access_token", "token_type")}
+                result["signed_in"] = True
         return result
+
+    # Heavy or paid work, capped per company so one account can't monopolise the server.
+    extract_limiter = RateLimiter(max_attempts=300, window=600, lockout=600)   # documents per 10 minutes
+    explain_limiter = RateLimiter(max_attempts=30, window=3600, lockout=3600)  # AI summaries per hour
+
+    def spend(limiter: RateLimiter, org: str, what: str) -> None:
+        try:
+            limiter.check(org)
+        except RateLimitError:
+            raise HTTPException(429, f"Your company has reached the limit for {what}. Try again later.") from None
+        limiter.record_failure(org)
 
     def require(*roles: str):
         def dependency(user: dict = Depends(current_user)) -> dict:
@@ -283,6 +304,8 @@ def create_app(settings: Settings | None = None, db: Database | None = None,
         except (binascii.Error, ValueError):
             raise HTTPException(422, "The file could not be read. Try uploading it again.") from None
         try:
+            if settings.isolate_documents:   # parse the upload in a throwaway, time-limited process
+                return run_isolated("invoice_detector.importer:read_table", body.filename, data, body.sheet)
             return read_table(body.filename, data, body.sheet)
         except FileProblem as exc:
             raise HTTPException(422, str(exc)) from None
@@ -394,19 +417,32 @@ def create_app(settings: Settings | None = None, db: Database | None = None,
     def login(body: LoginIn, request: Request, response: Response) -> dict:
         """Step 1. Returns an access token, or {"mfa_required": true, "mfa_token": ...} when
         the user has two-factor on; then send the code to POST /login/2fa."""
-        return start_session(response, run(lambda: accounts.login(body.username, body.password, client_ip(request))))
+        return start_session(request, response, run(lambda: accounts.login(body.username, body.password, client_ip(request))))
 
     @app.post("/login/2fa")
     def login_2fa(body: SecondFactorIn, request: Request, response: Response) -> dict:
         """Step 2: a code from the authenticator app, or a one-time recovery code."""
-        return start_session(response, run(lambda: accounts.login_second_factor(body.mfa_token, body.code,
+        return start_session(request, response, run(lambda: accounts.login_second_factor(body.mfa_token, body.code,
                                                                                 client_ip(request))))
 
     @app.post("/logout")
-    def logout(response: Response) -> dict:
-        """End the browser session (removes the session cookie)."""
+    def logout(request: Request, response: Response,
+               creds: HTTPAuthorizationCredentials | None = Depends(bearer)) -> dict:
+        """Sign out: remove the session cookie AND end the session on the server, so a copy
+        of the token (from a shared computer, a proxy log, malware) stops working too."""
+        token = creds.credentials if creds else request.cookies.get(session_cookie)
+        if token:
+            try:
+                accounts.logout(accounts.authenticate(token, enforce_2fa=False))
+            except AccountError:
+                pass   # already expired or invalid: nothing to end
         response.delete_cookie(session_cookie, path="/", secure=https, httponly=True, samesite="strict")
         return {"signed_out": True}
+
+    @app.get("/auth/notice")
+    def sso_notice(token: str = Query(max_length=2000)) -> dict:
+        """The text of a sign-in message this server signed (see Accounts.sso_callback)."""
+        return {"message": run(lambda: accounts.notice(token))}
 
     @app.get("/auth/providers")
     def sso_providers() -> list[dict]:
@@ -427,7 +463,7 @@ def create_app(settings: Settings | None = None, db: Database | None = None,
                                               client_ip(request))
         response = RedirectResponse(target, status_code=302)
         response.delete_cookie(sso_cookie, path="/auth/")
-        start_session(response, {"access_token": token})
+        start_session(request, response, {"access_token": token})
         response.headers["Cache-Control"] = "no-store"
         return response
 
@@ -459,23 +495,26 @@ def create_app(settings: Settings | None = None, db: Database | None = None,
         return run(lambda: accounts.setup_2fa(user))
 
     @app.post("/me/2fa/enable")
-    def two_factor_enable(body: CodeIn, response: Response, user: dict = Depends(account_user)) -> dict:
+    def two_factor_enable(body: CodeIn, request: Request, response: Response,
+                          user: dict = Depends(account_user)) -> dict:
         """Confirm with a code from the app. Returns ten recovery codes (shown once) and a new
         access token for a session that counts as two-factor."""
-        return start_session(response, run(lambda: accounts.enable_2fa(user, body.code)))
+        return start_session(request, response, run(lambda: accounts.enable_2fa(user, body.code)))
 
     @app.post("/me/2fa/disable")
-    def two_factor_disable(body: DisableTwoFactorIn, response: Response, user: dict = Depends(account_user)) -> dict:
-        return start_session(response, run(lambda: accounts.disable_2fa(user, body.password, body.code)))
+    def two_factor_disable(body: DisableTwoFactorIn, request: Request, response: Response,
+                           user: dict = Depends(account_user)) -> dict:
+        return start_session(request, response, run(lambda: accounts.disable_2fa(user, body.password, body.code)))
 
     @app.post("/me/2fa/recovery-codes")
     def two_factor_new_codes(body: CodeIn, user: dict = Depends(current_user)) -> dict:
         return run(lambda: accounts.new_recovery_codes(user, body.code))
 
     @app.post("/me/password")
-    def change_password(body: ChangePasswordIn, response: Response, user: dict = Depends(account_user)) -> dict:
+    def change_password(body: ChangePasswordIn, request: Request, response: Response,
+                        user: dict = Depends(account_user)) -> dict:
         """Ends every other session; returns a new access token for this one."""
-        return start_session(response, run(lambda: accounts.change_password(user, body.current_password,
+        return start_session(request, response, run(lambda: accounts.change_password(user, body.current_password,
                                                                             body.new_password)))
 
     # ---------------- company administration ----------------
@@ -488,6 +527,9 @@ def create_app(settings: Settings | None = None, db: Database | None = None,
         """Admins add people to their own company only. Use their email address as the
         username: it's what single sign-on and password-reset emails match on."""
         username = body.username.strip().lower() if "@" in body.username else body.username.strip()
+        problem = password_problem(body.password, username) if body.password else None
+        if problem:
+            raise HTTPException(422, problem)
         if db.auth_lookup(username):
             raise HTTPException(409, "Username is already taken")
         try:
@@ -503,6 +545,13 @@ def create_app(settings: Settings | None = None, db: Database | None = None,
         """Give someone a temporary password (ends their sessions)."""
         run(lambda: accounts.admin_set_password(user, username, body.new_password))
         return {"username": username}
+
+    @app.post("/users/{username}/access")
+    def admin_set_access(username: str, body: AccessIn, user: dict = Depends(require("admin"))) -> dict:
+        """Remove a person's access (they are signed out at once and can't sign in by any
+        route), or give it back. Their record stays, so the audit trail still names them."""
+        run(lambda: accounts.admin_set_access(user, username, body.enabled))
+        return {"username": username, "disabled": not body.enabled}
 
     @app.post("/users/{username}/2fa/reset")
     def admin_reset_2fa(username: str, user: dict = Depends(require("admin"))) -> dict:
@@ -648,6 +697,7 @@ def create_app(settings: Settings | None = None, db: Database | None = None,
             data = base64.b64decode(body.content_base64, validate=True)
         except (binascii.Error, ValueError):
             raise HTTPException(422, "The file could not be read. Try uploading it again.") from None
+        spend(extract_limiter, user["org"], "reading documents")
         return intake_call(lambda: intake.extract(user, body.filename, data))
 
     @app.post("/documents/import")
@@ -792,7 +842,13 @@ def create_app(settings: Settings | None = None, db: Database | None = None,
 
     @app.post("/explain")
     def explain_anomalies(user: dict = Depends(current_user)) -> dict:
+        # Flag details go to Anthropic only if this company switched AI on; otherwise the
+        # summary is written locally.
+        allowed = bool(settings.anthropic_api_key) and db.get_org(user["org"])["ai_extraction"]
+        if allowed:
+            spend(explain_limiter, user["org"], "AI summaries")
+            db.audit(user["org"], user["sub"], "ai_summary", "flag details sent to Anthropic for a summary")
         return {"explanation": explain(db.list_anomalies(user["org"], 20),
-                                       settings.anthropic_api_key)}
+                                       settings.anthropic_api_key if allowed else None)}
 
     return app

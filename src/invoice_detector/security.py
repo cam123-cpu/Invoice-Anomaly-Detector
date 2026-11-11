@@ -3,6 +3,7 @@ import base64
 import hashlib
 import hmac
 import json
+import re
 import secrets
 import time
 from collections import defaultdict, deque
@@ -88,6 +89,41 @@ def password_fingerprint(password_hash: str) -> str:
     """A short, non-reversible tag of the stored password hash. Tokens carry it, so changing
     the password ends every session and makes old reset links useless."""
     return hashlib.sha256(password_hash.encode()).hexdigest()[:16]
+
+
+# Long enough to pass a length rule, but among the first things an attacker tries.
+_COMMON_WORDS = {"password", "passw0rd", "p@ssword", "p@ssw0rd", "qwerty", "qwertyuiop", "letmein", "welcome",
+                 "admin", "administrator", "changeme", "iloveyou", "monkey", "dragon", "football", "baseball",
+                 "sunshine", "princess", "trustno", "master", "login", "invoice", "invoices", "accounting",
+                 "finance", "company", "secret", "abc", "test", "temp", "default"}
+_RUNS = ("01234567890123456789", "abcdefghijklmnopqrstuvwxyz", "qwertyuiopasdfghjklzxcvbnm",
+         "98765432109876543210")
+
+
+def password_problem(password: str, username: str = "") -> str | None:
+    """Why a password is too easy to guess, or None. Length alone (12+) is checked elsewhere;
+    this refuses the long-but-obvious ones: common words with digits on the end, runs,
+    repeats, and the username itself."""
+    low = password.lower()
+    core = re.sub(r"[\d\W_]+$", "", re.sub(r"^[\d\W_]+", "", low))   # "Password1234!" -> "password"
+    if len(set(low)) < 5:
+        return "Choose a password with more variety: this one repeats a few characters."
+    if core in _COMMON_WORDS or low in _COMMON_WORDS:
+        return "That password is one of the first an attacker would try. Choose something less common."
+    if any(low in run for run in _RUNS):
+        return "Choose a password that isn't a run of keys like 123456 or qwerty."
+    name = username.lower().split("@")[0]
+    if len(name) >= 3 and name in low:
+        rest = low.replace(name, "")
+        if len(rest) < 8 or len(re.sub(r"[^a-z]", "", rest)) < 4:   # the name plus digits or symbols
+            return "Choose a password that isn't based on the username."
+    return None
+
+
+def session_fingerprint(user: dict) -> str:
+    """What every token is tied to: the password hash and the sign-out counter. Change the
+    password, sign out, or have access removed, and every earlier token stops working."""
+    return password_fingerprint(f"{user['password_hash']}|{user.get('session_epoch') or 0}")
 
 
 class TokenSigner:

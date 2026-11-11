@@ -166,6 +166,10 @@ on every push. SQLite, used for local runs, has the first two layers and the las
 - **Security headers** on every response (CSP, frame, referrer, permissions, cross-origin) and
   no caching of API answers; API docs switched off in production
 - **Secret scanning** of the whole git history and a blocking dependency audit in CI
+- **Penetration-tested**: findings and fixes are in [docs/SECURITY-REVIEW.md](docs/SECURITY-REVIEW.md),
+  and every attack is kept as a test (`tests/test_attacks.py`) that fails if the hole reopens
+- **Sign-out ends the session on the server**, on every device; an admin can **remove a
+  person's access** at once (password, reset links and single sign-on)
 - **Passwords hashed** with salted scrypt; constant-time comparison
 - **Rate-limited sign-in**: 5 failures per 15 minutes per IP + username, then a lockout; 30 per
   address across all usernames (stops bots trying many accounts); limits on two-factor codes;
@@ -240,6 +244,7 @@ role restrictions, company isolation and a phone-sized screen.
 | `GET /me`, `POST /me/password` | any role | Your account; change your password |
 | `GET /me/2fa`, `POST /me/2fa/setup` · `enable` · `disable` · `recovery-codes` | any role | Two-factor authentication |
 | `POST /users/{name}/password`, `POST /users/{name}/2fa/reset` | admin | Help someone who is locked out |
+| `POST /users/{name}/access` | admin | Remove a person's access, or give it back |
 | `GET /health`, `GET /health/ready` | anyone | Up; database reachable (for load balancers) |
 | `POST /import/preview`, `POST /import` | admin, accountant | Read an Excel/CSV file and suggest a column mapping; import it |
 | `POST /documents/extract` | admin, accountant | Read one invoice document (PDF, Excel form, scan) into a draft; saves nothing |
