@@ -27,6 +27,8 @@ from .excel_out import XLSX, annotate, payment_file, review_report
 from .explain import explain
 from .importer import FIELDS, ID_PATTERN, FileProblem, convert, preview, read_table
 from .samples import SAMPLES, build as build_sample
+from .doc_samples import sample_docs, sample_zip
+from .intake import DocumentIntake, IntakeError
 from .accounts import AccountError, Accounts
 from .mailer import from_settings as mailer_from_settings
 from .security import TokenSigner
@@ -172,15 +174,38 @@ def attachment(data: bytes, filename: str, media_type: str) -> Response:
 class SettingsIn(StrictModel):
     approval_threshold: float | None = Field(default=None, gt=0, lt=1e12)
     require_2fa: bool | None = None
+    ai_extraction: bool | None = None
+
+
+class DocumentIn(StrictModel):
+    filename: str = Field(min_length=1, max_length=255)
+    content_base64: str = Field(min_length=1, max_length=14_000_000)
+
+
+class CheckedDocument(StrictModel):
+    """One draft after a person checked it. The fields are what they confirmed."""
+    draft: str = Field(min_length=1, max_length=8000)
+    file: str | None = Field(default=None, max_length=255)
+    id: str | None = Field(default=None, max_length=64)
+    vendor: str | None = Field(default=None, max_length=200)
+    date: str | None = Field(default=None, max_length=10)
+    amount: float | None = Field(default=None, ge=0, lt=1e12)
+    bank_account: str | None = Field(default=None, max_length=64)
+
+
+class DocumentsImportIn(StrictModel):
+    items: list[CheckedDocument] = Field(min_length=1, max_length=200)
+    run_detection: bool = True
 
 
 def create_app(settings: Settings | None = None, db: Database | None = None,
-               accounts: Accounts | None = None) -> FastAPI:
+               accounts: Accounts | None = None, intake: DocumentIntake | None = None) -> FastAPI:
     settings = settings or Settings.from_env()
     db = db or Database.from_settings(settings)
     db.check_keys()  # refuse to start with encryption keys that don't match the data
     signer = TokenSigner(settings.secret_key)
     accounts = accounts or Accounts(db, signer, settings, mailer_from_settings(settings))
+    intake = intake or DocumentIntake(db, signer, settings, isolate=settings.isolate_documents)
     bearer = HTTPBearer(auto_error=False)
     https = settings.public_url.startswith("https://")
     sso_cookie = "iad_sso"
@@ -189,7 +214,7 @@ def create_app(settings: Settings | None = None, db: Database | None = None,
     session_cookie = "__Host-iad_session" if https else "iad_session"
 
     docs = settings.api_docs
-    app = FastAPI(title="Invoice Anomaly Detector", version="0.8.0",
+    app = FastAPI(title="Invoice Anomaly Detector", version="0.9.0",
                   docs_url="/docs" if docs else None, redoc_url=None,
                   openapi_url="/openapi.json" if docs else None)
     app.add_middleware(BodyLimit)
@@ -310,6 +335,26 @@ def create_app(settings: Settings | None = None, db: Database | None = None,
         return RedirectResponse("/")
 
     # ---------------- sample files (synthetic, so no sign-in needed) ----------------
+    SAMPLE_DOC_INFO = {
+        "wayne-office-1042.pdf": "A normal invoice from a regular vendor.",
+        "stark-freight-8811.pdf": "Asks to be paid into a bank account this vendor hasn't used before.",
+        "umbrella-ltd-3307.xlsx": "An Excel invoice whose total doesn't match its own lines and tax.",
+        "acme-suplies-0091.pdf": "From \"Acme Suplies\", a look-alike of your vendor Acme Supplies.",
+    }
+
+    @app.get("/samples/documents")
+    def list_sample_documents() -> list[dict]:
+        """Made-up invoice documents (PDF and Excel) for trying document reading."""
+        return [{"name": n, "description": d} for n, d in SAMPLE_DOC_INFO.items()]
+
+    @app.get("/samples/documents/{name}")
+    def get_sample_document(name: str) -> Response:
+        files = {n: data for n, data, _ in sample_docs()}
+        if name not in files:
+            raise HTTPException(404, "No such sample")
+        media = "application/pdf" if name.endswith(".pdf") else XLSX
+        return attachment(files[name], name, media)
+
     @app.get("/samples")
     def list_samples() -> list[dict]:
         """Sample Excel files in the shapes real exports take, plus a blank template."""
@@ -317,6 +362,8 @@ def create_app(settings: Settings | None = None, db: Database | None = None,
 
     @app.get("/samples/{name}")
     def get_sample(name: str) -> Response:
+        if name == "invoice-documents.zip":
+            return attachment(sample_zip(), name, "application/zip")
         if name not in SAMPLES:
             raise HTTPException(404, "No such sample")
         return attachment(build_sample(name), name, XLSX)
@@ -465,18 +512,22 @@ def create_app(settings: Settings | None = None, db: Database | None = None,
 
     @app.get("/settings")
     def get_settings(user: dict = Depends(current_user)) -> dict:
-        org = db.get_org(user["org"])
-        return {"approval_threshold": org["approval_threshold"], "require_2fa": org["require_2fa"]}
+        return settings_view(db.get_org(user["org"]))
+
+    def settings_view(org: dict) -> dict:
+        return {"approval_threshold": org["approval_threshold"], "require_2fa": org["require_2fa"],
+                "ai_extraction": org["ai_extraction"], "ai_available": bool(settings.anthropic_api_key)}
 
     @app.put("/settings")
     def put_settings(body: SettingsIn, user: dict = Depends(require("admin"))) -> dict:
         if body.require_2fa and not user["two_factor"]:
             raise HTTPException(409, "Turn on two-factor for your own account first, so you aren't locked out.")
-        db.set_org_settings(user["org"], body.approval_threshold, body.require_2fa)
+        if body.ai_extraction and not settings.anthropic_api_key:
+            raise HTTPException(409, "AI reading needs an Anthropic API key on the server (ANTHROPIC_API_KEY).")
+        db.set_org_settings(user["org"], body.approval_threshold, body.require_2fa, body.ai_extraction)
         changes = {k: v for k, v in body.model_dump().items() if v is not None}
         db.audit(user["org"], user["sub"], "settings_changed", ", ".join(f"{k}={v}" for k, v in changes.items()))
-        org = db.get_org(user["org"])
-        return {"approval_threshold": org["approval_threshold"], "require_2fa": org["require_2fa"]}
+        return settings_view(db.get_org(user["org"]))
 
     @app.get("/audit")
     def audit_log(limit: int = 100, user: dict = Depends(require("admin", "auditor"))) -> list[dict]:
@@ -575,7 +626,40 @@ def create_app(settings: Settings | None = None, db: Database | None = None,
     @app.post("/import/preview")
     def import_preview(body: FileIn, user: dict = Depends(require("admin", "accountant"))) -> dict:
         """Read an uploaded Excel or CSV file and suggest which column is which."""
-        return preview(read_upload(body))
+        result = preview(read_upload(body))
+        # A single invoice form (not a list) has no invoice-number or amount column and few
+        # rows: point the person to document reading instead of a confusing column match.
+        missing = [f for f in ("id", "amount", "vendor") if not result["mapping"].get(f)]
+        result["looks_like_document"] = bool(missing) and result["total_rows"] <= 80
+        return result
+
+    # ---------------- invoice documents (one invoice per file) ----------------
+    def intake_call(action):
+        try:
+            return action()
+        except IntakeError as exc:
+            raise HTTPException(exc.status, exc.message) from None
+
+    @app.post("/documents/extract")
+    def documents_extract(body: DocumentIn, user: dict = Depends(require("admin", "accountant"))) -> dict:
+        """Read one invoice document (PDF, Excel invoice form, or a scan/photo) and return a
+        draft for a person to check. Nothing is saved."""
+        try:
+            data = base64.b64decode(body.content_base64, validate=True)
+        except (binascii.Error, ValueError):
+            raise HTTPException(422, "The file could not be read. Try uploading it again.") from None
+        return intake_call(lambda: intake.extract(user, body.filename, data))
+
+    @app.post("/documents/import")
+    def documents_import(body: DocumentsImportIn, user: dict = Depends(require("admin", "accountant"))) -> dict:
+        """Save checked drafts as invoices (with a record of each document), then run detection."""
+        result = intake_call(lambda: intake.import_drafts(user, [i.model_dump() for i in body.items]))
+        result["detection"] = run_detection_for(user) if body.run_detection and result["added"] else None
+        return result
+
+    @app.get("/documents/stats")
+    def documents_stats(user: dict = Depends(current_user)) -> dict:
+        return db.document_stats(user["org"])
 
     @app.post("/import")
     def import_file(body: ImportIn, user: dict = Depends(require("admin", "accountant"))) -> dict:

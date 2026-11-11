@@ -19,6 +19,7 @@ class Invoice:
     amount: float
     date: str  # ISO yyyy-mm-dd
     bank_idx: str | None = None  # blind index of the bank account, never the account itself
+    totals_issue: str | None = None  # read from the invoice document: its own arithmetic doesn't add up
 
 
 @dataclass(frozen=True)
@@ -54,6 +55,7 @@ RULE_WEIGHT = {
     "bank_account_change": 0.80,
     "shared_bank_account": 0.70,
     "amount_outlier": 0.55,
+    "totals_mismatch": 0.45,
     "split_invoice": 0.50,
     "near_duplicate": 0.50,
     "similar_vendor_name": 0.50,
@@ -78,6 +80,7 @@ RULE_INFO = {
     "below_threshold": ("Just under limit", "Amount is just below the approval threshold"),
     "round_amount": ("Round amount", "Suspiciously round figure"),
     "weekend_invoice": ("Weekend date", "Invoice is dated on a weekend"),
+    "totals_mismatch": ("Totals don't add up", "The invoice's line items, subtotal, tax and total don't agree"),
 }
 
 
@@ -259,6 +262,13 @@ def find_round_amounts(invoices: list[Invoice]) -> list[Anomaly]:
             for i in invoices if i.amount >= 1000 and i.amount % 1000 == 0]
 
 
+def find_totals_mismatch(invoices: list[Invoice]) -> list[Anomaly]:
+    """The invoice's own numbers don't agree (line items vs subtotal, or subtotal + tax vs
+    total). Common with honest typos, and with altered invoices where only the total was
+    changed. Only invoices read from documents carry this information."""
+    return [Anomaly(i.id, "totals_mismatch", "medium", i.totals_issue) for i in invoices if i.totals_issue]
+
+
 def find_weekend_invoices(invoices: list[Invoice]) -> list[Anomaly]:
     return [Anomaly(i.id, "weekend_invoice", "low", f"dated on a weekend ({i.date})")
             for i in invoices if _day(i).weekday() >= 5]
@@ -338,6 +348,7 @@ def detect(invoices: list[Invoice], cfg: DetectionConfig = DEFAULT_CONFIG) -> li
         *find_new_vendor_large(invoices, cfg),
         *find_round_amounts(invoices),
         *find_weekend_invoices(invoices),
+        *find_totals_mismatch(invoices),
     ]
     if cfg.use_ml:
         found += find_ml_outliers(invoices, cfg)

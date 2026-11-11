@@ -16,9 +16,11 @@ const RULES = {
   below_threshold: ["Just under limit", "Amount is just below the approval threshold", "low"],
   round_amount: ["Round amount", "Suspiciously round figure", "low"],
   weekend_invoice: ["Weekend date", "Invoice is dated on a weekend", "low"],
+  totals_mismatch: ["Totals don't add up", "The invoice's line items, subtotal, tax and total don't agree", "mid"],
 };
 const ACTIONS = {
   login: "Signed in", login_failed: "Failed sign-in", file_imported: "Imported a file",
+  documents_imported: "Imported invoice documents", ai_document_read: "Sent a document for AI reading",
   report_exported: "Downloaded a report", workbook_exported: "Downloaded a checked workbook",
   invoices_imported: "Imported invoices", detection_run: "Ran detection", invoice_reviewed: "Reviewed an invoice",
   bank_account_viewed: "Viewed a bank account", user_created: "Added a user", settings_changed: "Changed settings",
@@ -843,18 +845,34 @@ async function uploadView() {
           downloadButton("Download", "GET", "/samples/" + encodeURIComponent(smp.name), undefined, "sm"))))));
   }
 
+  // Two kinds of upload: a list of invoices (an export, one per row), or invoice documents
+  // (one invoice per file: PDFs, Excel invoice forms, scans).
+  let mode = "list";
+  const modeTabs = () => h("div", { class: "tabs", role: "tablist", "aria-label": "What are you uploading?" },
+    [["list", "A list of invoices (export)"], ["docs", "Invoice documents (PDF, Excel, scans)"]].map(([id, label]) =>
+      h("button", { class: mode === id ? "on" : "", role: "tab", "aria-selected": String(mode === id), id: "mode-" + id,
+        onclick: () => { mode = id; if (id === "docs") docsChoose(); else chooseStep(); } }, label)));
+
+  // One spreadsheet goes to the list importer; PDFs, photos or several files are documents.
+  function routeFiles(list) {
+    const files = [...list];
+    if (files.length === 1 && /\.(xlsx|xlsm|csv|txt|tsv)$/i.test(files[0].name)) return readFile(files[0]);
+    mode = "docs";
+    docsRead(files);
+  }
+
   function chooseStep(error) {
-    const input = h("input", { type: "file", accept: ".xlsx,.xlsm,.csv,.txt,.tsv", class: "hidden", id: "file-input",
-      onchange: () => input.files[0] && readFile(input.files[0]) });
+    const input = h("input", { type: "file", multiple: true, accept: ".xlsx,.xlsm,.csv,.txt,.tsv,.pdf,.png,.jpg,.jpeg",
+      class: "hidden", id: "file-input", onchange: () => input.files.length && routeFiles(input.files) });
     const drop = h("div", { class: "drop",
       ondragover: (e) => { e.preventDefault(); drop.classList.add("over"); },
       ondragleave: () => drop.classList.remove("over"),
-      ondrop: (e) => { e.preventDefault(); drop.classList.remove("over"); if (e.dataTransfer.files[0]) readFile(e.dataTransfer.files[0]); } },
+      ondrop: (e) => { e.preventDefault(); drop.classList.remove("over"); if (e.dataTransfer.files.length) routeFiles(e.dataTransfer.files); } },
       h("div", { class: "big" }, "Drop an Excel or CSV file here"),
       h("p", { class: "muted" }, "An invoice export from QuickBooks, Xero, NetSuite, SAP or your own spreadsheet. Up to 10 MB."),
       h("button", { class: "btn primary", onclick: () => input.click() }, "Choose file"), input);
     const sampleBox = h("div");
-    put(holder, steps(1), error ? failure(error) : null, error ? spacer(12) : null, drop,
+    put(holder, modeTabs(), spacer(16), steps(1), error ? failure(error) : null, error ? spacer(12) : null, drop,
       spacer(16), h("p", { class: "muted small" },
         "Each row should be one invoice with at least an invoice number, vendor, amount and date. A bank account column is optional but enables the bank checks. Columns can have any names; you'll match them in the next step."),
       spacer(12), sampleBox);
@@ -932,6 +950,10 @@ async function uploadView() {
     } }, "Import invoices");
     drawPreview();
     put(holder, steps(2),
+      info.looks_like_document ? h("div", { class: "note", role: "note", id: "looks-like-document" },
+        "This looks like a single invoice rather than a list of invoices. ",
+        h("button", { class: "btn sm", onclick: () => { mode = "docs"; docsRead([file]); } }, "Read it as an invoice document")) : null,
+      info.looks_like_document ? spacer(12) : null,
       h("div", { class: "card" },
         h("h2", {}, "Which column is which?"),
         h("p", { class: "muted" }, `${filename}${info.sheet ? ` · sheet "${info.sheet}"` : ""} · ${whole.format(info.total_rows)} rows. `,
@@ -976,8 +998,206 @@ async function uploadView() {
     toast(`Imported ${whole.format(r.added)} invoices from ${filename}`);
   }
 
+  /* ---------------- invoice documents ---------------- */
+  let docSamples = null;
+  async function docsChoose(error) {
+    const input = h("input", { type: "file", multiple: true, class: "hidden", id: "doc-input",
+      accept: ".pdf,.xlsx,.xlsm,.png,.jpg,.jpeg,.tif,.tiff,.webp",
+      onchange: () => input.files.length && docsRead([...input.files]) });
+    const drop = h("div", { class: "drop",
+      ondragover: (e) => { e.preventDefault(); drop.classList.add("over"); },
+      ondragleave: () => drop.classList.remove("over"),
+      ondrop: (e) => { e.preventDefault(); drop.classList.remove("over"); if (e.dataTransfer.files.length) docsRead([...e.dataTransfer.files]); } },
+      h("div", { class: "big" }, "Drop invoices here"),
+      h("p", { class: "muted" }, "PDFs, Excel invoices, or photos and scans of paper invoices. Several at once is fine: up to 50 files, 10 MB each."),
+      h("button", { class: "btn primary", onclick: () => input.click() }, "Choose files"), input);
+    const sampleBox = h("div");
+    put(holder, modeTabs(), spacer(16), error ? failure(error) : null, error ? spacer(12) : null, drop, spacer(16),
+      h("p", { class: "muted small" }, "One invoice per file. You'll see what was read from each file and can correct it before anything is saved. Files are read on this server; nothing is sent elsewhere unless an admin has switched on AI reading in Settings."),
+      spacer(12), sampleBox);
+    try { docSamples = docSamples || await api("GET", "/samples/documents"); } catch { return; }
+    const tryBtn = h("button", { class: "btn primary", id: "try-docs", onclick: async () => {
+      tryBtn.disabled = true;
+      try {
+        docsRead(await Promise.all(docSamples.map(async (d) => {
+          const res = await fetch("/samples/documents/" + encodeURIComponent(d.name));
+          if (!res.ok) throw new Error("Couldn't load the sample invoices.");
+          return new File([await res.blob()], d.name);
+        })));
+      } catch (err) { docsChoose(err); }
+    } }, "Read the sample invoices");
+    put(sampleBox, h("h2", {}, "No invoices handy? Try these"),
+      h("p", { class: "muted small" }, "Made-up invoices from vendors in the sample data. Load the sample data first (Upload > A list of invoices > Try it) so the checks have history to compare with."),
+      h("ul", { class: "sample-docs" }, docSamples.map((d) => h("li", {}, h("span", { class: "mono small" }, d.name), " ", h("span", { class: "muted" }, d.description)))),
+      h("div", { class: "row" }, tryBtn, downloadButton("Download them", "GET", "/samples/invoice-documents.zip")));
+  }
+
+  async function docsRead(files) {
+    const extra = files.length > 50 ? files.length - 50 : 0;
+    files = files.slice(0, 50);
+    const status = h("p", { class: "muted", id: "doc-progress" }, `Reading ${files.length} file${files.length === 1 ? "" : "s"}…`);
+    const fill = h("div", { class: "fill" });
+    fill.style.width = "0%";
+    put(holder, modeTabs(), spacer(16), h("div", { class: "card" }, h("h2", {}, "Reading invoices"), status,
+      h("div", { class: "hbar" }, h("span", {}, ""), h("div", { class: "track" }, fill), h("span", {}, ""))));
+    const results = new Array(files.length);
+    let next = 0;
+    let done = 0;
+    async function worker() {   // three at a time: quick, without flooding the server
+      while (next < files.length) {
+        const i = next++;
+        const f = files[i];
+        try {
+          if (f.size > 10 * 1024 * 1024) throw new Error("This file is larger than 10 MB.");
+          const content = toBase64(await f.arrayBuffer());
+          results[i] = await api("POST", "/documents/extract", { filename: f.name, content_base64: content });
+        } catch (err) {
+          if (err.status === 401) throw err;
+          results[i] = { file: f.name, status: "unreadable", message: err.message };
+        }
+        done += 1;
+        status.textContent = `Read ${done} of ${files.length}: ${f.name}`;
+        fill.style.width = (100 * done / files.length) + "%";
+      }
+    }
+    try { await Promise.all([worker(), worker(), worker()]); } catch { return; }
+    if (extra) toast(`Only the first 50 files were read; ${extra} were left out.`, true);
+    docsReview(results);
+  }
+
+  const DOC_FIELDS = [["id", "Invoice #", "text"], ["vendor", "Vendor", "text"], ["date", "Invoice date", "date"],
+    ["amount", "Total", "number"], ["bank_account", "Bank account", "text"]];
+
+  function docsReview(results) {
+    const usable = results.filter((r) => r.draft);
+    const others = results.filter((r) => !r.draft);
+    const rows = usable.map((r) => ({ r, include: true, inputs: {} }));
+    const err = h("div", { class: "error-box hidden", role: "alert" });
+    const addBtn = h("button", { class: "btn primary", id: "add-docs" });
+    const count = () => {
+      const n = rows.filter((st) => st.include).length;
+      addBtn.textContent = `Add ${n} invoice${n === 1 ? "" : "s"}`;
+      addBtn.disabled = n === 0;
+    };
+    const tbody = h("tbody", {}, rows.map((st, index) => {
+      const r = st.r;
+      const cells = DOC_FIELDS.map(([f, label, type]) => {
+        const value = r.fields[f];
+        const empty = value === null || value === undefined || value === "";
+        const unsure = !empty && (r.confidence[f] ?? 1) < 0.75;
+        const shown = empty ? "" : f === "amount" ? Number(value).toFixed(2) : value;
+        const input = h("input", { type, value: shown, id: `doc-${index}-${f}`,
+          "aria-label": `${label} for ${r.file}`, step: type === "number" ? "0.01" : null, min: type === "number" ? "0" : null,
+          class: "doc-input" + (empty && f !== "bank_account" ? " missing" : unsure ? " unsure" : ""),
+          placeholder: empty && f !== "bank_account" ? "Type it in" : null,
+          title: empty ? (f === "bank_account" ? "Not on this invoice" : "Not found on the invoice: type it in")
+            : `${unsure ? "Not sure about this. " : ""}Read from: “${r.source[f] || value}”`,
+          oninput: () => input.classList.remove("missing", "unsure") });
+        st.inputs[f] = input;
+        return h("td", { class: "c-" + f }, input);
+      });
+      const include = h("input", { type: "checkbox", checked: true, "aria-label": `Include ${r.file}`,
+        onchange: () => {
+          st.include = include.checked;
+          [tr, notes].forEach((row) => row && row.classList.toggle("excluded", !include.checked));
+          count();
+        } });
+      const tr = h("tr", { class: "doc-row" + (r.warnings.length ? " has-notes" : "") }, h("td", {}, include),
+        h("td", { class: "doc-file" }, h("div", { class: "small" }, r.file), h("div", { class: "muted small" }, r.method)),
+        cells);
+      // Notes go on their own line under the invoice, full width, so they're never cut off.
+      const notes = r.warnings.length ? h("tr", { class: "doc-notes" }, h("td", {}),
+        h("td", { colspan: String(DOC_FIELDS.length + 1) }, h("ul", {}, r.warnings.map((w) => h("li", {}, w))))) : null;
+      return [tr, notes];
+    }));
+    count();
+    const detect = h("input", { type: "checkbox", id: "doc-detect", checked: true });
+    addBtn.onclick = async () => {
+      err.classList.add("hidden");
+      const items = [];
+      let missing = 0;
+      for (const st of rows.filter((x) => x.include)) {
+        const item = { draft: st.r.draft, file: st.r.file };
+        for (const [f] of DOC_FIELDS) {
+          const v = st.inputs[f].value.trim();
+          item[f] = f === "amount" ? (v === "" ? null : Number(v)) : (v || null);
+          if (f !== "bank_account" && !v) { st.inputs[f].classList.add("missing"); missing += 1; }
+        }
+        items.push(item);
+      }
+      if (missing) {
+        err.textContent = "Fill in the boxes outlined in red, or untick those invoices.";
+        return err.classList.remove("hidden");
+      }
+      addBtn.disabled = true;
+      addBtn.textContent = "Adding…";
+      try {
+        const res = await api("POST", "/documents/import", { items, run_detection: detect.checked });
+        await refreshCount();
+        updateNavCount();
+        docsResult(res);
+      } catch (ex) {
+        if (ex.status === 401) return;
+        err.textContent = ex.message;
+        err.classList.remove("hidden");
+        count();
+      }
+    };
+    const unsureCount = rows.filter((st) => Object.values(st.inputs).some((i) => i.classList.contains("unsure") || i.classList.contains("missing"))).length;
+    put(holder, modeTabs(), spacer(16),
+      h("div", { class: "section-head" }, h("h2", {}, "Check what was read"), h("span", { class: "spacer" }),
+        h("span", { class: "muted small" }, `${usable.length} of ${results.length} file${results.length === 1 ? "" : "s"} read` +
+          (unsureCount ? ` · ${unsureCount} to look at` : ""))),
+      h("p", { class: "muted" }, "Amber boxes are ones the reader wasn't sure about; red ones are missing. Hover over a box to see the text it came from. Nothing is saved until you add the invoices."),
+      usable.length ? h("div", { class: "table-wrap" }, h("table", { class: "doc-table" },
+        h("thead", {}, h("tr", {}, h("th", {}, ""), h("th", {}, "File"), DOC_FIELDS.map(([, label]) => h("th", {}, label)))),
+        tbody)) : null,
+      others.length ? h("div", {}, spacer(16), h("h2", {}, "Not added"),
+        h("div", { class: "table-wrap" }, h("table", { id: "doc-others" },
+          h("thead", {}, h("tr", {}, h("th", {}, "File"), h("th", {}, "Why"))),
+          h("tbody", {}, others.map((r) => h("tr", {}, h("td", { class: "mono small" }, r.file), h("td", {}, r.message))))))) : null,
+      spacer(16), err, spacer(8),
+      h("div", { class: "row" },
+        h("label", { class: "row", for: "doc-detect" }, detect, "Run detection after adding"),
+        h("span", { class: "spacer" }),
+        h("button", { class: "btn", onclick: () => docsChoose() }, "Start again"),
+        usable.length ? addBtn : null));
+  }
+
+  async function docsResult(r) {
+    const kpi = (label, value, alert) => h("div", { class: "card kpi result-kpis" + (alert ? " alert" : "") },
+      h("div", { class: "label" }, label), h("div", { class: "value" }, whole.format(value)));
+    let flagged = [];
+    if (r.detection && r.ids.length) {
+      try {
+        const queue = await api("GET", "/review-queue?limit=500");
+        flagged = queue.filter((q) => r.ids.includes(q.invoice_id));
+      } catch { flagged = []; }
+    }
+    put(holder, modeTabs(), spacer(16),
+      h("div", { class: "kpis" }, kpi("Invoices added", r.added), kpi("Skipped", r.skipped.length, r.skipped.length > 0),
+        kpi("Fields you corrected", r.fields_corrected), r.detection ? kpi("Flagged for review", flagged.length, flagged.length > 0) : null),
+      flagged.length ? h("div", {}, h("h2", {}, "Flagged from these invoices"),
+        h("div", { class: "table-wrap" }, h("table", { id: "doc-flagged" },
+          h("thead", {}, h("tr", {}, h("th", {}, "Risk"), h("th", {}, "Invoice"), h("th", {}, "Vendor"), h("th", { class: "num" }, "Amount"), h("th", {}, "Why flagged"))),
+          h("tbody", {}, flagged.map((q) => h("tr", {},
+            h("td", {}, h("span", { class: "risk " + riskClass(q.risk) }, h("span", { class: "n" }, q.risk))),
+            h("td", { class: "mono" }, q.invoice_id), h("td", {}, q.vendor), h("td", { class: "num" }, fmtAmount(q.amount)),
+            h("td", {}, h("div", { class: "chips" }, q.rules.map((rule) => h("span", { class: "chip " + ruleLevel(rule), title: (RULES[rule] || [, ""])[1] }, ruleLabel(rule)))))))))),
+        spacer(16)) : null,
+      r.skipped.length ? h("div", {}, h("h2", {}, "Skipped"),
+        h("div", { class: "table-wrap" }, h("table", {},
+          h("thead", {}, h("tr", {}, h("th", {}, "File"), h("th", {}, "Why"))),
+          h("tbody", {}, r.skipped.map((x) => h("tr", {}, h("td", { class: "mono small" }, x.file || ""), h("td", {}, x.reason))))))
+      , spacer(16)) : null,
+      h("div", { class: "row" },
+        r.detection ? h("a", { class: "btn primary", href: "#/review" }, "Open review queue") : null,
+        h("button", { class: "btn", onclick: () => docsChoose() }, "Read more invoices")));
+    toast(`Added ${whole.format(r.added)} invoice${r.added === 1 ? "" : "s"} from documents`);
+  }
+
   chooseStep();
-  return h("div", {}, pageHead("Upload invoices", "Add invoices from an Excel or CSV export."), holder);
+  return h("div", {}, pageHead("Upload invoices", "Add invoices from an export, or from the invoices themselves."), holder);
 }
 
 /* ------------------------------------------------------------ invoices */
@@ -1039,11 +1259,14 @@ async function settingsView() {
   const threshold = h("input", { id: "threshold", type: "number", min: "1", step: "1", value: cfg.approval_threshold, disabled: !isAdmin });
   const require2fa = h("input", { id: "require-2fa", type: "checkbox", checked: cfg.require_2fa,
     disabled: !isAdmin || (!me.two_factor_enabled && !cfg.require_2fa) });
+  const aiReading = h("input", { id: "ai-reading", type: "checkbox", checked: cfg.ai_extraction,
+    disabled: !isAdmin || (!cfg.ai_available && !cfg.ai_extraction) });
   const company = h("div", { class: "card" }, h("h2", {}, "Company settings"),
     h("form", { class: "form", onsubmit: async (e) => {
       e.preventDefault();
       try {
-        await api("PUT", "/settings", { approval_threshold: Number(threshold.value), require_2fa: require2fa.checked });
+        await api("PUT", "/settings", { approval_threshold: Number(threshold.value), require_2fa: require2fa.checked,
+          ai_extraction: aiReading.checked });
         toast("Saved. Run detection to apply a new threshold to existing invoices.");
       } catch (err) { toast(err.message, true); }
     } },
@@ -1053,6 +1276,10 @@ async function settingsView() {
       h("p", { class: "muted small" }, isAdmin && !me.two_factor_enabled && !cfg.require_2fa
         ? h("span", {}, "Turn on two-factor for your own account first (", h("a", { href: "#/security" }, "Your account"), "), so you can't lock yourself out.")
         : "People without it are asked to set it up the next time they sign in. Single sign-on users are covered by their provider's own two-factor."),
+      h("label", { class: "row", for: "ai-reading" }, aiReading, "Use AI to read invoices the app can't read by itself"),
+      h("p", { class: "muted small" }, cfg.ai_available
+        ? "Only for scans, photos and unusual layouts that come back incomplete. Those files are sent to Anthropic (Claude) to be read, and each one is noted in the activity log. Everything else is read on this server."
+        : "Not available: the server has no Anthropic API key (ANTHROPIC_API_KEY). Invoices are read on this server only."),
       isAdmin ? h("div", {}, h("button", { class: "btn primary", type: "submit" }, "Save")) : h("p", { class: "muted small" }, "Only admins can change these.")));
 
   const you = h("div", { class: "card" }, h("h2", {}, "Your account"),

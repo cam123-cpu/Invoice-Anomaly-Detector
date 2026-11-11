@@ -49,6 +49,9 @@ RULE_FIX = {
                         "Check whether the amount was set to stay under the approval limit; if so, get the "
                         "approval it should have had."),
     "round_amount": ("hold", "Ask the vendor for an itemised breakdown supporting the round figure."),
+    "totals_mismatch": ("hold",
+                        "Recalculate the invoice. Pay only the correct amount, and ask the vendor for a corrected "
+                        "invoice; if the total looks altered, confirm it with the vendor by phone."),
     "weekend_invoice": ("hold",
                         "Confirm the delivery or work date. A weekend date can mean a backdated or invented "
                         "invoice."),

@@ -27,6 +27,10 @@ class TenantSeedMixin:
                                      Anomaly("INV-2", "round_amount", "low", "b-flag")])
         self.app.set_review(self.a, "INV-1", "confirmed", "alice")
         self.app.set_review(self.b, "INV-2", "dismissed", "bob")
+        for org, who in ((self.a, "alice"), (self.b, "bob")):  # both received the very same PDF
+            self.app.add_document_invoices(org, [{"id": "DOC-1", "vendor": "Acme", "amount": 50.0,
+                                                  "date": "2026-01-07", "sha256": "f" * 64, "filename": "a.pdf",
+                                                  "method": "PDF text", "totals_issue": f"{who}-issue"}], who)
 
 
 class TenantIsolationTests(TenantSeedMixin, DbTestCase):
@@ -35,8 +39,8 @@ class TenantIsolationTests(TenantSeedMixin, DbTestCase):
         self.seed()
 
     def test_same_invoice_id_can_exist_in_both_companies(self):
-        self.assertEqual([i["id"] for i in self.app.list_invoices(self.a)], ["INV-1"])
-        self.assertEqual([i["id"] for i in self.app.list_invoices(self.b)], ["INV-1", "INV-2"])
+        self.assertEqual([i["id"] for i in self.app.list_invoices(self.a)], ["INV-1", "DOC-1"])
+        self.assertEqual([i["id"] for i in self.app.list_invoices(self.b)], ["INV-1", "INV-2", "DOC-1"])
 
     def test_reads_are_scoped_to_one_company(self):
         self.assertEqual({a["detail"] for a in self.app.list_anomalies(self.a)}, {"a-flag"})
@@ -44,7 +48,10 @@ class TenantIsolationTests(TenantSeedMixin, DbTestCase):
         self.assertEqual(self.app.feedback_counts(self.a), {"duplicate": (1, 0)})
         self.assertEqual([u["username"] for u in self.app.list_users(self.a)], ["alice"])
         self.assertEqual({e["username"] for e in self.app.list_audit(self.a)}, {"alice"})
-        self.assertEqual(len(self.app.detection_inputs(self.a)), 1)
+        self.assertEqual(len(self.app.detection_inputs(self.a)), 2)
+        self.assertEqual({i.totals_issue for i in self.app.detection_inputs(self.a)}, {None, "alice-issue"})
+        self.assertEqual(self.app.document_by_hash(self.a, "f" * 64)["uploaded_by"], "alice")
+        self.assertEqual(self.app.document_stats(self.a)["documents"], 1)
         self.assertEqual(self.app.get_org(self.a)["name"], "Company A")
 
     def test_cannot_fetch_another_companys_invoice_by_id(self):

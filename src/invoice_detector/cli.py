@@ -10,6 +10,7 @@
   python -m invoice_detector.cli import COMPANY FILE            # Excel (.xlsx) or CSV; columns detected automatically
   python -m invoice_detector.cli detect COMPANY                 # run detection, print the review queue
   python -m invoice_detector.cli evaluate                       # score the detector on synthetic data
+  python -m invoice_detector.cli evaluate-documents [N]         # score invoice-document reading
   python -m invoice_detector.cli gen-keys                       # print fresh secrets (for a secrets manager)
   python -m invoice_detector.cli init-deploy DIR                # secret files for docker-compose.prod.yml
 """
@@ -211,6 +212,17 @@ def main(argv: list[str]) -> int:
         print(_fresh_secrets(), end="")
     elif cmd == "evaluate" and not args:
         print(format_report(evaluate()))
+    elif cmd == "evaluate-documents" and len(args) <= 1:
+        from .doc_samples import evaluate_documents
+        report = evaluate_documents(int(args[0]) if args else 100)
+        print(f"Read {report['documents']} generated invoice documents (PDF and Excel, four layouts):")
+        for field, acc in report["accuracy"].items():
+            print(f"  {field:13s} {acc:.1%}" if acc is not None else f"  {field:13s} -")
+        t = report["totals_check"]
+        print(f"  totals check  caught {t['caught']} planted errors, missed {t['missed']}, "
+              f"{t['false_alarms']} false alarms")
+        for m in report["mistakes"][:10]:
+            print(f"    {m['file']} ({m['layout']}): {m['field']} expected {m['expected']!r}, read {m['read']!r}")
     elif cmd == "migrate" and not args:
         with _db(check_keys=False) as db:
             db.migrate()
