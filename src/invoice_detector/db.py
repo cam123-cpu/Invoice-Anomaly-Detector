@@ -202,16 +202,20 @@ class Database:
     # ----- company settings -----
     def get_org(self, org_id: str) -> dict:
         with self._tx(org_id) as run:
-            rows = run("SELECT id, name, approval_threshold, require_2fa FROM orgs WHERE id = ?", (org_id,))
+            rows = run("SELECT id, name, approval_threshold, require_2fa, ai_extraction FROM orgs WHERE id = ?",
+                       (org_id,))
         if not rows:
             raise KeyError(org_id)
         org = rows[0]
         org["require_2fa"] = bool(org["require_2fa"])
+        org["ai_extraction"] = bool(org["ai_extraction"])
         return org
 
     def set_org_settings(self, org_id: str, approval_threshold: float | None = None,
-                         require_2fa: bool | None = None) -> None:
+                         require_2fa: bool | None = None, ai_extraction: bool | None = None) -> None:
         with self._tx(org_id) as run:
+            if ai_extraction is not None:
+                run("UPDATE orgs SET ai_extraction = ? WHERE id = ?", (int(ai_extraction), org_id))
             if approval_threshold is not None:
                 run("UPDATE orgs SET approval_threshold = ? WHERE id = ?", (approval_threshold, org_id))
             if require_2fa is not None:
@@ -359,10 +363,58 @@ class Database:
 
     def detection_inputs(self, org_id: str) -> list[Invoice]:
         with self._tx(org_id) as run:
-            rows = run("SELECT id, vendor, amount, invoice_date, bank_idx FROM invoices "
-                       "WHERE org_id = ?", (org_id,))
-        return [Invoice(r["id"], r["vendor"], r["amount"], r["invoice_date"], r["bank_idx"])
+            rows = run("SELECT i.id, i.vendor, i.amount, i.invoice_date, i.bank_idx, d.totals_issue "
+                       "FROM invoices i LEFT JOIN documents d ON d.org_id = i.org_id AND d.invoice_id = i.id "
+                       "WHERE i.org_id = ?", (org_id,))
+        return [Invoice(r["id"], r["vendor"], r["amount"], r["invoice_date"], r["bank_idx"], r["totals_issue"])
                 for r in rows]
+
+    # ----- invoice documents -----
+    def document_by_hash(self, org_id: str, sha256: str) -> dict | None:
+        with self._tx(org_id) as run:
+            rows = run("SELECT filename, invoice_id, uploaded_by, uploaded_at FROM documents "
+                       "WHERE org_id = ? AND sha256 = ?", (org_id, sha256))
+        return rows[0] if rows else None
+
+    def vendor_names(self, org_id: str) -> list[str]:
+        with self._tx(org_id) as run:
+            return [r["vendor"] for r in run("SELECT DISTINCT vendor FROM invoices WHERE org_id = ?", (org_id,))]
+
+    def add_document_invoices(self, org_id: str, rows: list[dict], created_by: str) -> list[str]:
+        """Each row: an invoice plus its document record, saved together in one transaction
+        (both or neither). Returns invoice ids skipped because they were already stored."""
+        vault = self.vault(org_id)
+        now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        skipped = []
+        mark = (lambda q: q.replace("?", "%s")) if self.is_postgres else (lambda q: q)
+        with self._tx(org_id):
+            for r in rows:
+                bank = r.get("bank_account")
+                inserted = self.conn.execute(mark(
+                    "INSERT INTO invoices (org_id, id, vendor, amount, invoice_date, bank_enc, bank_idx, created_by) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (org_id, id) DO NOTHING"),
+                    (org_id, r["id"], r["vendor"], r["amount"], r["date"],
+                     vault.encrypt(bank, f"invoices.bank:{org_id}:{r['id']}") if bank else None,
+                     vault.blind_index(normalize_account(bank)) if bank else None, created_by)).rowcount
+                if not inserted:
+                    skipped.append(r["id"])
+                    continue
+                self.conn.execute(mark(
+                    "INSERT INTO documents (org_id, sha256, filename, method, invoice_id, totals_issue, corrections, "
+                    "uploaded_by, uploaded_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT DO NOTHING"),
+                    (org_id, r["sha256"], r["filename"], r["method"], r["id"], r.get("totals_issue"),
+                     json.dumps(r.get("corrections") or {}), created_by, now))
+        return skipped
+
+    def document_stats(self, org_id: str) -> dict:
+        """How well documents are being read: how many, and how many fields people corrected."""
+        with self._tx(org_id) as run:
+            rows = run("SELECT method, corrections FROM documents WHERE org_id = ?", (org_id,))
+        corrected = sum(len(json.loads(r["corrections"] or "{}")) for r in rows)
+        by_method: dict[str, int] = {}
+        for r in rows:
+            by_method[r["method"]] = by_method.get(r["method"], 0) + 1
+        return {"documents": len(rows), "fields_corrected": corrected, "by_method": by_method}
 
     # ----- flags -----
     def save_flags(self, org_id: str, anomalies: list[Anomaly]) -> None:

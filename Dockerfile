@@ -1,8 +1,11 @@
 FROM python:3.12-slim
+# Tesseract reads scanned and photographed invoices (OCR), entirely inside this container.
+RUN apt-get update && apt-get install -y --no-install-recommends tesseract-ocr \
+    && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 COPY pyproject.toml ./
 COPY src ./src
-RUN pip install --no-cache-dir ".[postgres]"
+RUN pip install --no-cache-dir ".[postgres,ocr]"
 COPY deploy/entrypoint.sh /entrypoint.sh
 RUN chmod 755 /entrypoint.sh && useradd --create-home app && mkdir /data && chown app /data
 USER app

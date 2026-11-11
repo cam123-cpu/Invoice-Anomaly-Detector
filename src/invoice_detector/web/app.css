@@ -237,6 +237,27 @@ th .maps { display: block; color: var(--brand); font-size: var(--fs-xs); font-we
 .sample-title { font-weight: 600; }
 .note select { margin: 0 var(--s1); padding: var(--s1) var(--s2); }
 
+/* ---------- invoice documents ---------- */
+.doc-table td { vertical-align: top; }
+.doc-table input.doc-input { width: 100%; min-width: 6.5em; padding: var(--s1) var(--s2); }
+.doc-table .c-vendor input { min-width: 10em; }
+.doc-table .c-date input { min-width: 9.5em; }
+.doc-table .c-amount input { min-width: 7em; text-align: right; }
+.doc-table .c-bank_account input { min-width: 11em; font-family: var(--mono); font-size: var(--fs-sm); }
+.doc-input.unsure { border-color: var(--amber); background: var(--amber-soft); }
+.doc-input.missing { border-color: var(--red); background: var(--red-soft); }
+.doc-file { min-width: 10em; max-width: 16em; overflow-wrap: anywhere; }
+.doc-table tr.has-notes td { border-bottom: 0; padding-bottom: var(--s1); }
+.doc-table tr.doc-notes td { padding-top: 0; }
+.doc-notes ul { margin: 0; padding: var(--s2) var(--s3) var(--s2) var(--s5); font-size: var(--fs-sm);
+  background: var(--amber-soft); border-left: 3px solid var(--amber); }
+.doc-notes li + li { margin-top: var(--s1); }
+tr.excluded td { background: var(--panel-2); color: var(--muted); }
+tr.excluded input.doc-input { background: var(--disabled-bg); border-color: var(--line); }
+tr.excluded .doc-notes ul, tr.doc-notes.excluded ul { background: var(--panel-2); border-left-color: var(--line); }
+.sample-docs { margin: 0 0 var(--s3); padding-left: var(--s5); }
+.sample-docs li { margin: var(--s1) 0; }
+
 /* ---------- sign-in and account ---------- */
 .sso { display: grid; gap: var(--s2); }
 .sso-btn { justify-content: center; }

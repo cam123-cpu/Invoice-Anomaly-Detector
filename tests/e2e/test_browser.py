@@ -67,6 +67,12 @@ def free_port() -> int:
         return s.getsockname()[1]
 
 
+def _hlp_invoice() -> bytes:
+    sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
+    from doc_templates import simple_business_invoice
+    return simple_business_invoice()[0]
+
+
 @unittest.skipUnless(RUN, "set RUN_E2E=1 to run the browser test")
 class BrowserTest(unittest.TestCase):
     @classmethod
@@ -387,6 +393,50 @@ class BrowserTest(unittest.TestCase):
         self.assertEqual(p.inner_text(".kpi:has-text('Invoices added') .value"), "260")
         p.click("a:text('Open review queue')")
         p.wait_for_selector("td.mono:text('RE-2026-0251')")
+        self.assertEqual(self.errors, [])
+
+    def test_invoice_documents(self):
+        """PDF and Excel invoices (not a list): read, checked by a person, added, flagged.
+        Runs after test_full_workflow (alphabetical order), so Acme already has history."""
+        p = self.page
+        self.login("alice")
+        p.goto(self.base + "/#/upload")
+        p.click("#mode-docs")
+        p.click("#try-docs")
+        p.wait_for_selector("text=Check what was read")
+        self.assertEqual(p.locator(".doc-table tbody tr.doc-row").count(), 4)
+        self.assertIn("don't add up", p.inner_text(".doc-table tbody"))
+        self.assertEqual(p.locator(".doc-input.missing").count(), 0)
+        stark = p.locator(".doc-table tbody tr:has-text('stark-freight-8811.pdf')")
+        self.assertEqual(stark.locator(".c-id input").input_value(), "SF-8811")
+        self.assertEqual(stark.locator(".c-bank_account input").input_value(), "GB29NWBK60161331926819")
+        self.shot("15-documents-review")
+        # A person corrects a field; the correction is recorded.
+        wayne = p.locator(".doc-table tbody tr:has-text('wayne-office-1042.pdf') .c-vendor input")
+        wayne.fill("Wayne Office")
+        p.click("#add-docs")
+        p.wait_for_selector("#doc-flagged")
+        flagged = p.inner_text("#doc-flagged")
+        for label in ("Totals don't add up", "New bank account", "Look-alike vendor"):
+            self.assertIn(label, flagged)
+        self.assertEqual(p.inner_text(".kpi:has-text('Invoices added') .value"), "4")
+        self.shot("16-documents-result")
+        # The same files again: recognised, nothing added twice.
+        p.click("button:text('Read more invoices')")
+        p.click("#try-docs")
+        p.wait_for_selector("#doc-others")
+        self.assertEqual(p.locator("#doc-others tbody tr").count(), 4)
+        self.assertIn("already imported", p.inner_text("#doc-others"))
+        # An invoice form uploaded as a list is recognised as a document.
+        p.click("#mode-list")
+        p.set_input_files("#file-input", files=[{"name": "hlp.xlsx", "mimeType": "application/octet-stream",
+                                                  "buffer": _hlp_invoice()}])
+        p.wait_for_selector("#looks-like-document")
+        p.click("#looks-like-document button")
+        p.wait_for_selector("text=Check what was read")
+        row = p.locator(".doc-table tbody tr.doc-row")
+        self.assertEqual(row.locator(".c-id input").input_value(), "100")
+        self.assertEqual(row.locator(".c-date input").input_value(), "2023-11-09")
         self.assertEqual(self.errors, [])
 
     def test_two_factor_set_up_and_sign_in(self):

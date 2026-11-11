@@ -12,7 +12,8 @@ CREATE TABLE IF NOT EXISTS orgs (
   id TEXT PRIMARY KEY,
   name TEXT NOT NULL UNIQUE,
   approval_threshold {REAL} NOT NULL DEFAULT 10000 CHECK (approval_threshold > 0),
-  require_2fa INTEGER NOT NULL DEFAULT 0
+  require_2fa INTEGER NOT NULL DEFAULT 0,
+  ai_extraction INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS users (
   username TEXT PRIMARY KEY,
@@ -56,6 +57,22 @@ CREATE TABLE IF NOT EXISTS reviews (
   PRIMARY KEY (org_id, invoice_id),
   FOREIGN KEY (org_id, invoice_id) REFERENCES invoices(org_id, id)
 );
+-- Invoices read from documents (PDF, Excel form, scan). The file itself is never stored:
+-- only its fingerprint (so the same file can't be imported twice), how it was read, any
+-- arithmetic problem printed on it, and which fields a person corrected.
+CREATE TABLE IF NOT EXISTS documents (
+  org_id TEXT NOT NULL REFERENCES orgs(id),
+  sha256 TEXT NOT NULL,
+  filename TEXT NOT NULL,
+  method TEXT NOT NULL,
+  invoice_id TEXT NOT NULL,
+  totals_issue TEXT,
+  corrections TEXT NOT NULL DEFAULT '{}',
+  uploaded_by TEXT NOT NULL,
+  uploaded_at TEXT NOT NULL,
+  PRIMARY KEY (org_id, sha256),
+  FOREIGN KEY (org_id, invoice_id) REFERENCES invoices(org_id, id)
+);
 CREATE TABLE IF NOT EXISTS meta (
   key TEXT PRIMARY KEY,
   value TEXT NOT NULL
@@ -86,6 +103,7 @@ ADDED_COLUMNS = [
     ("users", "totp_enabled", "INTEGER NOT NULL DEFAULT 0"),
     ("users", "totp_last_step", "INTEGER"),
     ("users", "recovery_codes", "TEXT"),
+    ("orgs", "ai_extraction", "INTEGER NOT NULL DEFAULT 0"),
 ]
 
 # Idempotent: safe to run on every deploy.
@@ -116,9 +134,10 @@ GRANT EXECUTE ON FUNCTION app_org_id() TO invoice_app;
 
 -- Least privilege: the app cannot create companies, cannot edit or delete invoices,
 -- and cannot change or delete audit records.
-REVOKE ALL ON orgs, users, invoices, anomalies, reviews, audit_log, meta FROM PUBLIC, invoice_app;
+REVOKE ALL ON orgs, users, invoices, anomalies, reviews, audit_log, meta, documents FROM PUBLIC, invoice_app;
 GRANT SELECT ON orgs TO invoice_app;
-GRANT UPDATE (approval_threshold, require_2fa) ON orgs TO invoice_app;
+GRANT UPDATE (approval_threshold, require_2fa, ai_extraction) ON orgs TO invoice_app;
+GRANT SELECT, INSERT ON documents TO invoice_app;  -- a record of what was imported: never edited
 GRANT SELECT, INSERT ON users TO invoice_app;
 GRANT UPDATE (password_hash, totp_secret, totp_enabled, totp_last_step, recovery_codes) ON users TO invoice_app;
 GRANT SELECT, INSERT ON meta TO invoice_app;  -- holds only the encryption-key check
@@ -133,6 +152,7 @@ ALTER TABLE invoices  ENABLE ROW LEVEL SECURITY;
 ALTER TABLE anomalies ENABLE ROW LEVEL SECURITY;
 ALTER TABLE reviews   ENABLE ROW LEVEL SECURITY;
 ALTER TABLE audit_log ENABLE ROW LEVEL SECURITY;
+ALTER TABLE documents ENABLE ROW LEVEL SECURITY;
 -- With RLS on, a row is visible or writable only if a policy allows it. With no
 -- company set, app_org_id() is NULL, nothing matches, and every table looks empty.
 
@@ -150,6 +170,9 @@ CREATE POLICY tenant_isolation ON anomalies
   USING (org_id = app_org_id()) WITH CHECK (org_id = app_org_id());
 DROP POLICY IF EXISTS tenant_isolation ON reviews;
 CREATE POLICY tenant_isolation ON reviews
+  USING (org_id = app_org_id()) WITH CHECK (org_id = app_org_id());
+DROP POLICY IF EXISTS tenant_isolation ON documents;
+CREATE POLICY tenant_isolation ON documents
   USING (org_id = app_org_id()) WITH CHECK (org_id = app_org_id());
 DROP POLICY IF EXISTS tenant_isolation ON audit_log;
 CREATE POLICY tenant_isolation ON audit_log

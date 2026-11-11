@@ -29,12 +29,22 @@ jobs:
           cache-dependency-path: pyproject.toml
       - name: Install
         run: pip install -e ".[dev]"
+      - name: Install OCR (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get install -y -qq tesseract-ocr > /dev/null
+          pip install -e ".[ocr]"
       - name: Lint
         run: ruff check .
       - name: Test
-        run: pytest -v
+        run: pytest -v -rs
+      - name: OCR tests really ran (Linux)
+        if: runner.os == 'Linux'
+        run: pytest -q tests/test_documents.py -k Ocr -rs | tee ocr.txt && ! grep -q "skipped" ocr.txt
       - name: Model quality report
         run: python -m invoice_detector.cli evaluate
+      - name: Document reading report
+        run: python -m invoice_detector.cli evaluate-documents 200
 
   postgres:
     name: test (PostgreSQL 16, row-level security)

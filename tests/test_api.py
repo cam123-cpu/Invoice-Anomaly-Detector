@@ -560,5 +560,71 @@ class SignInApiTests(DbTestCase):
         self.assertGreater(checked, 25)
 
 
+
+@unittest.skipUnless(HAVE_API_DEPS, "fastapi/httpx not installed")
+class DocumentApiTests(DbTestCase):
+    """Invoice documents end to end over HTTP, with files read in an isolated process."""
+
+    def setUp(self):
+        super().setUp()
+        from fastapi.testclient import TestClient
+        from invoice_detector.api import create_app
+        from invoice_detector.doc_samples import sample_docs
+
+        self.client = forget_cookies(TestClient(create_app(make_settings(), db=self.app)))
+        self.app.create_user(self.a, "alice", PW_A, "admin")
+        self.app.create_user(self.a, "audit1", "auditor-password-123", "auditor")
+        self.h = {"Authorization": "Bearer " + self.client.post(
+            "/login", json={"username": "alice", "password": PW_A}).json()["access_token"]}
+        self.samples = {name: data for name, data, _ in sample_docs()}
+
+    def extract(self, name, data=None, headers=None):
+        body = {"filename": name, "content_base64": base64.b64encode(data or self.samples[name]).decode()}
+        return self.client.post("/documents/extract", json=body, headers=headers or self.h)
+
+    def test_read_check_and_import(self):
+        drafts = [self.extract(n).json() for n in ("umbrella-ltd-3307.xlsx", "stark-freight-8811.pdf")]
+        self.assertEqual([d["status"] for d in drafts], ["ready", "ready"])
+        self.assertTrue(any("add up" in w for w in drafts[0]["warnings"]))
+        items = [{"draft": d["draft"], "file": d["file"], **d["fields"]} for d in drafts]
+        result = self.client.post("/documents/import", json={"items": items}, headers=self.h).json()
+        self.assertEqual(result["added"], 2)
+        self.assertEqual(result["detection"]["invoices_checked"], 2)
+        queue = self.client.get("/review-queue", headers=self.h).json()
+        self.assertIn("totals_mismatch", next(q for q in queue if q["invoice_id"] == "3307")["rules"])
+        self.assertEqual(self.client.get("/documents/stats", headers=self.h).json()["documents"], 2)
+        self.assertEqual(self.extract("umbrella-ltd-3307.xlsx").json()["status"], "already_imported")
+
+    def test_unreadable_and_forbidden(self):
+        self.assertEqual(self.extract("x.pdf", b"%PDF-1.4 broken").json()["status"], "unreadable")
+        auditor = {"Authorization": "Bearer " + self.client.post(
+            "/login", json={"username": "audit1", "password": "auditor-password-123"}).json()["access_token"]}
+        self.assertEqual(self.extract("stark-freight-8811.pdf", headers=auditor).status_code, 403)
+        bad = self.client.post("/documents/extract", json={"filename": "x.pdf", "content_base64": "%%%"},
+                               headers=self.h)
+        self.assertEqual(bad.status_code, 422)
+
+    def test_an_invoice_form_uploaded_as_a_list_is_recognised(self):
+        from doc_templates import TEMPLATES
+        data, _ = TEMPLATES["Simple business invoice"]()
+        body = {"filename": "hlp.xlsx", "content_base64": base64.b64encode(data).decode()}
+        self.assertTrue(self.client.post("/import/preview", json=body, headers=self.h).json()["looks_like_document"])
+
+    def test_ai_reading_needs_a_server_key(self):
+        refused = self.client.put("/settings", json={"ai_extraction": True}, headers=self.h)
+        self.assertEqual(refused.status_code, 409)
+        self.assertEqual(self.client.get("/settings", headers=self.h).json()["ai_available"], False)
+
+    def test_sample_documents_download(self):
+        import zipfile
+        r = self.client.get("/samples/invoice-documents.zip")
+        self.assertEqual(r.headers["content-type"], "application/zip")
+        self.assertEqual(len(zipfile.ZipFile(io.BytesIO(r.content)).namelist()), 4)
+        listed = self.client.get("/samples/documents").json()
+        self.assertEqual(len(listed), 4)
+        one = self.client.get("/samples/documents/" + listed[1]["name"])
+        self.assertTrue(one.content.startswith(b"%PDF"))
+        self.assertEqual(self.client.get("/samples/documents/../../etc/passwd").status_code, 404)
+
 if __name__ == "__main__":
     unittest.main()
