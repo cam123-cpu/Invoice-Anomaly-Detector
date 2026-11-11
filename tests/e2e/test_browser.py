@@ -228,7 +228,9 @@ class BrowserTest(unittest.TestCase):
         p.click("nav a[href='#/dashboard']")
         p.wait_for_selector("text=How each check is performing")
         self.assertIn("1", p.inner_text(".kpi:has-text('Confirmed problems') .value"))
-        self.assertIn("1 invoice", p.inner_text(".d-card.d-do_not_pay"))
+        stopped = p.inner_text(".ledger tr:has(.swatch.d-do_not_pay)")
+        self.assertIn("Stopped", stopped)
+        self.assertIn("\t1\t", stopped)  # one invoice
         self.shot("02-dashboard")
 
         # upload a messy Excel export
