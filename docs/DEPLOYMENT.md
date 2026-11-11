@@ -159,6 +159,21 @@ outside the secrets manager**: do the next section too.
 
 ---
 
+## Reading invoice documents
+
+PDFs and Excel invoices are read on the server with nothing extra. Photos and scanned PDFs need
+OCR: the Docker image includes Tesseract, so on option A it just works. On a cloud platform the
+same image works too; if you build your own image, install `tesseract-ocr` and the `ocr` extra.
+
+Uploaded files are read in a separate, short-lived process with a 45-second limit and (on Linux)
+a 2 GB memory limit, so a broken file can't hang the app. Leave `DOC_ISOLATION` at its default.
+
+**AI reading** (optional) sends invoices the app can't read by itself to Anthropic's API. It
+needs `ANTHROPIC_API_KEY` set as a secret (`ANTHROPIC_API_KEY_FILE` works too) and an admin
+to switch it on per company in Settings. Each use is in the activity log; each company is limited
+to 100 an hour. Check that sending supplier invoices to Anthropic fits your company's data policy
+before switching it on.
+
 ## Backups
 
 ### The data

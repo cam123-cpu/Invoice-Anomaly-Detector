@@ -110,6 +110,29 @@ status column shows your team's decisions.
 For a report of everything flagged so far, across all your uploads, use **Download Excel** on
 the Review queue page or **Download Excel report** on the Dashboard.
 
+### 6b. Or upload the invoices themselves
+
+Not every invoice arrives in an export. On **Upload invoices**, choose **Invoice documents (PDF,
+Excel, scans)** and drop in invoice files: PDFs, Excel invoices made from a template, or photos and
+scans. Several at once is fine.
+
+To try it, click **Read the sample invoices** (load the sample data first so the checks have a
+history to compare with). You'll see a table with one row per file:
+
+- **Amber** boxes are values the reader wasn't sure of; **red** ones it couldn't find. Hover over
+  a box to see the text it was read from, and correct anything that's wrong.
+- Notes under a row explain anything worth checking: totals that don't add up, a vendor spelled
+  almost like one you already have, payment to a person rather than the business.
+- Untick a row to leave that file out. Nothing is saved until you click **Add invoices**.
+
+The results show which of the new invoices were flagged and why. With the samples you'll see a
+new bank account (Stark Freight), a look-alike vendor (Acme Suplies) and totals that don't add up
+(Umbrella Ltd). Upload the same file again and it is recognised and not added twice.
+
+Photos and scans need the optional OCR extra (see the README). If your company switches on **AI
+reading** in Settings (it needs an Anthropic API key on the server), files the app can't read by
+itself are sent to Claude instead; each one is noted in the activity log.
+
 ### 7. Work the review queue
 
 Each row shows a **risk score** from 0 to 100, the invoice, and coloured tags saying why it was
@@ -339,4 +362,6 @@ for item in api.get("/review-queue").json():
 | *Forgot your password?* sends nothing | Email isn't set up (`SMTP_*` or `MAIL_DIR`), or the username isn't an email address. An admin can reset it in Settings |
 | "Username ... is already taken" | That login already exists. Sign in with it, or reset its password as above |
 | An upload says ".xls isn't supported" | In Excel, use File > Save As and choose .xlsx or .csv |
+| "This PDF is a scan" or "Reading photos and scans needs OCR" | Install the OCR extra and Tesseract (README, Quick start), or ask an admin to switch on AI reading |
+| "This looks like a single invoice rather than a list" | Click **Read it as an invoice document** |
 | A package fails to build during install | Use Python 3.11 to 3.13. The newest Python release may not have builds for every library yet |

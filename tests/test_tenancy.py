@@ -123,7 +123,7 @@ class PostgresRowLevelSecurityTests(TenantSeedMixin, DbTestCase):
         self.assertEqual(row, ("invoice_app", False, False))
 
     def test_with_no_company_set_every_table_looks_empty(self):
-        self.assertEqual(self.count_as_owner("invoices", self.b), 2)  # the data is there
+        self.assertEqual(self.count_as_owner("invoices", self.b), 3)  # the data is there
         for table in TABLES:
             n = self.raw.execute(f"SELECT count(*) FROM {table}").fetchone()[0]
             self.assertEqual(n, 0, table)
@@ -148,12 +148,14 @@ class PostgresRowLevelSecurityTests(TenantSeedMixin, DbTestCase):
             "VALUES (%s, 'INV-2', 'duplicate', 'high', 'planted')",
             "INSERT INTO users (username, org_id, password_hash, role) VALUES ('mole', %s, 'x', 'admin')",
             "INSERT INTO audit_log (org_id, at, username, action, detail) VALUES (%s, 'now', 'x', 'x', 'x')",
+            "INSERT INTO documents (org_id, sha256, filename, method, invoice_id, uploaded_by, uploaded_at) "
+            "VALUES (%s, 'x', 'x', 'x', 'INV-2', 'x', 'now')",
         ]
         for statement in statements:
             with self.assertRaises(self.denied, msg=statement):
                 with self.as_org(self.a) as conn:
                     conn.execute(statement, (self.b,))
-        self.assertEqual(self.count_as_owner("invoices", self.b), 2)
+        self.assertEqual(self.count_as_owner("invoices", self.b), 3)
         self.assertEqual(self.count_as_owner("users", self.b), 1)
 
     def test_unfiltered_update_and_delete_only_touch_the_current_company(self):

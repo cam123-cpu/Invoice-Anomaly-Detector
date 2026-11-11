@@ -54,6 +54,8 @@ services:
       OIDC_CLIENT_ID: ${OIDC_CLIENT_ID:-}
       OIDC_CLIENT_SECRET: ${OIDC_CLIENT_SECRET:-}
       OIDC_LABEL: ${OIDC_LABEL:-}
+      # Optional: AI reading of invoices the app can't read itself (also switched on per company)
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
     secrets: [secret_key, encryption_keys, index_key, database_url, database_admin_url, app_db_password]
 
   caddy:
