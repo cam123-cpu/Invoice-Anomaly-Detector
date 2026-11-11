@@ -463,7 +463,10 @@ class SignInApiTests(DbTestCase):
         me = browser.get("/me").json()  # signed in by the session cookie alone
         self.assertEqual((me["username"], me["signed_in_with_two_factor"]), ("alice@acme.example", True))
         replay = browser.get(f"/auth/sso/callback?code={code}&state={q['state'][0]}", follow_redirects=False)
-        self.assertTrue(replay.headers["location"].startswith("/#/login?error="))  # cookie cleared, code used
+        where = replay.headers["location"]   # cookie cleared, code used: back to sign-in with a signed message
+        self.assertTrue(where.startswith("/#/login?notice="))
+        message = browser.get("/auth/notice", params={"token": where.split("notice=")[1]}).json()["message"]
+        self.assertIn("could not be verified", message)
         self.assertEqual(self.client.get("/auth/google/start", follow_redirects=False).status_code, 404)
 
     def test_https_enforcement(self):
