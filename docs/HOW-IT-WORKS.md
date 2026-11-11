@@ -74,7 +74,7 @@ flowchart LR
     end
     STORE[("SQLite file<br/>or PostgreSQL")]
     LLM["Anthropic API<br/>(optional)"]
-    UI -- "HTTPS + JSON<br/>Bearer token" --> API
+    UI -- "HTTPS + JSON<br/>session cookie" --> API
     API --> IMP
     API --> DET
     API --> XO
@@ -121,8 +121,9 @@ invoices, calls the pure function, and stores the result.
 
 ### 2.4 A stateless API
 
-Each HTTP request carries everything the server needs to know who is asking: a signed
-**bearer token** in the `Authorization` header. The server keeps no "session" in memory between
+Each HTTP request carries everything the server needs to know who is asking: a signed token,
+either in an **HttpOnly cookie** (the web app) or as a **bearer token** in the `Authorization`
+header (programs). The server keeps no "session" in memory between
 requests, so it could be restarted, or several copies run behind a load balancer, without
 logging anyone out. (One exception, covered in [section 14](#14-limits-and-what-to-build-next):
 the login rate limiter does keep in-memory state.)
@@ -242,7 +243,7 @@ sequenceDiagram
         S-->>A: base64(JSON) + "." + HMAC signature
         A-->>B: {access_token}
     end
-    Note over B: Stores the token in sessionStorage and<br/>sends it as "Authorization: Bearer ..." on every request
+    Note over B: The token arrives in an HttpOnly cookie the page<br/>can't read; the browser sends it on every request
 ```
 
 That is the password path with two-factor off. With two-factor on, step "right" returns
@@ -667,10 +668,25 @@ Concepts used:
 - **Closures:** `create_app` defines all routes inside itself, so they "close over" the `db`,
   `signer` and `limiter` created there, with no global variables. That's why tests can create
   isolated apps.
-- **Middleware:** `security_headers` wraps every response. It adds headers that stop browsers
-  guessing content types (`X-Content-Type-Options`), stop the site being framed by another site
-  (`X-Frame-Options`, clickjacking), and give the web app a strict **Content-Security-Policy**
-  ([section 8](#8-the-security-model)).
+- **Middleware:** `security_headers` wraps every request and response. Before the route runs it
+  refuses cross-site requests (below). On the way out it adds headers that stop browsers guessing
+  content types (`X-Content-Type-Options`), stop the site being framed (`X-Frame-Options`,
+  clickjacking), switch off camera, microphone and location (`Permissions-Policy`), isolate the
+  window from other sites (`Cross-Origin-Opener-Policy`), give the web app a strict
+  **Content-Security-Policy** and API answers `default-src 'none'`, and mark API answers
+  `Cache-Control: no-store` so company data isn't kept in caches ([section 8](#8-the-security-model)).
+- **Browser sessions and CSRF:** after sign-in, the token is put in a cookie that is
+  `HttpOnly` (page scripts can't read it, so even an injected script couldn't steal it), `Secure`,
+  `SameSite=Strict`, and named with the `__Host-` prefix (browsers then insist on HTTPS, this exact
+  host, every path). Cookies bring one classic risk, **cross-site request forgery**: another site
+  making your browser send a request here, cookie attached. Three locks: SameSite=Strict; any
+  change signed only by the cookie must carry an `X-Requested-With: fetch` header, which another
+  site can't add; and a request whose `Origin` is another site is refused. Programs keep using
+  `Authorization: Bearer`, which can't be forged this way.
+- **Strict request bodies:** every input model refuses unknown fields (`extra="forbid"`). A
+  request that adds `"org_id"` or `"role"` hoping some code path reads it gets 422, not silence.
+- **`BodyLimit`:** a small ASGI wrapper that refuses bodies over 16 MB (413) or without a length
+  (411) before anything reads them, so no one can make the server buffer gigabytes.
 - **Exceptions mapped to responses:** domain errors (`FileProblem`, `KeyError`, `Conflict`)
   become `HTTPException` with the right status, at the edge of the system.
 - **File transfer:** uploads arrive as base64 inside JSON, which is simple and avoids an extra
@@ -766,8 +782,8 @@ JavaScript.
   never overwrite a newer one.
 - **State in closures:** each page keeps its state (current tab, search text, review counts) in
   local variables captured by its event handlers, instead of in globals.
-- **Storage:** the sign-in token lives in `sessionStorage` (cleared when the tab closes). Saved
-  column mappings live in `localStorage`, keyed by the file's header row. Every access is wrapped
+- **Storage:** the sign-in token is in an HttpOnly cookie the script never sees; on start-up
+  the app asks `GET /me` who is signed in. Saved column mappings live in `localStorage`, keyed by the file's header row. Every access is wrapped
   in `try/catch`, because storage can be unavailable.
 - **Downloads:** the browser fetches the file with the token, turns it into a **Blob**, creates
   a temporary object URL, and clicks a hidden `<a download>` link.
@@ -1074,6 +1090,13 @@ company's real, labelled invoices.
 | Ciphertext copied between rows or companies | Associated data binds it to company + invoice | `crypto.py` |
 | Cross-site scripting from uploaded text | `textContent` only; strict CSP blocks inline and third-party script | `app.js`, `api.py` |
 | Clickjacking | `X-Frame-Options: DENY`, `frame-ancestors 'none'` | `api.py` |
+| Stolen session via injected script | Session in an HttpOnly, Secure, SameSite=Strict `__Host-` cookie | `api.py` |
+| Cross-site request forgery | SameSite=Strict; `X-Requested-With` required with the cookie; foreign `Origin` refused | `api.py` |
+| Extra fields slipped into a request | Unknown fields refused (422) | `api.py` `StrictModel` |
+| Bots trying many accounts | 30 failed sign-ins per address, any usernames; bounded limiter memory | `accounts.py`, `security.py` |
+| Hostile uploads | Real file type checked (zip/workbook, text), zip bombs refused, size capped | `importer.py`, `BodyLimit` |
+| Secrets in git history | gitleaks scans every commit in CI | `.gitleaks.toml` |
+| Vulnerable libraries | pip-audit fails the build; Dependabot updates | CI |
 | Formula injection in exported Excel | Text forced to string; formula-like text prefixed with `'` | `excel_out.py` |
 | Header injection through file names | Download names sanitized and percent-encoded | `api.py` `attachment()` |
 | Insider tampering with history | Audit log is append-only for the app role | `schema.py` |
@@ -1178,13 +1201,15 @@ tests sit at the top. Each level catches different mistakes.
 
 ### 11.3 Continuous integration
 
-On every push, GitHub Actions runs nine jobs in parallel: lint (ruff) and tests on Ubuntu with
+On every push, GitHub Actions runs ten jobs in parallel: lint (ruff) and tests on Ubuntu with
 Python 3.11, 3.12 and 3.13 and on Windows (four jobs); the same tests against a real PostgreSQL 16
 server, with a guard that fails if the PostgreSQL tests were silently skipped; the browser tests (including two-factor set-up from the on-screen QR secret, SSO through a
 fake provider, and a reset email read from the outbox);
 a Docker build; the **production stack** (`docker-compose.prod.yml` with HTTPS, secrets as files,
-sign-in, then a backup → wipe → restore → read cycle); and a dependency vulnerability audit (pip-audit). Dependabot opens pull requests
-when libraries update.
+sign-in, then a backup → wipe → restore → read cycle); a **secret scan** of the whole git history
+(gitleaks, so a key committed and later deleted is still caught); and a dependency vulnerability
+audit (pip-audit) that fails the build on a known vulnerability. Dependabot opens pull requests
+when libraries, GitHub Actions or Docker images update.
 
 ---
 

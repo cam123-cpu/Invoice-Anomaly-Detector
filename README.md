@@ -119,9 +119,17 @@ on every push. SQLite, used for local runs, has the first two layers and the las
 
 - **Secrets from a secrets manager or files** (`NAME` or `NAME_FILE`); `.env` only for local use
 - **HTTPS enforced** in production: HTTP redirects to HTTPS, plus HSTS
+- **Browser session in an HttpOnly cookie** (`__Host-`, Secure, SameSite=Strict) that page
+  scripts can't read, with cross-site request forgery checks; programs use bearer tokens
+- **Unknown request fields refused**, request size capped, uploads checked for their real file
+  type and for zip bombs
+- **Security headers** on every response (CSP, frame, referrer, permissions, cross-origin) and
+  no caching of API answers; API docs switched off in production
+- **Secret scanning** of the whole git history and a blocking dependency audit in CI
 - **Passwords hashed** with salted scrypt; constant-time comparison
-- **Rate-limited sign-in**: 5 failures per 15 minutes per IP + username, then a lockout; the
-  same for two-factor codes and reset requests
+- **Rate-limited sign-in**: 5 failures per 15 minutes per IP + username, then a lockout; 30 per
+  address across all usernames (stops bots trying many accounts); limits on two-factor codes;
+  at most 3 reset emails per person per hour
 - **Parameterized SQL everywhere**; sort columns go through an allow-list
 - **Bank accounts encrypted** with AES-256-GCM (key rotation supported) plus a keyed blind
   index, so detection compares accounts without ever decrypting them
@@ -181,7 +189,8 @@ role restrictions, company isolation and a phone-sized screen.
 
 | Endpoint | Who | What |
 |---|---|---|
-| `POST /login`, `POST /login/2fa` | anyone | Bearer token, or a second step asking for a two-factor code (rate limited) |
+| `POST /login`, `POST /login/2fa` | anyone | Session cookie and bearer token, or a second step asking for a two-factor code (rate limited) |
+| `POST /logout` | anyone | End the browser session |
 | `GET /auth/providers`, `GET /auth/{provider}/start` | anyone | Single sign-on (Microsoft, Google, OpenID Connect) |
 | `POST /password/forgot`, `POST /password/reset` | anyone | Email a reset link; set a new password with it |
 | `GET /me`, `POST /me/password` | any role | Your account; change your password |

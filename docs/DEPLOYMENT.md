@@ -145,6 +145,7 @@ Steps, whichever cloud:
    PUBLIC_URL         = https://invoices.yourcompany.com
    FORCE_HTTPS        = 1
    FORWARDED_ALLOW_IPS = *          # the platform's load balancer is the only way in
+   API_DOCS           = 0          # no public /docs page
    ```
 
    Do **not** give the running app `DATABASE_ADMIN_URL`: then it can't change the schema or

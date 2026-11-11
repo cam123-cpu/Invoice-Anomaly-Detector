@@ -576,16 +576,34 @@ async function dashboardView() {
     kpi("High risk, open", whole.format(s.high_risk_open), "Risk score 70 or more", s.high_risk_open > 0),
     kpi("Confirmed problems", whole.format(s.confirmed)),
     kpi("False alarms", whole.format(s.dismissed)),
-    kpi("Flag accuracy", m.precision === null ? "—" : Math.round(m.precision * 100) + "%",
+    kpi("Flag accuracy", m.precision === null ? "Not yet" : Math.round(m.precision * 100) + "%",
       m.reviewed ? `from ${whole.format(m.reviewed)} reviews` : "after your first reviews"));
 
-  const money = (d, label, alert) => h("div", { class: "card kpi d-card d-" + d + (alert ? " alert" : "") },
-    h("div", { class: "label" }, label), h("div", { class: "value" }, fmtAmount(s.amounts[d])),
-    h("div", { class: "sub" }, `${whole.format(s.decisions[d])} invoice${s.decisions[d] === 1 ? "" : "s"} · ${DECISIONS[d][1]}`));
-  const payments = h("div", {}, h("div", { class: "row" }, h("h2", {}, "Payments"), h("span", { class: "spacer" }),
-    downloadButton("Download payment file", "GET", "/export/payment-file.xlsx", undefined, "sm")),
-    h("div", { class: "kpis" }, money("pay", "Ready to pay"), money("review", "Review first"),
-      money("hold", "On hold"), money("do_not_pay", "Stopped (do not pay)", s.amounts.do_not_pay > 0)));
+  // Payments: how the money splits by decision, as a bar over a small ledger.
+  const order = [["pay", "Ready to pay"], ["review", "Review first"], ["hold", "On hold"], ["do_not_pay", "Stopped"]];
+  const totalAmount = order.reduce((t, [d]) => t + (s.amounts[d] || 0), 0);
+  const totalCount = order.reduce((t, [d]) => t + (s.decisions[d] || 0), 0);
+  const stack = h("div", { class: "stack", role: "img",
+    "aria-label": order.map(([d, label]) => `${label} ${fmtAmount(s.amounts[d])}`).join(", ") },
+  order.filter(([d]) => s.amounts[d] > 0).map(([d, label]) => {
+    const seg = h("span", { class: "d-" + d, title: `${label}: ${fmtAmount(s.amounts[d])}` });
+    seg.style.width = (100 * s.amounts[d] / (totalAmount || 1)) + "%";
+    return seg;
+  }));
+  const ledger = h("div", { class: "table-wrap" }, h("table", { class: "ledger" },
+    h("thead", {}, h("tr", {}, h("th", {}, "Decision"), h("th", { class: "num" }, "Invoices"),
+      h("th", { class: "num" }, "Amount"), h("th", { class: "meaning" }, "Meaning"))),
+    h("tbody", {}, order.map(([d, label]) => h("tr", { class: d === "do_not_pay" && s.amounts[d] > 0 ? "stop" : "" },
+      h("td", {}, h("span", { class: "swatch d-" + d }), label),
+      h("td", { class: "num" }, whole.format(s.decisions[d])),
+      h("td", { class: "num" }, fmtAmount(s.amounts[d])),
+      h("td", { class: "meaning muted" }, DECISIONS[d][1])))),
+    h("tfoot", {}, h("tr", {}, h("td", {}, "Total"), h("td", { class: "num" }, whole.format(totalCount)),
+      h("td", { class: "num" }, fmtAmount(totalAmount)), h("td", { class: "meaning" })))));
+  const payments = h("section", { class: "card payments" },
+    h("div", { class: "section-head" }, h("h2", {}, "Payments"), h("span", { class: "spacer" }),
+      downloadButton("Download payment file", "GET", "/export/payment-file.xlsx", undefined, "sm")),
+    stack, ledger);
   const maxRule = Math.max(1, ...Object.values(s.open_by_rule));
   const reasons = h("div", { class: "card" }, h("h2", {}, "Why open invoices were flagged"),
     Object.keys(s.open_by_rule).length
