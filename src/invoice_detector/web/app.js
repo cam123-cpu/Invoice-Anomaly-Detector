@@ -28,7 +28,7 @@ const RULES = {
 const kindTag = (kind) => (kind === "credit" ? [" ", h("span", { class: "pill credit" }, "Credit note")] : null);
 const ACTIONS = {
   login: "Signed in", login_failed: "Failed sign-in", file_imported: "Imported a file",
-  documents_imported: "Imported invoice documents", ai_document_read: "Sent a document for AI reading",
+  documents_imported: "Imported invoice documents", reader_taught: "Taught the document reader", ai_document_read: "Sent a document for AI reading",
   logout: "Signed out", access_removed: "Removed a person's access", access_restored: "Gave a person access back",
   ai_summary: "Asked for an AI summary",
   report_exported: "Downloaded a report", workbook_exported: "Downloaded a checked workbook",
