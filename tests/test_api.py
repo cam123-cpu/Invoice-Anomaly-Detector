@@ -317,7 +317,7 @@ class ApiTests(DbTestCase):
         r = self.client.get("/export/payment-file.xlsx", headers=admin)
         self.assertIn('filename="payment-file-company-a.xlsx"', r.headers["content-disposition"])
         wb = load_workbook(io.BytesIO(r.content))
-        self.assertEqual([wb["Do not pay"].cell(2, 1).value, wb["On hold"].cell(2, 8).value],
+        self.assertEqual([wb["Do not pay"].cell(2, 1).value, wb["On hold"].cell(2, 9).value],
                          ["D2", "asked for breakdown"])
         self.assertEqual(sorted(wb["Ready to pay"].cell(row, 1).value for row in (2, 3)), ["D1", "OK"])
         theirs = load_workbook(io.BytesIO(self.client.get("/export/payment-file.xlsx", headers=bob).content))
