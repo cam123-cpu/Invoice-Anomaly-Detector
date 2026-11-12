@@ -75,6 +75,16 @@ CREATE TABLE IF NOT EXISTS documents (
   PRIMARY KEY (org_id, sha256),
   FOREIGN KEY (org_id, invoice_id) REFERENCES invoices(org_id, id)
 );
+-- Attempt counters for rate limits (sign-in, codes, resets, heavy work). In the database
+-- rather than in each server's memory, so every server shares one count: five wrong
+-- passwords are five, whichever servers they landed on. Keys are hashes: no usernames or
+-- addresses are stored.
+CREATE TABLE IF NOT EXISTS rate_limits (
+  key TEXT PRIMARY KEY,
+  failures INTEGER NOT NULL,
+  window_start BIGINT NOT NULL,
+  locked_until BIGINT NOT NULL DEFAULT 0
+);
 CREATE TABLE IF NOT EXISTS meta (
   key TEXT PRIMARY KEY,
   value TEXT NOT NULL
@@ -139,10 +149,12 @@ GRANT EXECUTE ON FUNCTION app_org_id() TO invoice_app;
 
 -- Least privilege: the app cannot create companies, cannot edit or delete invoices,
 -- and cannot change or delete audit records.
-REVOKE ALL ON orgs, users, invoices, anomalies, reviews, audit_log, meta, documents FROM PUBLIC, invoice_app;
+REVOKE ALL ON orgs, users, invoices, anomalies, reviews, audit_log, meta, documents, rate_limits
+  FROM PUBLIC, invoice_app;
 GRANT SELECT ON orgs TO invoice_app;
 GRANT UPDATE (approval_threshold, require_2fa, ai_extraction) ON orgs TO invoice_app;
-GRANT SELECT, INSERT ON documents TO invoice_app;  -- a record of what was imported: never edited
+GRANT SELECT, INSERT ON documents TO invoice_app;
+GRANT SELECT, INSERT, UPDATE, DELETE ON rate_limits TO invoice_app;  -- a record of what was imported: never edited
 GRANT SELECT, INSERT ON users TO invoice_app;
 GRANT UPDATE (password_hash, totp_secret, totp_enabled, totp_last_step, recovery_codes, session_epoch, disabled)
   ON users TO invoice_app;

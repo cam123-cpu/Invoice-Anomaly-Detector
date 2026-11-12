@@ -25,6 +25,8 @@ services:
   app:
     build: .
     restart: unless-stopped
+    deploy:
+      replicas: ${APP_REPLICAS:-1}   # copies of the app behind the proxy; raise for more capacity or no-downtime restarts
     depends_on:
       db: {condition: service_healthy}
     environment:
@@ -38,6 +40,7 @@ services:
       FORCE_HTTPS: "1"
       FORWARDED_ALLOW_IPS: "*"   # the app is reachable only through Caddy on this network
       API_DOCS: "0"              # no public /docs page in production
+      WEB_CONCURRENCY: ${WEB_CONCURRENCY:-1}   # worker processes inside each copy
       # Optional: password-reset emails
       SMTP_HOST: ${SMTP_HOST:-}
       SMTP_PORT: ${SMTP_PORT:-587}

@@ -50,11 +50,12 @@ class Accounts:
             name: OIDCClient(p, allow_http=settings.oidc_allow_http) for name, p in settings.sso_providers.items()}
         self.sealer = StateSealer(settings.secret_key)
         self._mail_threads: list[threading.Thread] = []
-        self.login_limiter = RateLimiter()                 # 5 wrong passwords per address + username
-        self.address_limiter = RateLimiter(max_attempts=30)  # 30 per address, any usernames (bots)
-        self.code_limiter = RateLimiter()
-        self.reset_limiter = RateLimiter()                 # reset emails per address
-        self.reset_account_limiter = RateLimiter(max_attempts=3, window=3600, lockout=3600)  # per account
+        # Counts are kept in the database, so every server shares them.
+        self.login_limiter = db.limiter("login")                          # 5 wrong passwords per address + username
+        self.address_limiter = db.limiter("address", max_attempts=30)     # 30 per address, any usernames (bots)
+        self.code_limiter = db.limiter("code")
+        self.reset_limiter = db.limiter("reset")                          # reset emails per address
+        self.reset_account_limiter = db.limiter("reset-account", max_attempts=3, window=3600, lockout=3600)
         self._pepper = hmac.new(settings.secret_key.encode(), b"recovery-codes", hashlib.sha256).digest()
 
     # ------------------------------------------------------------ helpers

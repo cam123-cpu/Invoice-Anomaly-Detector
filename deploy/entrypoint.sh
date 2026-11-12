@@ -10,4 +10,5 @@ fi
 # real client addresses and HTTPS is detected. Only trust addresses that can reach the app
 # directly; in docker-compose.prod.yml only the Caddy proxy can.
 exec uvicorn invoice_detector.api:create_app --factory --host 0.0.0.0 --port 8000 --no-server-header \
+  --workers "${WEB_CONCURRENCY:-1}" \
   --proxy-headers --forwarded-allow-ips "${FORWARDED_ALLOW_IPS:-127.0.0.1}"
