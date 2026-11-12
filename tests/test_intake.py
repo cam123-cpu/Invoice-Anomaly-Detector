@@ -185,3 +185,59 @@ class EInvoiceIntakeTests(IntakeTestCase):
                                               self.checked(bad, kind="credit", reference="<script>")])
         stored = {i["id"]: i["reference"] for i in self.app.list_invoices(self.a)}
         self.assertEqual(stored, {"RE-1": None, "RE-2": None})
+
+
+def deposit_invoice(vendor: str, number: str, total: float, due: float) -> bytes:
+    """A vendor that prints the balance after a deposit high up, and the full total lower down."""
+    from invoice_detector.doc_samples import pdf_bytes
+    t = lambda y, s, x=50, size=10, bold=False: ("text", x, y, size, bold, s)  # noqa: E731
+    return pdf_bytes([t(40, vendor, size=16, bold=True), t(62, "12 Harbour Road, Leeds LS1 4AB"),
+                      t(110, f"Invoice number: {number}"), t(126, "Invoice date: 2026-03-05"),
+                      t(150, f"Balance due {due:,.2f}", bold=True),
+                      t(200, "Bill to: Acme Inc"),
+                      t(260, "Freight services"), t(260, f"{total:,.2f}", x=450),
+                      t(400, "Total"), t(400, f"{total:,.2f}", x=450),
+                      t(416, "Deposit received"), t(416, f"{total - due:,.2f}", x=450)])
+
+
+class LearningTests(IntakeTestCase):
+    def test_one_correction_teaches_the_reader_this_vendor(self):
+        first = self.intake.extract(self.user, "a.pdf", deposit_invoice("Harbour Freight Ltd", "HF-1", 1200.0, 900.0))
+        self.assertEqual(first["fields"]["amount"], 900.0)           # takes the balance due...
+        # ...but this company records the full invoice total (deposits are booked separately)
+        result = self.intake.import_drafts(self.user, [self.checked(first, amount=1200.0)])
+        self.assertEqual(result["fields_corrected"], 1)
+        self.assertEqual(self.app.reading_hints(self.a), {"harbour freight": {"amount": ["total"]}})
+
+        second = self.intake.extract(self.user, "b.pdf", deposit_invoice("Harbour Freight Ltd", "HF-2", 700.0, 500.0))
+        self.assertEqual(second["fields"]["amount"], 700.0)
+        self.assertTrue(any("where you corrected it" in w for w in second["warnings"]))
+        other = self.intake.extract(self.user, "c.pdf", deposit_invoice("Other Carrier Ltd", "OC-1", 700.0, 500.0))
+        self.assertEqual(other["fields"]["amount"], 500.0)           # other vendors: unchanged
+
+        # Kept once (confirmed), then corrected back to the balance three times: the reader
+        # drops the old lesson and learns the new one.
+        self.intake.import_drafts(self.user, [self.checked(second)])
+        for n in (3, 4, 5):
+            draft = self.intake.extract(self.user, f"{n}.pdf",
+                                        deposit_invoice("Harbour Freight Ltd", f"HF-{n}", 300.0 + n, 100.0))
+            self.assertEqual(draft["fields"]["amount"], 300.0 + n if n == 3 else 100.0)   # from the 4th, the new lesson leads
+            self.intake.import_drafts(self.user, [self.checked(draft, amount=100.0)])
+        self.assertEqual(self.app.reading_hints(self.a), {"harbour freight": {"amount": ["balance due", "total"]}})
+
+    def test_lessons_stay_inside_their_company(self):
+        draft = self.intake.extract(self.user, "a.pdf", deposit_invoice("Harbour Freight Ltd", "HF-1", 1200.0, 900.0))
+        self.intake.import_drafts(self.user, [self.checked(draft, amount=1200.0)])
+        other_company = {"sub": "carol", "org": self.b, "role": "admin"}
+        theirs = self.intake.extract(other_company, "b.pdf", deposit_invoice("Harbour Freight Ltd", "HF-2", 700.0, 500.0))
+        self.assertEqual(theirs["fields"]["amount"], 500.0)
+        self.assertEqual(self.app.reading_hints(self.b), {})
+
+    def test_a_tampered_lesson_cannot_be_sent_back(self):
+        """Candidates ride in the signed draft: changing them breaks the signature."""
+        draft = self.intake.extract(self.user, "a.pdf", deposit_invoice("Harbour Freight Ltd", "HF-1", 1200.0, 900.0))
+        payload, sig = draft["draft"].rsplit(".", 1)
+        forged = payload[:-4] + ("AAAA" if payload[-4:] != "AAAA" else "BBBB") + "." + sig
+        result = self.intake.import_drafts(self.user, [self.checked(draft, draft=forged, amount=1200.0)])
+        self.assertEqual(result["added"], 0)
+        self.assertEqual(self.app.reading_hints(self.a), {})

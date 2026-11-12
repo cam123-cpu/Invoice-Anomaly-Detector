@@ -22,8 +22,8 @@ from datetime import date
 
 from .ai_extract import AIError, extract_with_claude, merge
 from .db import Database
-from .documents import (LABEL_NAMES, REQUIRED, Extraction, document_text, kind_of, norm, read_document, similar,
-                        totals_issue)
+from .documents import (LABEL_NAMES, REQUIRED, Extraction, canonical_vendor, document_text, kind_of, read_document,
+                        similar, totals_issue)
 from .importer import ID_PATTERN, FileProblem
 from .isolation import run_isolated
 from .security import AuthError, RateLimitError, TokenSigner
@@ -50,10 +50,10 @@ class DocumentIntake:
     def ai_available(self, org: dict) -> bool:
         return bool(self.settings.anthropic_api_key) and bool(org.get("ai_extraction"))
 
-    def _read_locally(self, filename: str, data: bytes, company: str) -> Extraction:
+    def _read_locally(self, filename: str, data: bytes, company: str, hints: dict | None = None) -> Extraction:
         if self.isolate:
-            return run_isolated("invoice_detector.documents:read_document", filename, data, company)
-        return read_document(filename, data, company)
+            return run_isolated("invoice_detector.documents:read_document", filename, data, company, True, hints)
+        return read_document(filename, data, company, True, hints)
 
     def extract(self, user: dict, filename: str, data: bytes) -> dict:
         org = self.db.get_org(user["org"])
@@ -65,7 +65,7 @@ class DocumentIntake:
                                f"by {previous['uploaded_by']}."}
         problem, local = None, None
         try:
-            local = self._read_locally(filename, data, org["name"])
+            local = self._read_locally(filename, data, org["name"], self.db.reading_hints(user["org"]))
         except FileProblem as exc:
             problem = str(exc)
 
@@ -101,7 +101,8 @@ class DocumentIntake:
         if number and self.db.get_invoices(user["org"], [str(number)]):
             ex.warnings.insert(0, f"Invoice number {number} is already on file. It will be skipped unless you change it.")
         draft = self.signer.issue({"org": user["org"], "sub": user["sub"], "sha": sha, "file": filename[:200],
-                                   "method": ex.method, "read": {**ex.fields, "kind": ex.kind}, "totals": ex.totals},
+                                   "method": ex.method, "read": {**ex.fields, "kind": ex.kind}, "totals": ex.totals,
+                                   "cand": _compact(ex.candidates), "learned": ex.learned},
                                   "doc", DRAFT_TTL)
         return {"file": filename, "status": "ready" if not ex.missing else "incomplete", "draft": draft,
                 "kind": ex.kind,
@@ -191,6 +192,7 @@ class DocumentIntake:
                 corrections["reference"] = [read.get("reference"), row["reference"]]
             if (read.get("kind") or "invoice") != row["kind"]:
                 corrections["kind"] = [read.get("kind") or "invoice", row["kind"]]
+            row["teach"] = _lessons(read, row, draft.get("cand") or {}, draft.get("learned") or {})
             row.update(sha256=draft["sha"], filename=draft["file"], method=draft["method"],
                        corrections=corrections, totals_issue=totals_issue(row["amount"], draft.get("totals") or {}))
             rows.append(row)
@@ -199,6 +201,9 @@ class DocumentIntake:
             if r["id"] in already:
                 skipped.append({"file": r["filename"], "reason": f"invoice {r['id']} is already on file"})
         added = [r for r in rows if r["id"] not in already]
+        for r in added:
+            for field, label, helped in r["teach"]:
+                self.db.learn_reading(user["org"], canonical_vendor(r["vendor"]), field, label, helped)
         corrected = sum(len(r["corrections"]) for r in added)
         if added:
             self.db.audit(user["org"], user["sub"], "documents_imported",
@@ -209,12 +214,38 @@ class DocumentIntake:
                 "totals_issues": sum(1 for r in added if r["totals_issue"])}
 
 
-def _canonical(name: str) -> str:
-    """A vendor name without formatting: lower case, no punctuation, no legal suffix."""
-    words = re.sub(r"[^a-z0-9 ]+", " ", norm(name)).split()
-    while words and words[-1] in ("inc", "llc", "ltd", "limited", "corp", "corporation", "co", "plc", "gmbh"):
-        words.pop()
-    return " ".join(words)
+_canonical = canonical_vendor
+
+
+def _compact(candidates: dict) -> dict:
+    """Candidates small enough to ride in the signed draft."""
+    return {f: [[str(k)[:60], v] for k, v in rows[:6]] for f, rows in (candidates or {}).items()}
+
+
+def _lessons(read: dict, final: dict, candidates: dict, learned: dict) -> list[tuple[str, str, bool]]:
+    """What a person's check teaches the reader: (field, label, helped).
+
+    - A field corrected to a value that was printed beside another label: that label helps.
+    - A field read beside a learned label and then corrected away: that label misled.
+    - A field read beside a learned label and kept: the label helped again."""
+    out = []
+    for f in ("id", "date", "amount"):
+        was, now = read.get(f), final.get(f)
+        if now in (None, ""):
+            continue
+        if learned.get(f):
+            out.append((f, learned[f], _same(was, now)))
+        if _same(was, now):
+            continue
+        for label, value in candidates.get(f, ()):
+            if _same(value, now) or (f == "id" and _squash_id(value) == _squash_id(now)):
+                out.append((f, label, True))
+                break
+    return out
+
+
+def _squash_id(value) -> str:
+    return re.sub(r"[^a-z0-9]", "", str(value or "").lower())
 
 
 def _same(read, final) -> bool:
