@@ -125,9 +125,14 @@ history to compare with). You'll see a table with one row per file:
   almost like one you already have, payment to a person rather than the business.
 - Untick a row to leave that file out. Nothing is saved until you click **Add invoices**.
 
+- Under each file name is its **type**: Invoice or Credit note. A credit note is recognised by
+  its title; change the box if the reader got it wrong.
+
 The results show which of the new invoices were flagged and why. With the samples you'll see a
-new bank account (Stark Freight), a look-alike vendor (Acme Suplies) and totals that don't add up
-(Umbrella Ltd). Upload the same file again and it is recognised and not added twice.
+new bank account (Stark Freight), a look-alike vendor (Acme Suplies), totals that don't add up
+(Umbrella Ltd), and a Globex invoice with the credit note that cancels it: the two are flagged
+as a pair so the invoice isn't paid. In a list, a negative amount or a Type column saying
+"credit" does the same. Upload the same file again and it is recognised and not added twice.
 
 Photos and scans need the optional OCR extra (see the README). If your company switches on **AI
 reading** in Settings (it needs an Anthropic API key on the server), files the app can't read by

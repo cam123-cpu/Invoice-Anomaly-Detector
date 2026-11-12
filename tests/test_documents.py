@@ -4,8 +4,8 @@ import unittest
 
 from doc_templates import TEMPLATES
 from invoice_detector import ai_extract, doc_samples
-from invoice_detector.documents import (Box, account_value, as_date, find_fields, iban_ok, kind_of, money,
-                                        ocr_available, read_document, totals_issue)
+from invoice_detector.documents import (Box, account_value, as_date, find_fields, iban_ok, kind_of, match_label, money,
+                                        ocr_available, parse_value, read_document, totals_issue)
 from invoice_detector.importer import FileProblem
 from invoice_detector.isolation import run_isolated
 
@@ -121,6 +121,178 @@ class BenchmarkTests(unittest.TestCase):
                     self.assertEqual(ex.fields[f], v)
                 self.assertEqual(ex.kind, "credit" if "credit-note" in name else "invoice")
                 self.assertEqual(any("add up" in w for w in ex.warnings), name.startswith("umbrella"))
+
+
+def page(*rows):
+    """Boxes for a page given as rows of (x, text): one row per printed line."""
+    boxes = []
+    for line, row in enumerate(rows):
+        for x, text in row:
+            boxes.append(Box(text, x, 40 + line * 14, x + len(text) * 5.5, 50 + line * 14, 0, 10))
+    return boxes
+
+
+class OtherLanguagesTests(unittest.TestCase):
+    """Invoices that aren't in English, laid out the way real ones are."""
+
+    def test_german(self):
+        ex = find_fields(page(
+            [(40, "Muster Hosting AG - Uferweg 40-42 - D-63571 Gelnhausen")],
+            [(40, "Kunden AG Mitte")], [(40, "Kundenstraße 15")], [(40, "69876 Frankfurt")],
+            [(40, "Rechnung"), (400, "Seite 1")],
+            [(40, "Rechnungsnr. 30064443"), (300, "Kundennr. 47774")],
+            [(40, "Rechnungsdatum 7. Mai 2014"), (300, "Lieferdatum 02.05.2014")],
+            [(40, "Pos."), (80, "Bezeichnung"), (300, "Menge"), (400, "Betrag")],
+            [(40, "1"), (80, "Grundgebühr"), (300, "1"), (400, "100,00")],
+            [(300, "Nettobetrag"), (400, "100,00 €")],
+            [(300, "MwSt 19%"), (400, "19,00 €")],
+            [(300, "Gesamtbetrag"), (400, "119,00 €")],
+            [(40, "IBAN DE89 3704 0044 0532 0130 00")]), "Kunden AG Mitte")
+        self.assertEqual(ex.fields, {"id": "30064443", "date": "2014-05-07", "amount": 119.0,
+                                     "vendor": "Muster Hosting AG", "bank_account": "DE89370400440532013000"})
+        self.assertEqual((ex.totals["subtotal"], ex.totals["tax"]), (100.0, 19.0))
+        self.assertFalse(any("add up" in w for w in ex.warnings))
+
+    def test_a_title_that_carries_the_number_and_date(self):
+        ex = find_fields(page(
+            [(40, "Handelsrechnung (380) Nr. 471102 vom 05.06.2018")],
+            [(40, "Bestellung:"), (260, "2018-471331")],
+            [(40, "Verkäufer")], [(40, "Name:"), (260, "Lieferant GmbH")], [(40, "Anschrift:"), (260, "Lieferantenstraße 20")],
+            [(40, "Käufer")], [(40, "Name:"), (260, "Kunden AG Mitte")],
+            [(40, "Rechnung gemäß Bestellung Nr. 2018-471331 vom 01.03.2018.")],
+            [(40, "Rechnungsbetrag"), (260, "235,62")]))
+        self.assertEqual((ex.fields["id"], ex.fields["date"], ex.fields["vendor"], ex.fields["amount"]),
+                         ("471102", "2018-06-05", "Lieferant GmbH", 235.62))
+
+    def test_french(self):
+        ex = find_fields(page(
+            [(40, "Au bon moulin SARL - 1242 chemin de l'olive - 84340 Malaucène - France")],
+            [(40, "Facture FA-2017-0010")],
+            [(300, "Ma jolie boutique")], [(300, "35 rue de la République")], [(300, "69001 Lyon")],
+            [(40, "Date de facture 13/11/2017 Contact commercial")],
+            [(40, "Date d'échéance 13/12/2017")],
+            [(300, "Total HT"), (420, "624,90 €")],
+            [(300, "Total taxes"), (420, "46,25 €")],
+            [(300, "Total TTC"), (420, "671,15 €")]))
+        self.assertEqual((ex.fields["id"], ex.fields["date"], ex.fields["vendor"], ex.fields["amount"]),
+                         ("FA-2017-0010", "2017-11-13", "Au bon moulin SARL", 671.15))
+        inline = find_fields(page([(40, "Facture n°562044387 du 02 Juillet 2015")],
+                                  [(40, "Total facture"), (300, "24.99"), (360, "5.00"), (420, "29.99")]))
+        self.assertEqual((inline.fields["id"], inline.fields["date"], inline.fields["amount"]),
+                         ("562044387", "2015-07-02", 29.99))     # net, tax, gross: the gross is the total
+
+    def test_dutch_with_a_kerned_capital(self):
+        ex = find_fields(page(
+            [(40, "FACTUUR."), (300, "Coolblue B.V.")], [(300, "Weena 664")], [(300, "3012 CN Rotterdam")],
+            [(40, "F actuurnummer: 993548900")], [(40, "K lantnummer: 6669263")],
+            [(40, "F actuurdatum: 19 april 2014")], [(40, "Orderdatum: 18 april 2014")],
+            [(40, "Totaal € 717,97")]))
+        self.assertEqual(ex.fields, {"id": "993548900", "date": "2014-04-19", "amount": 717.97, "vendor": "Coolblue B.V."})
+
+    def test_spanish_and_italian_labels(self):
+        es = find_fields(page([(40, "Olivos del Sur S.L.")], [(40, "Número de factura: F-2024-118")],
+                              [(40, "Fecha de factura: 5 de marzo de 2024")], [(40, "Fecha de vencimiento: 04/04/2024")],
+                              [(40, "Base imponible"), (300, "200,00")], [(40, "IVA 21%"), (300, "42,00")],
+                              [(40, "Total a pagar"), (300, "242,00 €")]))
+        self.assertEqual((es.fields["id"], es.fields["date"], es.fields["amount"], es.fields["vendor"]),
+                         ("F-2024-118", "2024-03-05", 242.0, "Olivos del Sur S.L."))
+        it = find_fields(page([(40, "Officine Rossi S.r.l.")], [(40, "Fattura n° 2024/57")],
+                              [(40, "Data fattura: 12/09/2024")], [(40, "Imponibile"), (300, "1.000,00")],
+                              [(40, "Totale fattura"), (300, "1.220,00")]))
+        self.assertEqual((it.fields["id"], it.fields["date"], it.fields["amount"]), ("2024/57", "2024-09-12", 1220.0))
+
+    def test_dates(self):
+        self.assertEqual(as_date(None, "7. Mai 2014"), ("2014-05-07", False))
+        self.assertEqual(as_date(None, "02 Juillet 2015"), ("2015-07-02", False))
+        self.assertEqual(as_date(None, "1er août 2023"), ("2023-08-01", False))
+        self.assertEqual(as_date(None, "August 3 , 2014"), ("2014-08-03", False))
+        self.assertEqual(as_date(None, "05.06.2018"), ("2018-06-05", False))        # dots: always day first
+        self.assertEqual(as_date(None, "05/06/2018"), ("2018-05-06", True))         # no other clue: flagged
+        # Another date on the page settles the order; so does the language.
+        for clue in ("Delivered 28/05/2018", "MwSt 19% Rechnungsdatum"):
+            ex = find_fields(page([(40, "Invoice No: 77")], [(40, "Invoice date: 05/06/2018")], [(40, clue)]))
+            self.assertEqual((ex.fields["date"], ex.confidence["date"] > 0.9), ("2018-06-05", True), clue)
+        us = find_fields(page([(40, "Invoice No: 77")], [(40, "Invoice date: 05/06/2018")], [(40, "Due 05/28/2018")]))
+        self.assertEqual(us.fields["date"], "2018-05-06")
+        pounds = find_fields(page([(40, "Invoice No: 77")], [(40, "Invoice date: 05/06/2018")], [(40, "Total £10.00")]))
+        self.assertEqual(pounds.fields["date"], "2018-06-05")                         # likely, and still flagged
+        self.assertTrue(any("two ways" in w for w in pounds.warnings))
+
+    def test_money_and_labels(self):
+        self.assertEqual((money("29.99 € TTC"), money("120 000,00 €"), money("EUR 49,99")), (29.99, 120000.0, 49.99))
+        self.assertEqual(match_label("Lieferant GmbH", "payable_to"), None)           # a company, not a label
+        self.assertEqual(match_label("Lieferant: Muster KG", "payable_to"), (3, "Muster KG"))
+        self.assertIsNone(match_label("Date d'échéance 13/12/2017", "date"))
+        self.assertIsNone(match_label("Kundennr. 47774", "id"))
+        self.assertIsNone(match_label("USt-IdNr. DE123456789", "tax"))
+        self.assertEqual(match_label("Invoice No. 123", "id"), (3, "123"))
+        self.assertEqual(parse_value("id", "471102 vom 05.06.2018"), ("471102", 1.0))
+        self.assertEqual(parse_value("id", "INV 2024 001"), ("INV 2024 001", 1.0))
+        self.assertEqual(parse_value("tax", "20,0% 81,90 € 16,38 €")[0], 16.38)
+
+    def test_the_totals_check_stays_quiet_when_it_cannot_be_sure(self):
+        self.assertIsNone(totals_issue(215.14, {"subtotal": 202.76, "tax": 123456789.0}))       # that's a tax number
+        self.assertIsNone(totals_issue(56.02, {"subtotal": 46.68}))                              # 20% tax, line unread
+        self.assertIsNone(totals_issue(571.04, {"subtotal": 496.0, "tax_unread": True}))         # mixed rates, unread
+        self.assertIsNone(totals_issue(470.15, {"subtotal": 624.9, "tax": 46.25, "printed_totals": [671.15]}))
+        self.assertIn("add up", totals_issue(8213.62, {"subtotal": 7986.07}))                    # 2.85% is no tax rate
+        self.assertIn("add up", totals_issue(996.4, {"subtotal": 830.0, "tax": 66.4}))
+        self.assertIn("add up", totals_issue(996.4, {"subtotal": 830.0, "tax": 66.4, "printed_totals": [500.0]}))
+
+    def test_a_total_column_heading_is_not_the_invoice_total(self):
+        ex = find_fields(page(
+            [(40, "Bei Spiel GmbH")], [(40, "Invoice # RE-20190610/507 issued at 2019-06-10")],
+            [(40, "Amount"), (120, "Product"), (290, "VAT"), (350, "Price"), (420, "Total")],
+            [(40, "1.00"), (120, "Design"), (290, "7%"), (350, "160.00 €"), (420, "160.00 €")],
+            [(40, "400.00"), (120, "Ballons"), (290, "19%"), (350, "0.84 €"), (420, "336.00 €")],
+            [(40, "Net total: 496.00 €")], [(150, "VAT total: 75.04 €")], [(40, "Due payable: 571.04 €")]))
+        self.assertEqual((ex.fields["id"], ex.fields["amount"], ex.totals.get("lines")), ("RE-20190610/507", 571.04, 496.0))
+        self.assertFalse(any("add up" in w for w in ex.warnings))
+
+    def test_words_are_joined_the_way_they_are_printed(self):
+        from invoice_detector.documents import _merge_words
+
+        def word(text, x0, x1, size=10):
+            return {"text": text, "x0": x0, "x1": x1, "top": 100, "bottom": 110, "size": size}
+        # typewriter font: a space is 0.6 of the font size and must not split the phrase
+        self.assertEqual([b.text for b in _merge_words([word("Lieferant", 50, 104), word("GmbH", 110, 134)], 0)],
+                         ["Lieferant GmbH"])
+        # a number the PDF stores in two pieces, with no gap between them
+        self.assertEqual([b.text for b in _merge_words([word("Nr.", 50, 70), word("4", 76, 82), word("71102", 82, 112)], 0)],
+                         ["Nr. 471102"])
+        # a real column gap still separates
+        self.assertEqual(len(_merge_words([word("Total", 50, 80), word("119,00", 300, 340)], 0)), 2)
+
+    def test_credit_note_titles(self):
+        from invoice_detector.documents import is_credit_note
+        for title, credit in (("Rechnungskorrektur", True), ("Avoir AV-2017-0005", True), ("Creditnota", True),
+                              ("Gutschrift", True), ("Gutschrift (Selbst ausgestellte Rechnung)", False),
+                              ("Handelsrechnung", False), ("Facture", False)):
+            self.assertEqual(is_credit_note(page([(40, title)], [(40, "Nr. 5")])), credit, title)
+
+
+class RealFolderBenchmarkTests(unittest.TestCase):
+    def test_a_folder_with_answers_is_scored(self):
+        import tempfile
+        from pathlib import Path
+        from invoice_detector.doc_benchmark import format_report, score_folder, vendor_matches
+        with tempfile.TemporaryDirectory() as tmp:
+            rows = ["file,id,vendor,date,amount,amount_due,kind"]
+            for name, data, doc in doc_samples.sample_docs():
+                (Path(tmp) / name).write_bytes(data)
+                t = doc.truth()
+                rows.append(f"{name},{t['id']},{t['vendor']},{t['date']},{t['amount']},,{t['kind']}")
+            rows.append("../outside.pdf,1,X,2026-01-01,1,,")          # never read: outside the folder
+            rows.append("missing.pdf,1,X,2026-01-01,1,,")
+            (Path(tmp) / "copy.pdf").write_bytes(doc_samples.sample_docs()[0][1])
+            rows.append(rows[1].replace(doc_samples.sample_docs()[0][0], "copy.pdf"))   # same bytes: counted once
+            (Path(tmp) / "truth.csv").write_text("\n".join(rows), encoding="utf-8")
+            report = score_folder(tmp, isolate=False)
+        self.assertEqual((report["documents"], report["all_four"], report["kind"]), (6, 1.0, 1.0))
+        self.assertEqual(report["totals_warnings"], 1)                 # the sample whose totals really are wrong
+        self.assertIn("all four right: 100%", format_report(report))
+        self.assertTrue(vendor_matches("Acme Supplies Ltd", "Acme Supplies"))
+        self.assertFalse(vendor_matches("Rechnung", "Acme Supplies"))
 
 
 @unittest.skipUnless(ocr_available(), "Tesseract OCR isn't installed")

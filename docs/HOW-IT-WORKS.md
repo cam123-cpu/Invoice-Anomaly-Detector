@@ -125,8 +125,13 @@ Each HTTP request carries everything the server needs to know who is asking: a s
 either in an **HttpOnly cookie** (the web app) or as a **bearer token** in the `Authorization`
 header (programs). The server keeps no "session" in memory between
 requests, so it could be restarted, or several copies run behind a load balancer, without
-logging anyone out. (One exception, covered in [section 14](#14-limits-and-what-to-build-next):
-the login rate limiter does keep in-memory state.)
+logging anyone out. The one thing that used to live in memory, the sign-in rate limiter, is now
+a table (`rate_limits`): each failed attempt is one `INSERT ... ON CONFLICT DO UPDATE`
+statement, which the database applies atomically, so five wrong passwords lock an account
+whichever copies of the app they happened to reach. Keys are stored hashed. Two other things
+needed care for several copies: all of them run `migrate` when they start, so it takes a
+PostgreSQL **advisory lock** and they queue; and two detection runs for the same company take
+a per-company lock, so one can't delete the flags the other is writing.)
 
 ### 2.5 Configuration from the environment
 
@@ -976,6 +981,35 @@ five real free invoice templates are tests the reader wasn't written against: th
 genuine bugs during development (a label taken as a vendor name, a person as payee, an unlabelled
 date, "Invoice Subtotal", a discount column misread).
 
+**Measuring it on real invoices.** Generated documents share their author's assumptions, and
+the first run on real ones showed how much: on 156 public invoices (`scripts/real_invoice_benchmark.py`:
+invoice2data's samples and the ZUGFeRD e-invoice corpus, whose embedded XML gives the right
+answers) the reader got all four fields right on **one**. It only knew English. What fixed it,
+each a general rule rather than a patch for one file:
+
+- **Languages as data** (`doc_languages.py`): labels, month names, "not this label" phrases and
+  legal forms for German, French, Dutch, Spanish and Italian, merged into the same tables.
+  "Lieferant:" is a label only with its colon; "Lieferant GmbH" is a company.
+- **Titles that carry the number**: "Handelsrechnung Nr. 471102 vom 05.06.2018", "Facture
+  n°562044387 du 02 juillet 2015". A number ends where ordinary words begin.
+- **Day-first dates**: dots always mean day-first; otherwise another date on the page (28/05)
+  or the document's language settles it, and only a truly undecided date is flagged.
+- **Words as printed**: typewriter fonts have wide spaces, some PDFs store one number in two
+  pieces, small print has narrow gaps. The word-joining thresholds now follow the font size.
+- **Vendor**: a "Seller" section with a "Name:" line, the sender line above the address window
+  ("Name - Street - Town"), legal forms, a name repeated in the footer; never a document
+  title, a column heading or the left half of a "key : value" pair.
+- **Totals**: in a row of net, tax, gross the gross is the total; a "Total" heading a column
+  isn't; and when subtotal + tax equals another printed total, that one is the total.
+- **A quieter arithmetic check**: a wrong "totals don't add up" becomes a wrong flag, so the
+  check says nothing when the tax it read is impossible, when tax is mentioned but its amount
+  wasn't read, or when another printed total does add up.
+
+Result: 78% of the 156 with all four fields right (88-94% per field), 1 false totals warning.
+The e-invoice vendors were split in half before tuning; the untouched half scored 73% when
+first run, and 84% after fixes made from its own failures, so 73% is the honest estimate for
+a layout never seen. CI runs the benchmark on every push with a floor under each set.
+
 **Isolation** (`isolation.py`). PDF and image parsers are big libraries fed bytes chosen by a
 stranger. The reading runs in a **child process** (`multiprocessing`, "spawn": nothing shared)
 with a **timeout** (a stuck child is killed) and, on Linux, an **address-space limit**
@@ -1172,6 +1206,26 @@ company's real, labelled invoices.
 
 ---
 
+### 7.x Credit notes
+
+A credit note is stored as `kind = 'credit'` with a **positive** amount; the database returns
+it negated for display (`CASE WHEN kind = 'credit' THEN -amount ...`), so sums are net and the
+`amount > 0` rule still holds for every row. Detection treats the two kinds differently:
+
+1. `match_credits()` pairs each credit with the invoice it cancels in full: same vendor, same
+   amount to the cent, invoice dated on or before the credit and within a year. A dictionary
+   keyed by (vendor, cents) makes this one pass; the most recent candidate wins and each
+   invoice is cancelled once.
+2. Both halves of a pair are flagged (`credited_invoice`, `matched_credit`). Until someone
+   reviews them neither sits in "Ready to pay", which stops both mistakes: paying a cancelled
+   invoice, and deducting a credit that was meant for it from something else.
+3. Cancelled invoices are left out of the duplicate checks, so the corrected re-issue (same
+   vendor, same amount, a few days later) is not called a duplicate.
+4. `unmatched_credit`: nothing billed by that vendor before the credit, or less than the
+   credit. `duplicate_credit`: same vendor, amount and date as another credit.
+5. The checks that learn what is normal for a vendor (amount outliers, splits, new-vendor,
+   the Isolation Forest) see invoices only.
+
 ## 8. The security model
 
 | Threat | Defence | Where |
@@ -1230,7 +1284,7 @@ an attacker somehow got markup into the page, the browser would refuse to execut
 was built with no inline scripts and no third-party libraries specifically so this strict policy
 works.
 
-Limits are listed honestly in the README: the sign-in rate limiter is per server; RLS
+Limits are listed honestly in the README: RLS
 protects against application mistakes, not against an attacker who can run arbitrary SQL as the
 app role; role checks live in the application, not the database.
 
@@ -1395,22 +1449,26 @@ that learns from their decisions."
 
 ## 14. Limits and what to build next
 
-- **Accuracy on real data is unmeasured.** The next real milestone is a pilot on one company's
-  historical invoices.
+- **Detection accuracy on real data is unmeasured** (reading accuracy now is: see 6.15). The
+  next real milestone is a pilot on one company's historical invoices.
 - **No connectors yet.** QuickBooks or Xero sync would remove manual exports.
 - **Sign-in:** SSO, two-factor and reset are tested against stand-ins (a fake identity
   provider, `.eml` files), not real Microsoft, Google or mail servers. Next: passkeys
   (WebAuthn), and SCIM so leavers are removed automatically.
-- **Scale:** one database connection per server process; detection runs inside the web request;
-  the rate limiter lives in memory. Production would add a connection pool, a background job
-  queue and Redis.
+- **Scale:** several copies of the app can run behind a load balancer (shared rate limits,
+  locked upgrades and detection runs; tested with three copies in CI). Still one database
+  connection per server process, and detection still runs inside the web request: a much
+  larger company would add a connection pool and a background job queue.
 - **Money as floating point:** `REAL` / `float` is fine for detection, but accounting systems use
   exact decimals (`numeric` in PostgreSQL, `Decimal` in Python).
-- **Credit notes** (negative amounts) aren't supported.
+- **Credit notes** are matched to an invoice only when they cancel it in full. A credit that
+  names the invoice it partly reduces isn't linked to it (the reference isn't read yet).
 - **Excel output** can't copy pictures or charts (a limit of openpyxl).
 - **ML** is re-trained on every run and isn't updated by feedback; only rule weights learn.
-- **Invoice documents:** the reader is rule-based and measured on generated invoices and template
-  replicas, not on a large set of real ones. One invoice per file (multi-invoice PDFs aren't
+- **Invoice documents:** the reader is rule-based. On 156 real public invoices it gets all four
+  fields right on 78%; those are mostly German and French samples, not a random sample of what a
+  given company receives, so measure on your own (`evaluate-documents --folder`). A vendor name
+  that exists only in a logo image is not found. One invoice per file (multi-invoice PDFs aren't
   split). Line items are summed but not stored. The AI step is tested against a stand-in for the
   API, not the real service. Next: learn from the recorded corrections (which labels and
   positions people fix most), and read e-invoices (UBL / ZUGFeRD XML) exactly.

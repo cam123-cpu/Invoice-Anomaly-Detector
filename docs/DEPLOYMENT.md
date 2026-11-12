@@ -111,6 +111,24 @@ docker compose -f docker-compose.prod.yml up -d --build app
 
 The app runs `migrate` on start; it only adds what is missing, so it is safe to run every time.
 
+### Running several copies of the app
+
+One copy is enough for a small company. To survive a crashed process, or to use more of the
+server's processors, run several:
+
+```bash
+APP_REPLICAS=3 docker compose -f docker-compose.prod.yml up -d
+```
+
+Caddy finds the copies by name and sends each request to the least busy one, dropping a copy
+that stops answering. Nothing else changes: the copies share the database, including the
+sign-in rate limits, and they take turns when upgrading the database on start and when running
+detection for the same company. `WEB_CONCURRENCY=2` instead starts two worker processes inside
+each container. On a cloud platform, set the platform's instance count; the same guarantees
+apply. Size the PostgreSQL connection limit for one connection per process. CI starts three
+copies on every push and checks that requests reach more than one and that five wrong
+passwords lock an account across all of them.
+
 ---
 
 ## B. A cloud platform
@@ -167,6 +185,13 @@ same image works too; if you build your own image, install `tesseract-ocr` and t
 
 Uploaded files are read in a separate, short-lived process with a 45-second limit and (on Linux)
 a 2 GB memory limit, so a broken file can't hang the app. Leave `DOC_ISOLATION` at its default.
+
+**How well it reads.** English, German, French, Dutch, Spanish and Italian invoices. On 156
+real public invoices, about three in four are read with number, vendor, date and total all
+correct; the rest need a field corrected on the review screen. Before rolling it out, measure
+it on your own vendors: put 30 or so of their invoices in a folder with a `truth.csv`
+(`file,id,vendor,date,amount`) and run
+`python -m invoice_detector.cli evaluate-documents --folder DIR`.
 
 **AI reading** (optional) sends invoices the app can't read by itself to Anthropic's API. It
 needs `ANTHROPIC_API_KEY` set as a secret (`ANTHROPIC_API_KEY_FILE` works too) and an admin

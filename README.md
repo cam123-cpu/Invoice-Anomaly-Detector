@@ -25,6 +25,9 @@ sorts every invoice into Ready to pay, Review first, On hold and Do not pay.
 | `shared_bank_account` | 0.70 | One bank account paid to several vendors |
 | `amount_outlier` | 0.55–0.75 | Far above the vendor's own history (robust z-score on log amounts) |
 | `totals_mismatch` | 0.45 | The invoice's own line items, subtotal, tax and total don't agree (invoices read from documents) |
+| `credited_invoice` / `matched_credit` | 0.65 | An invoice and the credit note that cancels it in full (flagged as a pair) |
+| `duplicate_credit` | 0.50 | The same credit note recorded twice |
+| `unmatched_credit` | 0.45 | A credit note from a vendor with nothing, or less, billed |
 | `split_invoice` | 0.50 | Several invoices in a few days, each under the approval threshold, together over it |
 | `near_duplicate` | 0.50 | Same vendor + amount a few days apart |
 | `similar_vendor_name` | 0.50 | Vendor name almost identical to another vendor's |
@@ -42,6 +45,25 @@ signals add up, but they never outrank one strong signal. Thresholds live in `De
 rule's weight for that company is multiplied by `(confirmed + 5) / (confirmed + dismissed + 5)`.
 Rules that keep raising false alarms fade, and `GET /metrics` reports the measured precision
 per rule. This re-weights the rules; it does not retrain the Isolation Forest.
+
+## Credit notes
+
+A credit note is a document type of its own, not a negative invoice. It is stored with a
+positive amount and its type, and shown with a minus sign, so every total is net.
+
+- **In a list:** a negative amount (`-120.00`, `(120.00)`, `120.00-`) or a Type column that
+  says credit ("Credit Memo", "Vendor Credit", "Gutschrift"...) makes the row a credit note.
+- **As a document:** recognised by its title ("Credit note", "Avoir", "Rechnungskorrektur"...);
+  the review screen has a Type box to change it.
+- **Checks of their own:** a credit for exactly an invoice's amount, from the same vendor,
+  cancels that invoice. Both are flagged as a pair (*Cancelled by a credit note* / *Cancels an
+  invoice*), so the invoice isn't paid and the credit isn't also deducted elsewhere, and the
+  re-issued invoice is not mistaken for a duplicate. A credit from a vendor with nothing billed
+  (or less billed than the credit) is flagged, as is the same credit recorded twice.
+- Credits for other amounts (a price adjustment, a return) are ordinary: they reduce what the
+  vendor is paid. They are left out of the checks that learn what is normal for a vendor.
+- The dashboard and the payment file show how much credit is included and how much is ready
+  to deduct.
 
 ## Invoice documents (PDF, Excel invoices, scans)
 
@@ -69,12 +91,34 @@ fields in amber and missing ones in red, and shows the text each value came from
   that's what a look-alike vendor looks like;
 - corrections are recorded, and totals that don't add up become a detection flag.
 
-**How accurate?** `python -m invoice_detector.cli evaluate-documents 200` reads 200 generated
-invoices (PDF and Excel, four layouts, many label wordings, date and number formats, some with
-wrong totals). Current result: every field 100%, all planted totals errors caught, no false
-alarms. CI fails if any field drops below 97%. The tests also read replicas of five popular free
-invoice templates, and OCR on simulated scans (tilted, blurred, JPEG). Real invoices vary more
-than any test set; that's why a person checks every one.
+The reader knows English, German, French, Dutch, Spanish and Italian labels
+(`doc_languages.py`; adding a language is adding its words), month names and day-first dates,
+and recognises a credit note by its title.
+
+**How accurate?** Two different answers, and the second is the one that matters:
+
+- *On generated invoices*: `cli evaluate-documents 200` reads 200 invoices this project
+  generates itself. Every field 100%, every planted totals error caught, no false alarms.
+  That only shows the reader handles the layouts its author thought of.
+- *On real invoices nobody here designed*: `scripts/real_invoice_benchmark.py` downloads two
+  public collections (156 different PDFs from 24 vendors, mostly German, French and Dutch)
+  and compares the reading with their known answers:
+
+  | Set | Documents | All four fields right | Before this work |
+  |---|---|---|---|
+  | Real company invoices (invoice2data) | 10 | 60% | 10% |
+  | E-invoices, vendors used for tuning | 102 | 77% | 0% |
+  | E-invoices, vendors held out | 44 | 84% (73% when first run, before any fix made from it) | 0% |
+
+  By field, over all 156: invoice number 88%, vendor 90%, date 94%, amount 91%. One document
+  in 156 was wrongly told its totals don't add up. CI re-runs this on every push and fails if
+  it gets worse.
+
+So expect roughly three real invoices in four to need no correction, and one in four to need
+a field fixed on the review screen. Vendors whose name exists only inside a logo image, and
+receipts that aren't invoices, are the usual misses. Measure it on your own vendors before
+relying on it: put a sample in a folder with a `truth.csv` and run
+`cli evaluate-documents --folder DIR`.
 
 **Safety:** uploaded files are parsed in a separate process with a time limit (and a memory
 limit on Linux), so a broken or hostile file can't hang the server. Files must really be what
@@ -123,7 +167,7 @@ on every push. SQLite, used for local runs, has the first two layers and the las
   help if an attacker can run arbitrary SQL as the app role, because the role sets the current
   company itself. Parameterized queries everywhere are the defence against that.
 - Role checks (admin, accountant, auditor) are enforced in the application, not the database.
-- The sign-in rate limiter lives in each server's memory, so run one web server (or move it to Redis).
+- Detection runs inside the web request (a lock makes two copies of the app take turns per company). A very large company would move it to a background job.
 - Microsoft, Google and SMTP setups are tested against stand-ins in CI, not the real services; check them with one real account when you set them up.
 - One database connection per server process. Add a connection pool for real load.
 - Amounts are stored as floating-point numbers, which is fine for detection but not for ledgers.
@@ -145,6 +189,11 @@ on every push. SQLite, used for local runs, has the first two layers and the las
 
 [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md) covers running it for a company:
 
+- **Several copies of the app:** the app keeps nothing in memory between requests. Sign-in
+  rate limits live in the database, and database upgrades and detection runs take a lock, so
+  any number of copies can run behind a load balancer. `APP_REPLICAS=3` in
+  `docker-compose.prod.yml` does it on one server; CI starts three copies and checks that they
+  share one set of rate limits.
 - **One server:** `docker-compose.prod.yml` runs HTTPS (Caddy, automatic Let's Encrypt
   certificates), PostgreSQL with row-level security, the app and nightly backups.
   `cli init-deploy` creates the secret files. CI starts this whole stack on every push and checks

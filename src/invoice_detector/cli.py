@@ -11,6 +11,7 @@
   python -m invoice_detector.cli detect COMPANY                 # run detection, print the review queue
   python -m invoice_detector.cli evaluate                       # score the detector on synthetic data
   python -m invoice_detector.cli evaluate-documents [N]         # score invoice-document reading
+  python -m invoice_detector.cli evaluate-documents --folder DIR  # ...on your own invoices (DIR/truth.csv)
   python -m invoice_detector.cli gen-keys                       # print fresh secrets (for a secrets manager)
   python -m invoice_detector.cli init-deploy DIR                # secret files for docker-compose.prod.yml
 """
@@ -212,6 +213,12 @@ def main(argv: list[str]) -> int:
         print(_fresh_secrets(), end="")
     elif cmd == "evaluate" and not args:
         print(format_report(evaluate()))
+    elif cmd == "evaluate-documents" and len(args) == 2 and args[0] == "--folder":
+        from .doc_benchmark import format_report as format_reading, score_folder
+        report = score_folder(args[1])
+        print(format_reading(report))
+        for m in report["mistakes"][:25]:
+            print(f"    {m['file']}: {m['field']} expected {m['expected']!r}, read {m['read']!r}")
     elif cmd == "evaluate-documents" and len(args) <= 1:
         from .doc_samples import evaluate_documents
         report = evaluate_documents(int(args[0]) if args else 100)
