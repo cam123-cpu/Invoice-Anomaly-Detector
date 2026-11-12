@@ -21,6 +21,7 @@ class Invoice:
     bank_idx: str | None = None  # blind index of the bank account, never the account itself
     totals_issue: str | None = None  # read from the invoice document: its own arithmetic doesn't add up
     kind: str = "invoice"            # "invoice", or "credit" for a credit note (amount stays positive)
+    reference: str | None = None     # on a credit note: the invoice number it says it applies to
 
 
 @dataclass(frozen=True)
@@ -398,23 +399,64 @@ def find_ml_outliers(invoices: list[Invoice], cfg: DetectionConfig = DEFAULT_CON
 CREDIT_MATCH_DAYS = 365   # a credit note cancels an invoice issued up to this long before it
 
 
+def _ref_key(text: str | None) -> str:
+    return re.sub(r"[^a-z0-9]", "", str(text or "").lower()).lstrip("0") or ""
+
+
+def credit_links(invoices: list[Invoice]) -> dict[str, tuple[str | None, str]]:
+    """What each credit note that names an invoice says about it: {credit id: (invoice id, status)}.
+
+    status: "full" (cancels it), "partial" (reduces it), "missing" (no such invoice on file),
+    "other_vendor" (that invoice is another vendor's), "exceeds" (the credits for it add up
+    to more than the invoice). Credits that name no invoice aren't in the result."""
+    by_number: dict[str, list[Invoice]] = defaultdict(list)
+    for inv in invoices:
+        if inv.kind == "invoice":
+            by_number[_ref_key(inv.id)].append(inv)
+    links: dict[str, tuple[str | None, str]] = {}
+    credited: dict[str, float] = defaultdict(float)
+    for credit in sorted((i for i in invoices if i.kind == "credit" and _ref_key(i.reference)),
+                         key=lambda i: (i.date, i.id)):
+        found = by_number.get(_ref_key(credit.reference), [])
+        same_vendor = [b for b in found if b.vendor == credit.vendor]
+        if not found:
+            links[credit.id] = (None, "missing")
+        elif not same_vendor:
+            links[credit.id] = (found[0].id, "other_vendor")
+        else:
+            bill = same_vendor[0]
+            credited[bill.id] += credit.amount
+            if credited[bill.id] > bill.amount + 0.005:
+                links[credit.id] = (bill.id, "exceeds")
+            elif abs(credit.amount - bill.amount) < 0.005:
+                links[credit.id] = (bill.id, "full")
+            else:
+                links[credit.id] = (bill.id, "partial")
+    return links
+
+
 def match_credits(invoices: list[Invoice]) -> dict[str, str]:
     """Which invoice each credit note cancels in full: {credit id: invoice id}.
 
-    A credit note for exactly an invoice's amount, from the same vendor, dated on or after
-    it, cancels that invoice. If several invoices fit, the most recent one before the
-    credit is taken (a correction usually follows quickly), and each invoice is cancelled
-    at most once. Credits for other amounts (a price adjustment, a returned item) match
-    nothing: they simply reduce what is owed to the vendor."""
+    A credit note that names its invoice is taken at its word (if that invoice exists, is
+    from the same vendor and the amounts are equal). Otherwise a credit for exactly an
+    invoice's amount, from the same vendor, dated on or after it, cancels that invoice. If
+    several invoices fit, the most recent one before the credit is taken (a correction
+    usually follows quickly), and each invoice is cancelled at most once. Credits for other
+    amounts (a price adjustment, a returned item) match nothing: they simply reduce what is
+    owed to the vendor."""
+    links = credit_links(invoices)
+    matched = {c: inv for c, (inv, status) in links.items() if status == "full"}
+    used: set[str] = set(matched.values())
     bills: dict[tuple[str, int], list[Invoice]] = defaultdict(list)
     for inv in invoices:
         if inv.kind == "invoice":
             bills[(inv.vendor, round(inv.amount * 100))].append(inv)
     for group in bills.values():
         group.sort(key=lambda i: (i.date, i.id))
-    used: set[str] = set()
-    matched: dict[str, str] = {}
     for credit in sorted((i for i in invoices if i.kind == "credit"), key=lambda i: (i.date, i.id)):
+        if credit.id in links:
+            continue           # it named its invoice: don't guess another one
         candidates = [b for b in bills.get((credit.vendor, round(credit.amount * 100)), ())
                       if b.id not in used and b.date <= credit.date
                       and (_day(credit) - _day(b)).days <= CREDIT_MATCH_DAYS]
@@ -436,6 +478,7 @@ def find_credit_issues(invoices: list[Invoice], matched: dict[str, str]) -> list
       or to make an account look settled.
     - duplicate_credit: the same credit recorded twice (it would be deducted twice)."""
     out = []
+    links = credit_links(invoices)
     for credit_id, bill_id in matched.items():
         out.append(Anomaly(bill_id, "credited_invoice", "high",
                            f"cancelled by credit note {credit_id} (same vendor and amount)"))
@@ -455,6 +498,16 @@ def find_credit_issues(invoices: list[Invoice], matched: dict[str, str]) -> list
             seen[key] = credit.id
         if credit.id in matched:
             continue
+        link = links.get(credit.id)
+        if link and link[1] != "partial":
+            bill_id, status = link
+            detail = {"missing": f"refers to invoice {credit.reference}, which isn't on file",
+                      "other_vendor": f"refers to invoice {bill_id}, which is from another vendor",
+                      "exceeds": f"credits for invoice {bill_id} now add up to more than the invoice itself"}[status]
+            out.append(Anomaly(credit.id, "unmatched_credit", "medium", detail))
+            continue
+        if link:
+            continue           # reduces the invoice it names, within its amount: ordinary
         before = [b for b in billed.get(credit.vendor, ()) if b.date <= credit.date]
         if not before:
             out.append(Anomaly(credit.id, "unmatched_credit", "medium",

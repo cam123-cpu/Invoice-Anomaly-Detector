@@ -326,3 +326,6 @@ tr.excluded .doc-notes ul, tr.doc-notes.excluded ul { background: var(--panel-2)
   .detail-grid { grid-template-columns: 1fr; }
   .editor input[type=text] { min-width: 0; width: 100%; }
 }
+
+.doc-ref { display: block; margin-top: 6px; width: 100%; max-width: 190px; font-size: 13px; }
+.doc-ref[hidden] { display: none; }

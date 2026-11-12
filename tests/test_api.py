@@ -668,6 +668,23 @@ class DocumentApiTests(DbTestCase):
         listed = {i["id"]: i for i in self.client.get("/invoices", headers=self.h).json()}
         self.assertEqual((listed[credit]["kind"], listed[credit]["amount"]), ("credit", -amount))
 
+    def test_an_e_invoice_and_a_credit_that_names_it(self):
+        from test_einvoice import cii
+        bill = self.extract("re-500.xml", cii(id="RE-500", total="500.00", net="420.17", tax="79.83")).json()
+        credit = self.extract("gs-1.xml", cii(id="GS-1", type="381", total="100.00", net="84.03", tax="15.97",
+                                              ref="RE-500")).json()
+        self.assertEqual((bill["method"][:14], credit["kind"], credit["fields"]["reference"]),
+                         ("E-invoice data", "credit", "RE-500"))
+        items = [{"draft": d["draft"], "file": d["file"], "kind": d["kind"], **d["fields"]} for d in (bill, credit)]
+        result = self.client.post("/documents/import", json={"items": items}, headers=self.h).json()
+        self.assertEqual(result["added"], 2)
+        queue = {q["invoice_id"] for q in self.client.get("/review-queue", headers=self.h).json()}
+        self.assertNotIn("GS-1", queue)            # a partial credit for the invoice it names: ordinary
+        listed = {i["id"]: i for i in self.client.get("/invoices", headers=self.h).json()}
+        self.assertEqual((listed["GS-1"]["reference"], listed["GS-1"]["amount"]), ("RE-500", -100.0))
+        bad = {"id": "CN-X", "vendor": "A", "amount": 1, "date": "2026-01-01", "kind": "credit", "reference": "<b>"}
+        self.assertEqual(self.client.post("/invoices", json=bad, headers=self.h).status_code, 422)
+
     def test_credit_notes_through_the_api_and_a_list(self):
         body = {"id": "CN-1", "vendor": "Acme", "amount": 25.0, "date": "2026-01-09", "kind": "credit"}
         self.assertIn(self.client.post("/invoices", json=body, headers=self.h).status_code, (200, 201))

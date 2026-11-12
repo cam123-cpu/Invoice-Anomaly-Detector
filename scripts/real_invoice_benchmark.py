@@ -97,7 +97,8 @@ def embedded_truth(xml: bytes) -> dict | None:
         return None
     return {"id": number, "vendor": seller.splitlines()[-1].strip(), "amount": float(total),
             "date": f"{issued[:4]}-{issued[4:6]}-{issued[6:]}", "amount_due": float(due) if due else "",
-            "kind": {"380": "invoice", "389": "invoice", "381": "credit", "384": "credit"}.get(code, "")}
+            # a credit note by its type, or any document whose grand total is negative
+            "kind": "credit" if code == "381" or float(total) < 0 else ("invoice" if code in ("380", "384", "389") else "")}
 
 
 def corpus_truth(folder: Path) -> list[dict]:
@@ -134,11 +135,16 @@ def main() -> int:
         rows = corpus_truth(second)
         write_truth(second, rows)
         vendors = sorted({row["vendor"] for row in rows})
+        # The page is what is scored: the answers come from the e-invoice data, so reading
+        # that data would score itself. It is measured separately below.
         reports = {
-            "Real company invoices (invoice2data)": score_folder(first),
-            "E-invoices, vendors used for tuning": score_folder(second, groups=set(vendors[0::2])),
-            "E-invoices, vendors held out": score_folder(second, groups=set(vendors[1::2])),
+            "Real company invoices (invoice2data)": score_folder(first, embedded=False),
+            "E-invoices, page only, vendors used for tuning": score_folder(second, groups=set(vendors[0::2]),
+                                                                           embedded=False),
+            "E-invoices, page only, vendors held out": score_folder(second, groups=set(vendors[1::2]),
+                                                                    embedded=False),
         }
+        exact = score_folder(second)
     failed = False
     for title, report in reports.items():
         print(format_report(report, title), end="\n\n")
@@ -146,8 +152,12 @@ def main() -> int:
     warnings = sum(r["totals_warnings"] for r in reports.values())
     documents = sum(r["documents"] for r in reports.values())
     right = sum(round(r["all_four"] * r["documents"]) for r in reports.values())
-    print(f"Overall: all four fields right on {right} of {documents} documents ({right / documents:.0%}); "
-          f"{warnings} wrongly told the totals don't add up.")
+    print(f"Overall, reading the page: all four fields right on {right} of {documents} documents "
+          f"({right / documents:.0%}); {warnings} wrongly told the totals don't add up.")
+    print()
+    print(format_report(exact, "E-invoices read from their own data (ZUGFeRD / Factur-X)"))
+    print("  (Told \"the totals don't add up\" above includes PDFs whose page contradicts their own data:"
+          " several samples in this corpus really do.)")
     if args.max_totals_warnings is not None and warnings > args.max_totals_warnings:
         failed = True
     return 1 if failed else 0

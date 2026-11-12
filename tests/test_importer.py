@@ -62,7 +62,7 @@ class MappingTests(unittest.TestCase):
     def test_typical_exports(self):
         self.assertEqual(suggest_mapping(["Invoice #", "Supplier", "Invoice Date", "Total", "IBAN"]),
                          {"id": "Invoice #", "vendor": "Supplier", "date": "Invoice Date",
-                          "amount": "Total", "bank_account": "IBAN", "kind": None})
+                          "amount": "Total", "bank_account": "IBAN", "kind": None, "reference": None})
         self.assertEqual(suggest_mapping(["Bill No", "Vendor", "Date", "Amount", "Document Type"])["kind"],
                          "Document Type")
         qb = suggest_mapping(["Date", "Transaction Type", "Num", "Name", "Memo", "Amount"])

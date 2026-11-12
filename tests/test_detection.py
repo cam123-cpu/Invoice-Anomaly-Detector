@@ -187,6 +187,30 @@ class CreditNoteTests(unittest.TestCase):
         for a in detect(with_credit):
             self.assertNotEqual(a.invoice_id, "CN1")
 
+    def test_a_credit_that_names_its_invoice(self):
+        from invoice_detector.detection import credit_links
+        base = self.history() + [inv("INV-77", amount=900.0, date="2026-01-05"),
+                                 inv("INV-78", amount=100.0, date="2026-01-06")]
+        ref = lambda i, amount, r, vendor="V": Invoice(i, vendor, amount, "2026-01-20", None, kind="credit", reference=r)  # noqa: E731
+        # partial, named: reduces INV-77, no flag (and not matched to INV-78 by amount)
+        partial = base + [ref("CN1", 100.0, "INV-77")]
+        self.assertEqual(credit_links(partial), {"CN1": ("INV-77", "partial")})
+        self.assertEqual(match_credits(partial), {})
+        self.assertEqual(self.rules(partial), {})
+        # full, named (formatting differences in the number don't matter)
+        full = base + [ref("CN1", 900.0, "inv 77")]
+        self.assertEqual(match_credits(full), {"CN1": "INV-77"})
+        # names an invoice that doesn't exist, or another vendor's
+        self.assertEqual(self.rules(base + [ref("CN1", 50.0, "INV-404")])["CN1"], {"unmatched_credit"})
+        other = base + [inv("X-1", "Other", 300.0, "2026-01-07"), ref("CN1", 50.0, "X-1")]
+        self.assertEqual(self.rules(other)["CN1"], {"unmatched_credit"})
+        # credits for one invoice that add up to more than it
+        over = base + [ref("CN1", 600.0, "INV-77"), ref("CN2", 400.0, "INV-77")]
+        fired = self.rules(over)
+        self.assertNotIn("CN1", fired)
+        self.assertEqual(fired["CN2"], {"unmatched_credit"})
+        self.assertIn("more than the invoice", next(a.detail for a in detect(over) if a.invoice_id == "CN2"))
+
     def test_a_fake_credit_cannot_launder_a_duplicate(self):
         """Attack: an invoice already paid is copied, and a credit note "cancels" the original
         so the copy no longer looks like a duplicate. The copy must not be ready to pay."""

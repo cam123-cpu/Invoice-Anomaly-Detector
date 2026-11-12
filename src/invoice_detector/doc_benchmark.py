@@ -64,21 +64,23 @@ def load_truth(path: Path) -> dict[str, dict]:
     return {row["file"]: row for row in rows}
 
 
-def score_folder(folder, truth_path=None, company: str = "", isolate: bool = True, groups=None) -> dict:
+def score_folder(folder, truth_path=None, company: str = "", isolate: bool = True, groups=None,
+                 embedded: bool = True) -> dict:
     """Read every file listed in truth.csv and compare. Identical files are counted once.
-    groups: only rows whose vendor is in this set (used to keep a hold-out apart)."""
+    groups: only rows whose vendor is in this set (used to keep a hold-out apart).
+    embedded=False reads only the page of a PDF, ignoring any e-invoice data inside it."""
     folder = Path(folder)
     truth = load_truth(Path(truth_path) if truth_path else folder / "truth.csv")
     if isolate:
         from .isolation import run_isolated
 
         def read(name, data):
-            return run_isolated("invoice_detector.documents:read_document", name, data, company)
+            return run_isolated("invoice_detector.documents:read_document", name, data, company, embedded)
     else:
         from .documents import read_document
 
         def read(name, data):
-            return read_document(name, data, company)
+            return read_document(name, data, company, embedded)
 
     right = dict.fromkeys(FIELDS, 0)
     by_vendor: dict[str, list[int]] = {}
