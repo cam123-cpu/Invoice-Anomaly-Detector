@@ -31,6 +31,8 @@ class TenantSeedMixin:
             self.app.add_document_invoices(org, [{"id": "DOC-1", "vendor": "Acme", "amount": 50.0,
                                                   "date": "2026-01-07", "sha256": "f" * 64, "filename": "a.pdf",
                                                   "method": "PDF text", "totals_issue": f"{who}-issue"}], who)
+            # both taught the reader about the same vendor, differently
+            self.app.learn_reading(org, "acme", "amount", "total" if who == "alice" else "balance due", True)
 
 
 class TenantIsolationTests(TenantSeedMixin, DbTestCase):
@@ -79,6 +81,10 @@ class TenantIsolationTests(TenantSeedMixin, DbTestCase):
         with self.assertRaises(ValueError):  # A's ciphertext is unreadable with B's keys
             self.app.vault(self.b).decrypt(row[self.a]["bank_enc"], f"invoices.bank:{self.a}:INV-1")
         self.assertEqual(self.app.get_bank_account(self.a, "INV-1"), "SHARED-ACCT")
+
+    def test_what_the_reader_learned_stays_in_its_company(self):
+        self.assertEqual(self.app.reading_hints(self.a), {"acme": {"amount": ["total"]}})
+        self.assertEqual(self.app.reading_hints(self.b), {"acme": {"amount": ["balance due"]}})
 
     def test_detection_never_mixes_companies(self):
         # A and B each pay a different vendor into the same account. Within one company
@@ -150,6 +156,7 @@ class PostgresRowLevelSecurityTests(TenantSeedMixin, DbTestCase):
             "INSERT INTO audit_log (org_id, at, username, action, detail) VALUES (%s, 'now', 'x', 'x', 'x')",
             "INSERT INTO documents (org_id, sha256, filename, method, invoice_id, uploaded_by, uploaded_at) "
             "VALUES (%s, 'x', 'x', 'x', 'INV-2', 'x', 'now')",
+            "INSERT INTO reading_hints (org_id, vendor, field, label, hits) VALUES (%s, 'acme', 'amount', 'x', 99)",
         ]
         for statement in statements:
             with self.assertRaises(self.denied, msg=statement):

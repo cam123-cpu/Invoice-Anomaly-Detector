@@ -179,6 +179,35 @@ class HostileXmlTests(unittest.TestCase):
         self.assertEqual(ex.fields["id"], truth["id"])
 
 
+class HostileShapesTests(unittest.TestCase):
+    def test_deep_wide_or_attribute_heavy_xml_is_cheap(self):
+        import time
+        n = 140000
+        for data in (b"<Invoice>" + b"<a>" * n + b"</a>" * n + b"</Invoice>",
+                     b"<Invoice>" + b"<ID/>" * 380000 + b"</Invoice>",
+                     b"<Invoice " + b" ".join(b'a%d="1"' % i for i in range(140000)) + b"/>"):
+            start = time.perf_counter()
+            einvoice.parse_xml(data)
+            self.assertLess(time.perf_counter() - start, 3)
+
+    def test_a_compressed_attachment_bomb_is_not_expanded(self):
+        """A few hundred KB in the PDF, 100 MB once decompressed: pypdf's own limit stops it, and the
+        page is read instead."""
+        from pypdf import PdfReader, PdfWriter
+        from pypdf.generic import StreamObject
+        _, data, doc = next(s for s in doc_samples.sample_docs() if s[0].endswith(".pdf"))
+        writer = PdfWriter(clone_from=PdfReader(io.BytesIO(data)))
+        writer.add_attachment("factur-x.xml", b"<a>" + b" " * (100 * 1024 * 1024) + b"</a>")
+        for i, obj in enumerate(writer._objects):
+            if isinstance(obj, StreamObject) and obj.get("/Type") == "/EmbeddedFile":
+                writer._objects[i] = obj.flate_encode()
+        out = io.BytesIO()
+        writer.write(out)
+        self.assertLess(len(out.getvalue()), 2 * 1024 * 1024)
+        self.assertIsNone(einvoice.from_pdf(out.getvalue()))
+        self.assertEqual(read_document("x.pdf", out.getvalue()).fields["id"], doc.truth()["id"])
+
+
 class EmbeddedDataTests(unittest.TestCase):
     def test_a_pdf_carrying_its_own_data_is_read_from_it(self):
         _, _, doc = next(s for s in doc_samples.sample_docs() if s[0].endswith(".pdf"))

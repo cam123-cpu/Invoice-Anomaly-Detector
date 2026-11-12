@@ -201,9 +201,15 @@ class DocumentIntake:
             if r["id"] in already:
                 skipped.append({"file": r["filename"], "reason": f"invoice {r['id']} is already on file"})
         added = [r for r in rows if r["id"] not in already]
+        taught = []
         for r in added:
             for field, label, helped in r["teach"]:
                 self.db.learn_reading(user["org"], canonical_vendor(r["vendor"]), field, label, helped)
+                if helped and field in r["corrections"]:
+                    taught.append(f"{r['vendor'][:60]}: {LABEL_NAMES[field].lower()} beside \"{label}\"")
+        if taught:
+            # What the reader learned is accountable: it pre-fills the next invoices for everyone.
+            self.db.audit(user["org"], user["sub"], "reader_taught", "; ".join(taught)[:500])
         corrected = sum(len(r["corrections"]) for r in added)
         if added:
             self.db.audit(user["org"], user["sub"], "documents_imported",

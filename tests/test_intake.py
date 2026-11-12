@@ -208,6 +208,9 @@ class LearningTests(IntakeTestCase):
         result = self.intake.import_drafts(self.user, [self.checked(first, amount=1200.0)])
         self.assertEqual(result["fields_corrected"], 1)
         self.assertEqual(self.app.reading_hints(self.a), {"harbour freight": {"amount": ["total"]}})
+        log = [e for e in self.app.list_audit(self.a) if e["action"] == "reader_taught"]
+        self.assertEqual(len(log), 1)
+        self.assertIn('Harbour Freight Ltd: total amount beside "total"', log[0]["detail"])
 
         second = self.intake.extract(self.user, "b.pdf", deposit_invoice("Harbour Freight Ltd", "HF-2", 700.0, 500.0))
         self.assertEqual(second["fields"]["amount"], 700.0)
