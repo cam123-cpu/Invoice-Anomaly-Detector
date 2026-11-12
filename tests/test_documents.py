@@ -271,6 +271,42 @@ class OtherLanguagesTests(unittest.TestCase):
             self.assertEqual(is_credit_note(page([(40, title)], [(40, "Nr. 5")])), credit, title)
 
 
+class VendorAndCreditRulesTests(unittest.TestCase):
+    def test_the_account_holder_in_a_packed_footer_line_is_the_vendor(self):
+        ex = find_fields(page([(380, "ALEXINUX")], [(380, "27 rue Henri Rolland")], [(380, "69100 Villeurbanne")],
+                              [(240, "Facture n° 2022089083")], [(56, "Date : 28/11/2022")],
+                              [(56, "Total TTC"), (400, "49,00 €")],
+                              [(120, "BRED BANQUE POPULAIRE – Titulaire du compte : NETPRESSE")], [(278, "NETPRESSE")]))
+        self.assertEqual(ex.fields["vendor"], "NETPRESSE")
+
+    def test_sold_by_names_the_seller(self):
+        ex = find_fields(page([(10, "Sold By : WS Retail Services Pvt. Ltd.,")], [(10, "Invoice No: FAKE-1")],
+                              [(10, "Invoice Date: 2016-02-15")], [(300, "Anushrut Singh")], [(10, "Total"), (400, "730.00")]))
+        self.assertEqual(ex.fields["vendor"], "WS Retail Services Pvt. Ltd.")
+
+    def test_a_payee_who_is_a_person_still_gives_way_to_the_business(self):
+        ex = find_fields(page([(40, "Bright Windows Cleaning")], [(40, "Invoice # 51")], [(40, "Date: 2026-01-05")],
+                              [(40, "Make all checks payable to John Smith")], [(40, "Total"), (300, "$80.00")]))
+        self.assertEqual(ex.fields["vendor"], "Bright Windows Cleaning")
+        self.assertTrue(any("John Smith" in w for w in ex.warnings))
+
+    def test_sentences_and_item_lines_are_not_names(self):
+        from invoice_detector.documents import looks_like_name
+        for text in ("Prijzen zijn inclusief BTW", "Rs 1939 x 1 Night x 1 Room", "Retail Invoices/Bill",
+                     "Preise sind Endpreise", "Thank you for your order"):
+            self.assertFalse(looks_like_name(text), text)
+        for text in ("Coolblue B.V.", "OYO 4189 Resort Nanganallur", "e-Luscious Nederland B.V."):
+            self.assertTrue(looks_like_name(text), text)
+
+    def test_a_document_whose_only_total_is_negative_is_a_credit(self):
+        ex = find_fields(page([(40, "Muster GmbH")], [(40, "Korrektur Nr. RK-1 vom 16.09.2019")],
+                              [(40, "Endbetrag"), (300, "-8,79")]))
+        self.assertEqual((ex.kind, ex.fields["amount"]), ("credit", 8.79))
+        self.assertTrue(any("negative" in w for w in ex.warnings))
+        plain = find_fields(page([(40, "Muster GmbH")], [(40, "Rechnung Nr. 5")], [(40, "Endbetrag"), (300, "8,79")]))
+        self.assertEqual(plain.kind, "invoice")
+
+
 class RealFolderBenchmarkTests(unittest.TestCase):
     def test_a_folder_with_answers_is_scored(self):
         import tempfile

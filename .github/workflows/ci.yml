@@ -223,10 +223,11 @@ jobs:
           sudo apt-get install -y -qq tesseract-ocr > /dev/null
           pip install -e ".[ocr]" pypdf
       # Two public collections at fixed commits; nothing from them is stored in this repository.
-      # The numbers are printed in full. The floor is set below today's results (60% / 77% / 84%),
-      # so the job fails when reading gets worse, not when it merely isn't perfect.
+      # The numbers are printed in full. The floor is set below today's page-reading results
+      # (70% / 79% / 84%), so the job fails when reading gets worse, not when it merely isn't
+      # perfect; e-invoice data must be read exactly.
       - name: Read them and compare with the right answers
-        run: python scripts/real_invoice_benchmark.py --min-all-four 0.5 --max-totals-warnings 3
+        run: python scripts/real_invoice_benchmark.py --min-all-four 0.6 --min-exact 0.99 --max-totals-warnings 3
 
   secret-scan:
     name: secret scan (whole git history)
