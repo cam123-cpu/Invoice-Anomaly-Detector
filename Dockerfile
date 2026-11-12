@@ -1,4 +1,4 @@
-FROM python:3.12-slim
+FROM python:3.15-slim
 # Tesseract reads scanned and photographed invoices (OCR), entirely inside this container.
 RUN apt-get update && apt-get install -y --no-install-recommends tesseract-ocr \
     && rm -rf /var/lib/apt/lists/*
