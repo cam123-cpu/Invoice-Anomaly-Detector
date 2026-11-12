@@ -61,6 +61,7 @@ RULE_WEIGHT = {
     "matched_credit": 0.65,
     "unmatched_credit": 0.45,
     "duplicate_credit": 0.5,
+    "reissued_invoice": 0.35,
     "split_invoice": 0.50,
     "near_duplicate": 0.50,
     "similar_vendor_name": 0.50,
@@ -90,6 +91,8 @@ RULE_INFO = {
     "matched_credit": ("Cancels an invoice", "This credit note cancels a specific invoice in full"),
     "unmatched_credit": ("Credit with no matching invoices", "Credit note from a vendor with nothing, or less, billed"),
     "duplicate_credit": ("Duplicate credit note", "Same vendor, amount and date as another credit note"),
+    "reissued_invoice": ("Replaces a cancelled invoice",
+                         "Same vendor and amount as an invoice a credit note cancelled: pay it once the credit is confirmed"),
 }
 
 
@@ -463,6 +466,29 @@ def find_credit_issues(invoices: list[Invoice], matched: dict[str, str]) -> list
     return out
 
 
+def find_reissues(invoices: list[Invoice], matched: dict[str, str], days: int = 90) -> list[Anomaly]:
+    """reissued_invoice: a later invoice for the same vendor and amount as one a credit note
+    cancelled. Usually the corrected copy, and not a duplicate, but it is exactly what a
+    fake credit note would be used for: "cancel" an invoice that was already paid, so its
+    copy no longer looks like a duplicate and is paid a second time. So the copy waits,
+    lightly flagged, until someone has confirmed the credit note with the vendor."""
+    by_id = {i.id: i for i in invoices}
+    cancelled = {bill_id: credit_id for credit_id, bill_id in matched.items()}
+    out, taken = [], set()
+    for bill_id, credit_id in sorted(cancelled.items()):
+        original = by_id[bill_id]
+        for inv in sorted(invoices, key=lambda i: (i.date, i.id)):
+            if (inv.kind == "invoice" and inv.id not in cancelled and inv.id not in taken
+                    and inv.vendor == original.vendor and abs(inv.amount - original.amount) < 0.005
+                    and 0 <= (_day(inv) - _day(original)).days <= days and inv.id != bill_id):
+                taken.add(inv.id)
+                out.append(Anomaly(inv.id, "reissued_invoice", "low",
+                                   f"same vendor and amount as invoice {bill_id}, which credit note {credit_id} "
+                                   "cancels: pay once that credit is confirmed with the vendor"))
+                break
+    return out
+
+
 # ---------------------------------------------------------------- combine
 def detect(invoices: list[Invoice], cfg: DetectionConfig = DEFAULT_CONFIG) -> list[Anomaly]:
     # Credit notes are not purchases. The checks that learn what is normal for a vendor
@@ -476,6 +502,7 @@ def detect(invoices: list[Invoice], cfg: DetectionConfig = DEFAULT_CONFIG) -> li
     live = [i for i in bills if i.id not in cancelled]
     found = [
         *find_duplicates(live),
+        *find_reissues(bills, matched),
         *find_near_duplicates(live, cfg),
         *find_amount_outliers(bills, cfg),
         *find_bank_account_changes(invoices),
