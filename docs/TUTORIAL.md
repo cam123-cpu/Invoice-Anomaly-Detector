@@ -126,7 +126,12 @@ history to compare with). You'll see a table with one row per file:
 - Untick a row to leave that file out. Nothing is saved until you click **Add invoices**.
 
 - Under each file name is its **type**: Invoice or Credit note. A credit note is recognised by
-  its title; change the box if the reader got it wrong.
+  its title; change the box if the reader got it wrong. For a credit note, a second box says
+  which invoice it corrects, when the reader found it.
+- E-invoices (an .xml file, or a PDF with the data inside) say *E-invoice data* under the file
+  name: every value comes from the data, not from reading the page.
+- If you correct a field, the app remembers where that vendor prints it, and reads their next
+  invoice there.
 
 The results show which of the new invoices were flagged and why. With the samples you'll see a
 new bank account (Stark Freight), a look-alike vendor (Acme Suplies), totals that don't add up

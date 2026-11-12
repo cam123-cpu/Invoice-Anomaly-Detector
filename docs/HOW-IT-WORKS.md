@@ -1010,6 +1010,36 @@ The e-invoice vendors were split in half before tuning; the untouched half score
 first run, and 84% after fixes made from its own failures, so 73% is the honest estimate for
 a layout never seen. CI runs the benchmark on every push with a floor under each set.
 
+A second round, again general rules only, took the page reading to **80%** of the 156 (number
+90%, vendor 96%, date 96%, total 94%) with the held-out half unchanged at 84%:
+
+- Letters join into words by a share of the font size (`x_tolerance_ratio=0.15`), not a fixed
+  1.5 points: big kerned titles ("Rechnungskor rektur") stay whole.
+- Payee labels: *Sold by*, *Payment received by*, the account holder in six languages, also
+  inside packed footer lines ("BANK – Titulaire du compte : NETPRESSE"). A strong label naming a
+  company now beats the name at the top, which is often the customer's address window.
+- Sentences ("Prijzen zijn inclusief BTW") and item lines ("Rs 1939 x 1 Night") are never names.
+- A document whose only total is printed negative is a credit note.
+
+**E-invoices** (`einvoice.py`). ZUGFeRD 1/2, Factur-X and XRechnung (UN/CEFACT CII), UBL 2.1
+(PEPPOL, XRechnung) and FatturaPA all carry the invoice as XML, attached inside the PDF or as
+the file itself. Elements are found by local name, so namespace versions don't matter. When the
+data is there, `read_document` returns it with confidence 0.99 and checks the page against it
+(`compare_with_page`): a page total, number or bank account that appears nowhere in the data,
+while the data's own value appears nowhere on the page, means the PDF contradicts itself. That
+becomes a warning and the `totals_mismatch` flag. On the ZUGFeRD corpus: all 146 PDFs and 71
+standalone UBL/CII files read with every field exact; the page check raised no false alarm on
+the consistent ones and found six real contradictions in the sample files. Parsing uses
+defusedxml (no DTDs or entities), a 2 MB cap, and pypdf's own 75 MB decompression limit.
+
+**Learning from corrections.** Each draft carries, signed, the labelled values the page
+offered for the number, date and total (`page_candidates`). At import `_lessons()` compares
+them with what the person confirmed: a field corrected to a value printed beside another label
+records a hit for that label (table `reading_hints`, per company and canonical vendor, under
+row-level security). The next invoice from that vendor is read with those labels preferred
+(`_LEARNED` context in `best()`); keeping the value adds a hit, correcting it away a miss, and a
+label is used while hits > misses. New lessons go to the activity log.
+
 **Isolation** (`isolation.py`). PDF and image parsers are big libraries fed bytes chosen by a
 stranger. The reading runs in a **child process** (`multiprocessing`, "spawn": nothing shared)
 with a **timeout** (a stuck child is killed) and, on Linux, an **address-space limit**
@@ -1212,17 +1242,26 @@ A credit note is stored as `kind = 'credit'` with a **positive** amount; the dat
 it negated for display (`CASE WHEN kind = 'credit' THEN -amount ...`), so sums are net and the
 `amount > 0` rule still holds for every row. Detection treats the two kinds differently:
 
-1. `match_credits()` pairs each credit with the invoice it cancels in full: same vendor, same
-   amount to the cent, invoice dated on or before the credit and within a year. A dictionary
-   keyed by (vendor, cents) makes this one pass; the most recent candidate wins and each
-   invoice is cancelled once.
+1. `credit_links()` first takes credits at their word: one that names its invoice
+   (`invoices.reference`, from e-invoice data, the page, an *Applies to* column or the review
+   screen) is linked to it as **full** (same amount), **partial** (less; ordinary),
+   **missing** (no such invoice), **other_vendor** or **exceeds** (the credits for that invoice
+   now add up to more than it). Numbers are compared without punctuation or leading zeros.
+   Then `match_credits()` pairs each remaining credit with the invoice it cancels in full:
+   same vendor, same amount to the cent, invoice dated on or before the credit and within a
+   year. A dictionary keyed by (vendor, cents) makes this one pass; the most recent candidate
+   wins and each invoice is cancelled once.
 2. Both halves of a pair are flagged (`credited_invoice`, `matched_credit`). Until someone
    reviews them neither sits in "Ready to pay", which stops both mistakes: paying a cancelled
    invoice, and deducting a credit that was meant for it from something else.
 3. Cancelled invoices are left out of the duplicate checks, so the corrected re-issue (same
-   vendor, same amount, a few days later) is not called a duplicate.
+   vendor, same amount, a few days later) is not called a duplicate. It gets
+   `reissued_invoice` instead (weight 0.35, *hold*): found in the pen test, a fake credit note
+   could otherwise "cancel" an invoice that was already paid so that its copy sailed through
+   as clean. The copy waits until someone has confirmed the credit with the vendor.
 4. `unmatched_credit`: nothing billed by that vendor before the credit, or less than the
-   credit. `duplicate_credit`: same vendor, amount and date as another credit.
+   credit, or a named invoice that is missing, another vendor's, or over-credited.
+   `duplicate_credit`: same vendor, amount and date as another credit.
 5. The checks that learn what is normal for a vendor (amount outliers, splits, new-vendor,
    the Isolation Forest) see invoices only.
 
@@ -1461,17 +1500,19 @@ that learns from their decisions."
   larger company would add a connection pool and a background job queue.
 - **Money as floating point:** `REAL` / `float` is fine for detection, but accounting systems use
   exact decimals (`numeric` in PostgreSQL, `Decimal` in Python).
-- **Credit notes** are matched to an invoice only when they cancel it in full. A credit that
-  names the invoice it partly reduces isn't linked to it (the reference isn't read yet).
+- **Credit notes** that name no invoice are matched only when they cancel one in full; a partial
+  credit with no reference simply reduces what the vendor is paid. The payment file doesn't yet
+  net a partial credit against the specific invoice it names.
 - **Excel output** can't copy pictures or charts (a limit of openpyxl).
 - **ML** is re-trained on every run and isn't updated by feedback; only rule weights learn.
-- **Invoice documents:** the reader is rule-based. On 156 real public invoices it gets all four
-  fields right on 78%; those are mostly German and French samples, not a random sample of what a
-  given company receives, so measure on your own (`evaluate-documents --folder`). A vendor name
-  that exists only in a logo image is not found. One invoice per file (multi-invoice PDFs aren't
-  split). Line items are summed but not stored. The AI step is tested against a stand-in for the
-  API, not the real service. Next: learn from the recorded corrections (which labels and
-  positions people fix most), and read e-invoices (UBL / ZUGFeRD XML) exactly.
+- **Invoice documents:** e-invoices are exact; for other PDFs and scans the reader is
+  rule-based and gets all four fields right on 80% of 156 real public invoices, mostly German
+  and French samples rather than what a given company receives, so measure on your own
+  (`evaluate-documents --folder`). A vendor name that exists only in a logo image is not found.
+  Learning only chooses among labels the reader already knows; it can't learn a brand-new
+  label. One invoice per file (multi-invoice PDFs aren't split; a FatturaPA batch reads its
+  first invoice and says so). Line items are summed but not stored. The AI step is tested
+  against a stand-in for the API, not the real service.
 
 ---
 
