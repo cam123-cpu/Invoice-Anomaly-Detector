@@ -20,6 +20,7 @@ class Invoice:
     date: str  # ISO yyyy-mm-dd
     bank_idx: str | None = None  # blind index of the bank account, never the account itself
     totals_issue: str | None = None  # read from the invoice document: its own arithmetic doesn't add up
+    kind: str = "invoice"            # "invoice", or "credit" for a credit note (amount stays positive)
 
 
 @dataclass(frozen=True)
@@ -56,6 +57,10 @@ RULE_WEIGHT = {
     "shared_bank_account": 0.70,
     "amount_outlier": 0.55,
     "totals_mismatch": 0.45,
+    "credited_invoice": 0.65,
+    "matched_credit": 0.65,
+    "unmatched_credit": 0.45,
+    "duplicate_credit": 0.5,
     "split_invoice": 0.50,
     "near_duplicate": 0.50,
     "similar_vendor_name": 0.50,
@@ -81,6 +86,10 @@ RULE_INFO = {
     "round_amount": ("Round amount", "Suspiciously round figure"),
     "weekend_invoice": ("Weekend date", "Invoice is dated on a weekend"),
     "totals_mismatch": ("Totals don't add up", "The invoice's line items, subtotal, tax and total don't agree"),
+    "credited_invoice": ("Cancelled by a credit note", "A credit note for the same vendor and amount cancels this invoice"),
+    "matched_credit": ("Cancels an invoice", "This credit note cancels a specific invoice in full"),
+    "unmatched_credit": ("Credit with no matching invoices", "Credit note from a vendor with nothing, or less, billed"),
+    "duplicate_credit": ("Duplicate credit note", "Same vendor, amount and date as another credit note"),
 }
 
 
@@ -382,24 +391,106 @@ def find_ml_outliers(invoices: list[Invoice], cfg: DetectionConfig = DEFAULT_CON
             for inv_id, score in scores.items() if score > cutoff]
 
 
+# ---------------------------------------------------------------- credit notes
+CREDIT_MATCH_DAYS = 365   # a credit note cancels an invoice issued up to this long before it
+
+
+def match_credits(invoices: list[Invoice]) -> dict[str, str]:
+    """Which invoice each credit note cancels in full: {credit id: invoice id}.
+
+    A credit note for exactly an invoice's amount, from the same vendor, dated on or after
+    it, cancels that invoice. If several invoices fit, the most recent one before the
+    credit is taken (a correction usually follows quickly), and each invoice is cancelled
+    at most once. Credits for other amounts (a price adjustment, a returned item) match
+    nothing: they simply reduce what is owed to the vendor."""
+    bills: dict[tuple[str, int], list[Invoice]] = defaultdict(list)
+    for inv in invoices:
+        if inv.kind == "invoice":
+            bills[(inv.vendor, round(inv.amount * 100))].append(inv)
+    for group in bills.values():
+        group.sort(key=lambda i: (i.date, i.id))
+    used: set[str] = set()
+    matched: dict[str, str] = {}
+    for credit in sorted((i for i in invoices if i.kind == "credit"), key=lambda i: (i.date, i.id)):
+        candidates = [b for b in bills.get((credit.vendor, round(credit.amount * 100)), ())
+                      if b.id not in used and b.date <= credit.date
+                      and (_day(credit) - _day(b)).days <= CREDIT_MATCH_DAYS]
+        if candidates:
+            bill = candidates[-1]
+            used.add(bill.id)
+            matched[credit.id] = bill.id
+    return matched
+
+
+def find_credit_issues(invoices: list[Invoice], matched: dict[str, str]) -> list[Anomaly]:
+    """Checks that only make sense for credit notes.
+
+    - credited_invoice / matched_credit: an invoice and the credit note that cancels it.
+      Both are flagged, as a pair: paying the invoice anyway is money lost, and deducting
+      the credit from some other payment as well would short the vendor.
+    - unmatched_credit: a credit note from a vendor with nothing billed before it, or for
+      more than the vendor has ever billed. Fake credits are used to hide missing money
+      or to make an account look settled.
+    - duplicate_credit: the same credit recorded twice (it would be deducted twice)."""
+    out = []
+    for credit_id, bill_id in matched.items():
+        out.append(Anomaly(bill_id, "credited_invoice", "high",
+                           f"cancelled by credit note {credit_id} (same vendor and amount)"))
+        out.append(Anomaly(credit_id, "matched_credit", "medium",
+                           f"cancels invoice {bill_id} (same vendor and amount)"))
+    billed: dict[str, list[Invoice]] = defaultdict(list)
+    for inv in invoices:
+        if inv.kind == "invoice":
+            billed[inv.vendor].append(inv)
+    seen: dict[tuple, str] = {}
+    for credit in sorted((i for i in invoices if i.kind == "credit"), key=lambda i: (i.date, i.id)):
+        key = (credit.vendor, round(credit.amount * 100), credit.date)
+        if key in seen:
+            out.append(Anomaly(credit.id, "duplicate_credit", "medium",
+                               f"same vendor, amount and date as credit note {seen[key]}"))
+        else:
+            seen[key] = credit.id
+        if credit.id in matched:
+            continue
+        before = [b for b in billed.get(credit.vendor, ()) if b.date <= credit.date]
+        if not before:
+            out.append(Anomaly(credit.id, "unmatched_credit", "medium",
+                               f"credit note from '{credit.vendor}', which has no invoices on file before it"))
+        elif credit.amount > sum(b.amount for b in before) + 0.005:
+            out.append(Anomaly(credit.id, "unmatched_credit", "medium",
+                               f"credit of {credit.amount:,.2f} is more than everything '{credit.vendor}' "
+                               f"has billed ({sum(b.amount for b in before):,.2f})"))
+    return out
+
+
 # ---------------------------------------------------------------- combine
 def detect(invoices: list[Invoice], cfg: DetectionConfig = DEFAULT_CONFIG) -> list[Anomaly]:
+    # Credit notes are not purchases. The checks that learn what is normal for a vendor
+    # (amounts, timing, splits, the ML model) look at invoices only, so a credit can't skew
+    # them or be mistaken for a duplicate of the invoice it cancels.
+    bills = [i for i in invoices if i.kind == "invoice"]
+    matched = match_credits(invoices)
+    cancelled = set(matched.values())
+    # An invoice that was cancelled and then re-issued correctly is not a duplicate of its
+    # replacement: leave cancelled invoices out of the duplicate checks.
+    live = [i for i in bills if i.id not in cancelled]
     found = [
-        *find_duplicates(invoices),
-        *find_near_duplicates(invoices, cfg),
-        *find_amount_outliers(invoices, cfg),
+        *find_duplicates(live),
+        *find_near_duplicates(live, cfg),
+        *find_amount_outliers(bills, cfg),
         *find_bank_account_changes(invoices),
         *find_shared_bank_accounts(invoices),
-        *find_split_invoices(invoices, cfg),
-        *find_below_threshold(invoices, cfg),
+        *find_split_invoices(bills, cfg),
+        *find_below_threshold(bills, cfg),
         *find_similar_vendor_names(invoices, cfg),
-        *find_new_vendor_large(invoices, cfg),
-        *find_round_amounts(invoices),
-        *find_weekend_invoices(invoices),
+        *find_new_vendor_large(bills, cfg),
+        *find_round_amounts(bills),
+        *find_weekend_invoices(bills),
         *find_totals_mismatch(invoices),
+        *find_credit_issues(invoices, matched),
     ]
     if cfg.use_ml:
-        found += find_ml_outliers(invoices, cfg)
+        found += find_ml_outliers(bills, cfg)
     return sorted(found, key=lambda a: (SEVERITY_RANK[a.severity], a.invoice_id, a.rule))
 
 

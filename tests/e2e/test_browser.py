@@ -225,7 +225,7 @@ class BrowserTest(unittest.TestCase):
         pay = xlsx(dl.value.path())
         self.assertEqual(pay.sheetnames, ["Summary", "Ready to pay", "Review first", "On hold", "Do not pay"])
         stopped = pay["Do not pay"]
-        self.assertEqual((stopped.cell(2, 1).value, stopped.cell(2, 8).value),
+        self.assertEqual((stopped.cell(2, 1).value, stopped.cell(2, 9).value),
                          ("INV-0249", "Vendor says they never changed banks"))
         p.fill("input[type=search]", "nothing-matches-this")
         p.wait_for_selector("text=No matches")
@@ -390,7 +390,8 @@ class BrowserTest(unittest.TestCase):
         self.assertEqual(p.input_value("#map-amount"), "Gross amount (EUR)")
         p.click("button:text('Import invoices')")
         p.wait_for_selector(".kpi:has-text('Invoices added')")
-        self.assertEqual(p.inner_text(".kpi:has-text('Invoices added') .value"), "260")
+        self.assertEqual(p.inner_text(".kpi:has-text('Invoices added') .value"), "265")
+        self.assertEqual(p.inner_text(".kpi:has-text('Of which credit notes') .value"), "3")
         p.click("a:text('Open review queue')")
         p.wait_for_selector("td.mono:text('RE-2026-0251')")
         self.assertEqual(self.errors, [])
@@ -404,7 +405,11 @@ class BrowserTest(unittest.TestCase):
         p.click("#mode-docs")
         p.click("#try-docs")
         p.wait_for_selector("text=Check what was read")
-        self.assertEqual(p.locator(".doc-table tbody tr.doc-row").count(), 4)
+        self.assertEqual(p.locator(".doc-table tbody tr.doc-row").count(), 6)
+        # The credit note is recognised as one; the others are invoices.
+        kinds = {name: p.locator(f".doc-table tbody tr:has-text('{name}') select.doc-kind").input_value()
+                 for name in ("globex-corp-credit-note-118.pdf", "globex-corp-7730.pdf")}
+        self.assertEqual(kinds, {"globex-corp-credit-note-118.pdf": "credit", "globex-corp-7730.pdf": "invoice"})
         self.assertIn("don't add up", p.inner_text(".doc-table tbody"))
         self.assertEqual(p.locator(".doc-input.missing").count(), 0)
         stark = p.locator(".doc-table tbody tr:has-text('stark-freight-8811.pdf')")
@@ -417,15 +422,16 @@ class BrowserTest(unittest.TestCase):
         p.click("#add-docs")
         p.wait_for_selector("#doc-flagged")
         flagged = p.inner_text("#doc-flagged")
-        for label in ("Totals don't add up", "New bank account", "Look-alike vendor"):
+        for label in ("Totals don't add up", "New bank account", "Look-alike vendor",
+                      "Cancelled by a credit note", "Cancels an invoice", "Credit note"):
             self.assertIn(label, flagged)
-        self.assertEqual(p.inner_text(".kpi:has-text('Invoices added') .value"), "4")
+        self.assertEqual(p.inner_text(".kpi:has-text('Invoices added') .value"), "6")
         self.shot("16-documents-result")
         # The same files again: recognised, nothing added twice.
         p.click("button:text('Read more invoices')")
         p.click("#try-docs")
         p.wait_for_selector("#doc-others")
-        self.assertEqual(p.locator("#doc-others tbody tr").count(), 4)
+        self.assertEqual(p.locator("#doc-others tbody tr").count(), 6)
         self.assertIn("already imported", p.inner_text("#doc-others"))
         # An invoice form uploaded as a list is recognised as a document.
         p.click("#mode-list")

@@ -87,6 +87,8 @@ class Doc:
     symbol: str = "$"
     labels: dict = field(default_factory=dict)
     total_error: float = 0.0         # >0: the printed total is wrong by this much
+    credit: bool = False             # a credit note instead of an invoice
+    negative_totals: bool = False    # credit notes often print their amounts with a minus sign
 
     @property
     def subtotal(self) -> float:
@@ -106,6 +108,8 @@ class Doc:
 
     def m(self, amount: float, symbol: bool = True) -> str:
         text = f"{amount:,.2f}"
+        if self.negative_totals and symbol:
+            text = "-" + text
         if self.money_format == "eu":
             text = text.replace(",", "X").replace(".", ",").replace("X", ".")
             return f"{text} {self.symbol}" if symbol else text
@@ -115,11 +119,27 @@ class Doc:
         return when.strftime(self.date_format)
 
     def label(self, key: str, default: str) -> str:
+        if self.credit and key in CREDIT_LABELS:
+            return CREDIT_LABELS[key].get(self.style, CREDIT_LABELS[key]["classic"])
         return self.labels.get(key, default)
+
+    @property
+    def title(self) -> str:
+        return "CREDIT NOTE" if self.credit else "INVOICE"
 
     def truth(self) -> dict:
         return {"id": self.number, "vendor": self.vendor, "date": self.issued.isoformat(),
-                "amount": self.printed_total, "bank_account": (self.bank or "").replace(" ", "") or None}
+                "amount": self.printed_total, "bank_account": (self.bank or "").replace(" ", "") or None,
+                "kind": "credit" if self.credit else "invoice"}
+
+
+CREDIT_LABELS = {
+    "number": {"classic": "Credit note #:", "band": "Credit note no.", "inline": "Credit note #", "european": "Credit note No."},
+    "date": {"classic": "Credit note date:", "band": "Date", "inline": "Issued on", "european": "Date of issue"},
+    "total": {"classic": "Total credit", "band": "Total", "inline": "Credit total", "european": "Total credit"},
+    "due_label": {"classic": "Amount credited", "band": "Credit amount", "inline": "Amount credited", "european": "Total credit"},
+    "title": {"classic": "CREDIT NOTE", "european": "TAX CREDIT NOTE"},
+}
 
 
 # ------------------------------------------------------------------ layouts
@@ -171,7 +191,7 @@ def layout(doc: Doc) -> list[tuple]:
         text(50, 50, doc.vendor, 20, True)
         for i, line in enumerate(doc.vendor_lines + [doc.email]):
             text(50, 78 + i * 14, line, 9)
-        right(562, 50, "INVOICE", 24, True)
+        right(562, 50, doc.title, 24, True)
         text(380, 90, doc.label("number", "Invoice #:"), 10, True)
         right(562, 90, doc.number)
         text(380, 106, doc.label("date", "Invoice date:"), 10, True)
@@ -182,13 +202,14 @@ def layout(doc: Doc) -> list[tuple]:
         for i, line in enumerate([doc.customer] + doc.customer_lines):
             text(50, 176 + i * 14, line)
         y = totals(table(250))
-        text(50, y, f"{doc.label('payable', 'Make all checks payable to')} {doc.vendor}", 9)
+        if not doc.credit:
+            text(50, y, f"{doc.label('payable', 'Make all checks payable to')} {doc.vendor}", 9)
         if doc.bank:
             text(50, y + 14, f"{doc.label('bank', 'IBAN')}: {doc.bank}", 9)
         text(50, y + 40, "Thank you for your business!", 10, True)
     elif doc.style == "band":
         T.append(("rect", 0, 30, PAGE_W, 60, 0.15))
-        text(50, 48, "INVOICE", 26, True)
+        text(50, 48, doc.title, 26, True)
         text(50, 110, doc.vendor, 16, True)
         for i, line in enumerate(doc.vendor_lines):
             text(50, 132 + i * 13, line, 9)
@@ -207,6 +228,8 @@ def layout(doc: Doc) -> list[tuple]:
     elif doc.style == "inline":
         text(50, 50, doc.vendor, 18, True)
         text(50, 74, " · ".join(doc.vendor_lines), 9)
+        if doc.credit:
+            text(330, 50, doc.title, 16, True)
         text(50, 110, f"{doc.label('number', 'Invoice #')}{doc.number}", 14, True)
         text(50, 132, f"{doc.label('date', 'Issued on')} {doc.d(doc.issued)}", 10)
         text(50, 148, f"Due {doc.d(doc.due)}", 10)
@@ -320,7 +343,11 @@ def random_doc(rng: random.Random, style: str | None = None) -> Doc:
     labels = {k: rng.choice(v[style]) for k, v in LABEL_VARIANTS.items()}
     if eu:
         labels["tax"] = "VAT 20%"
+    credit = rng.random() < 0.12
+    if credit:
+        number = rng.choice([f"CN-{rng.randint(1, 9999):04d}", f"CR{rng.randint(100, 9999)}"])
     return Doc(
+        credit=credit, negative_totals=credit and rng.random() < 0.5,
         vendor=vendor, vendor_lines=[rng.choice(STREETS), rng.choice(CITIES)], email=f"billing@{domain}",
         customer=rng.choice(CUSTOMERS), customer_lines=["Accounts Payable", rng.choice(STREETS)],
         number=number, issued=issued, due=issued + timedelta(days=30), items=items,
@@ -328,7 +355,7 @@ def random_doc(rng: random.Random, style: str | None = None) -> Doc:
         shipping=rng.choice([0.0, 0.0, 25.0, 49.5]), discount=rng.choice([0.0, 0.0, 0.0, 10.0]),
         bank=rng.choice(IBANS) if (eu or rng.random() < 0.5) else None, style=style, date_format=date_format,
         money_format="eu" if eu else "us", symbol="€" if eu else rng.choice(["$", "$", "USD "]), labels=labels,
-        total_error=rng.choice([0.0] * 9 + [round(rng.uniform(20, 400), 2)]))
+        total_error=0.0 if credit else rng.choice([0.0] * 9 + [round(rng.uniform(20, 400), 2)]))
 
 
 def random_docs(n: int, seed: int = 7) -> list[tuple[str, bytes, Doc]]:
@@ -368,6 +395,16 @@ def sample_docs() -> list[tuple[str, bytes, Doc]]:
         ("acme-suplies-0091.pdf", Doc(vendor="Acme Suplies", email="sales@acme-suplies.example", number="0091",
                                       issued=date(2026, 10, 22), due=date(2026, 11, 21),
                                       items=[("Office chairs", 3, 189.0)], style="inline", **base), "pdf"),
+        # An invoice billed at the wrong price, and the credit note that cancels it.
+        ("globex-corp-7730.pdf", Doc(vendor="Globex Corp", email="billing@globex.example", number="GX-7730",
+                                     issued=date(2026, 10, 26), due=date(2026, 11, 25),
+                                     items=[("Server maintenance", 2, 1340.0)], tax_rate=0.08, style="classic",
+                                     **base), "pdf"),
+        ("globex-corp-credit-note-118.pdf", Doc(vendor="Globex Corp", email="billing@globex.example", number="CN-118",
+                                                issued=date(2026, 10, 29), due=date(2026, 10, 29),
+                                                items=[("Server maintenance (invoice GX-7730 cancelled)", 2, 1340.0)],
+                                                tax_rate=0.08, style="classic", credit=True, negative_totals=True,
+                                                **base), "pdf"),
     ]
     return [(name, to_pdf(doc) if kind == "pdf" else to_xlsx(doc), doc) for name, doc, kind in docs]
 
@@ -386,7 +423,7 @@ def evaluate_documents(n: int = 100, seed: int = 7, company: str = "Acme Inc") -
     formats) and score each field against the known answer. Also scores the arithmetic
     check: planted wrong totals caught, and false alarms on correct invoices."""
     from .documents import norm, read_document
-    fields = ("id", "vendor", "date", "amount", "bank_account")
+    fields = ("id", "vendor", "date", "amount", "bank_account", "kind")
     right = dict.fromkeys(fields, 0)
     total = dict.fromkeys(fields, 0)
     caught = missed = false_alarms = 0
@@ -398,7 +435,7 @@ def evaluate_documents(n: int = 100, seed: int = 7, company: str = "Acme Inc") -
             if truth[f] is None:
                 continue
             total[f] += 1
-            got = ex.fields.get(f)
+            got = ex.kind if f == "kind" else ex.fields.get(f)
             ok = (got is not None and abs(got - truth[f]) < 0.005) if f == "amount" else \
                 norm(str(got or "")).rstrip(".") == norm(str(truth[f])).rstrip(".")
             right[f] += ok

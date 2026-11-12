@@ -101,9 +101,10 @@ class DocumentIntake:
         if number and self.db.get_invoices(user["org"], [str(number)]):
             ex.warnings.insert(0, f"Invoice number {number} is already on file. It will be skipped unless you change it.")
         draft = self.signer.issue({"org": user["org"], "sub": user["sub"], "sha": sha, "file": filename[:200],
-                                   "method": ex.method, "read": ex.fields, "totals": ex.totals},
+                                   "method": ex.method, "read": {**ex.fields, "kind": ex.kind}, "totals": ex.totals},
                                   "doc", DRAFT_TTL)
         return {"file": filename, "status": "ready" if not ex.missing else "incomplete", "draft": draft,
+                "kind": ex.kind,
                 "fields": ex.fields, "confidence": ex.confidence, "source": ex.source, "totals": ex.totals,
                 "warnings": ex.warnings, "method": ex.method, "currency": ex.currency, "customer": ex.customer,
                 "missing": ex.missing, "ai_available": self.ai_available(org)}
@@ -152,8 +153,9 @@ class DocumentIntake:
             return None, "the date is outside 1990-2100"
         if bank and len(bank) > 64:
             return None, "the bank account is too long"
+        kind = "credit" if item.get("kind") == "credit" else "invoice"
         return {"id": inv_id, "vendor": vendor, "amount": amount, "date": when.isoformat(),
-                "bank_account": bank}, None
+                "bank_account": bank, "kind": kind}, None
 
     def import_drafts(self, user: dict, items: list[dict]) -> dict:
         if len(items) > MAX_BATCH:
@@ -182,6 +184,8 @@ class DocumentIntake:
             read = draft.get("read") or {}
             corrections = {f: [read.get(f), row[f]] for f in ("id", "vendor", "amount", "date", "bank_account")
                            if not _same(read.get(f), row[f])}
+            if (read.get("kind") or "invoice") != row["kind"]:
+                corrections["kind"] = [read.get("kind") or "invoice", row["kind"]]
             row.update(sha256=draft["sha"], filename=draft["file"], method=draft["method"],
                        corrections=corrections, totals_issue=totals_issue(row["amount"], draft.get("totals") or {}))
             rows.append(row)

@@ -34,6 +34,11 @@ class Conflict(Exception):
     """A uniqueness, foreign-key or check constraint was violated."""
 
 
+# For display and totals a credit note counts as a negative amount (it reduces what is
+# owed); in the table its amount is positive and its kind says what it is.
+SIGNED_AMOUNT = "CASE WHEN kind = 'credit' THEN -amount ELSE amount END AS amount, kind"
+
+
 class KeyMismatch(RuntimeError):
     """The encryption keys in the settings are not the ones this database was written with."""
 
@@ -336,7 +341,7 @@ class Database:
 
     # ----- invoices -----
     def add_invoice(self, org_id: str, inv_id: str, vendor: str, amount: float,
-                    invoice_date: str, bank_account: str | None, created_by: str) -> None:
+                    invoice_date: str, bank_account: str | None, created_by: str, kind: str = "invoice") -> None:
         bank_enc = bank_idx = None
         if bank_account:
             vault = self.vault(org_id)
@@ -344,8 +349,8 @@ class Database:
             bank_idx = vault.blind_index(normalize_account(bank_account))
         with self._tx(org_id) as run:
             run("INSERT INTO invoices (org_id, id, vendor, amount, invoice_date, bank_enc, "
-                "bank_idx, created_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                (org_id, inv_id, vendor, amount, invoice_date, bank_enc, bank_idx, created_by))
+                "bank_idx, created_by, kind) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (org_id, inv_id, vendor, amount, invoice_date, bank_enc, bank_idx, created_by, kind))
 
     def add_invoices(self, org_id: str, invoices: list[dict], created_by: str) -> list[str]:
         """Insert many invoices in one transaction. Returns the ids that were already
@@ -356,10 +361,11 @@ class Database:
             bank = inv.get("bank_account")
             rows.append((org_id, inv["id"], inv["vendor"], inv["amount"], inv["date"],
                          vault.encrypt(bank, f"invoices.bank:{org_id}:{inv['id']}") if bank else None,
-                         vault.blind_index(normalize_account(bank)) if bank else None, created_by))
+                         vault.blind_index(normalize_account(bank)) if bank else None, created_by,
+                         inv.get("kind") or "invoice"))
         existing = []
         query = ("INSERT INTO invoices (org_id, id, vendor, amount, invoice_date, bank_enc, bank_idx, "
-                 "created_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (org_id, id) DO NOTHING")
+                 "created_by, kind) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (org_id, id) DO NOTHING")
         if self.is_postgres:
             query = query.replace("?", "%s")
         with self._tx(org_id):
@@ -375,7 +381,7 @@ class Database:
             chunk = ids[start:start + 500]
             marks = ", ".join("?" * len(chunk))
             with self._tx(org_id) as run:
-                for r in run(f"SELECT id, vendor, amount, invoice_date FROM invoices "
+                for r in run(f"SELECT id, vendor, {SIGNED_AMOUNT}, invoice_date FROM invoices "
                              f"WHERE org_id = ? AND id IN ({marks})", (org_id, *chunk)):
                     found[r["id"]] = r
         return found
@@ -395,7 +401,7 @@ class Database:
             raise ValueError("Invalid sort column")
         limit = max(1, min(int(limit), 500))
         with self._tx(org_id) as run:  # bank details are never returned here
-            return run(f"SELECT id, vendor, amount, invoice_date FROM invoices "
+            return run(f"SELECT id, vendor, {SIGNED_AMOUNT}, invoice_date FROM invoices "
                        f"WHERE org_id = ? ORDER BY {sort}, id LIMIT ?", (org_id, limit))
 
     def get_bank_account(self, org_id: str, inv_id: str) -> str | None:
@@ -408,11 +414,11 @@ class Database:
 
     def detection_inputs(self, org_id: str) -> list[Invoice]:
         with self._tx(org_id) as run:
-            rows = run("SELECT i.id, i.vendor, i.amount, i.invoice_date, i.bank_idx, d.totals_issue "
+            rows = run("SELECT i.id, i.vendor, i.amount, i.invoice_date, i.bank_idx, d.totals_issue, i.kind "
                        "FROM invoices i LEFT JOIN documents d ON d.org_id = i.org_id AND d.invoice_id = i.id "
                        "WHERE i.org_id = ?", (org_id,))
-        return [Invoice(r["id"], r["vendor"], r["amount"], r["invoice_date"], r["bank_idx"], r["totals_issue"])
-                for r in rows]
+        return [Invoice(r["id"], r["vendor"], r["amount"], r["invoice_date"], r["bank_idx"], r["totals_issue"],
+                        r["kind"]) for r in rows]
 
     # ----- invoice documents -----
     def document_by_hash(self, org_id: str, sha256: str) -> dict | None:
@@ -436,11 +442,12 @@ class Database:
             for r in rows:
                 bank = r.get("bank_account")
                 inserted = self.conn.execute(mark(
-                    "INSERT INTO invoices (org_id, id, vendor, amount, invoice_date, bank_enc, bank_idx, created_by) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (org_id, id) DO NOTHING"),
+                    "INSERT INTO invoices (org_id, id, vendor, amount, invoice_date, bank_enc, bank_idx, created_by, "
+                    "kind) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (org_id, id) DO NOTHING"),
                     (org_id, r["id"], r["vendor"], r["amount"], r["date"],
                      vault.encrypt(bank, f"invoices.bank:{org_id}:{r['id']}") if bank else None,
-                     vault.blind_index(normalize_account(bank)) if bank else None, created_by)).rowcount
+                     vault.blind_index(normalize_account(bank)) if bank else None, created_by,
+                     r.get("kind") or "invoice")).rowcount
                 if not inserted:
                     skipped.append(r["id"])
                     continue
@@ -519,7 +526,7 @@ class Database:
     def all_invoices(self, org_id: str) -> list[dict]:
         """Every invoice of this company (no bank data), oldest first."""
         with self._tx(org_id) as run:
-            return run("SELECT id, vendor, amount, invoice_date FROM invoices WHERE org_id = ? "
+            return run(f"SELECT id, vendor, {SIGNED_AMOUNT}, invoice_date FROM invoices WHERE org_id = ? "
                        "ORDER BY invoice_date, id", (org_id,))
 
     def list_reviews(self, org_id: str) -> dict[str, str]:

@@ -36,6 +36,7 @@ CREATE TABLE IF NOT EXISTS invoices (
   bank_enc TEXT,
   bank_idx TEXT,
   created_by TEXT NOT NULL,
+  kind TEXT NOT NULL DEFAULT 'invoice' CHECK (kind IN ('invoice', 'credit')),  -- credit note: amount stays positive
   PRIMARY KEY (org_id, id)
 );
 CREATE TABLE IF NOT EXISTS anomalies (
@@ -118,6 +119,7 @@ ADDED_COLUMNS = [
     ("orgs", "ai_extraction", "INTEGER NOT NULL DEFAULT 0"),
     ("users", "session_epoch", "INTEGER NOT NULL DEFAULT 0"),
     ("users", "disabled", "INTEGER NOT NULL DEFAULT 0"),
+    ("invoices", "kind", "TEXT NOT NULL DEFAULT 'invoice'"),
 ]
 
 # Idempotent: safe to run on every deploy.

@@ -134,3 +134,32 @@ class AiReadingTests(IntakeTestCase):
             raise OSError("no network")
         result = self.ai_intake(down).extract(self.user, "photo.png", b"\x89PNG\r\n\x1a\n" + b"0" * 100)
         self.assertEqual(result["status"], "unreadable")
+
+
+class CreditNoteIntakeTests(IntakeTestCase):
+    def test_a_credit_note_document_is_read_as_one(self):
+        data, doc = self.samples["globex-corp-credit-note-118.pdf"]
+        draft = self.intake.extract(self.user, "cn.pdf", data)
+        self.assertEqual((draft["status"], draft["kind"]), ("ready", "credit"))
+        self.assertAlmostEqual(draft["fields"]["amount"], doc.truth()["amount"], places=2)
+        self.assertTrue(any("credit note" in w for w in draft["warnings"]))
+        result = self.intake.import_drafts(self.user, [self.checked(draft, kind=draft["kind"])])
+        self.assertEqual((result["added"], result["fields_corrected"]), (1, 0))
+        stored = self.app.list_invoices(self.a)[0]
+        self.assertEqual((stored["kind"], stored["amount"]), ("credit", -draft["fields"]["amount"]))
+
+    def test_changing_the_type_by_hand_is_recorded(self):
+        data, _ = self.samples["wayne-office-1042.pdf"]
+        draft = self.intake.extract(self.user, "a.pdf", data)
+        self.assertEqual(draft["kind"], "invoice")
+        result = self.intake.import_drafts(self.user, [self.checked(draft, kind="credit")])
+        self.assertEqual(result["fields_corrected"], 1)
+        self.assertEqual(self.app.list_invoices(self.a)[0]["kind"], "credit")
+        record = self.admin.conn.execute("SELECT corrections FROM documents").fetchone()["corrections"]
+        self.assertIn("kind", record)
+
+    def test_a_negative_amount_is_refused_whatever_the_type(self):
+        data, _ = self.samples["wayne-office-1042.pdf"]
+        draft = self.intake.extract(self.user, "a.pdf", data)
+        result = self.intake.import_drafts(self.user, [self.checked(draft, kind="credit", amount=-5)])
+        self.assertEqual(result["added"], 0)

@@ -100,6 +100,7 @@ class InvoiceIn(StrictModel):
     amount: float = Field(gt=0, lt=1e12)
     date: Date
     bank_account: str | None = Field(default=None, max_length=64)
+    kind: Literal["invoice", "credit"] = "invoice"   # "credit" for a credit note; the amount stays positive
 
 
 class UserIn(StrictModel):
@@ -196,6 +197,7 @@ class CheckedDocument(StrictModel):
     date: str | None = Field(default=None, max_length=10)
     amount: float | None = Field(default=None, ge=0, lt=1e12)
     bank_account: str | None = Field(default=None, max_length=64)
+    kind: Literal["invoice", "credit"] = "invoice"
 
 
 class DocumentsImportIn(StrictModel):
@@ -363,6 +365,8 @@ def create_app(settings: Settings | None = None, db: Database | None = None,
         "stark-freight-8811.pdf": "Asks to be paid into a bank account this vendor hasn't used before.",
         "umbrella-ltd-3307.xlsx": "An Excel invoice whose total doesn't match its own lines and tax.",
         "acme-suplies-0091.pdf": "From \"Acme Suplies\", a look-alike of your vendor Acme Supplies.",
+        "globex-corp-7730.pdf": "An invoice that the vendor then cancelled...",
+        "globex-corp-credit-note-118.pdf": "...with this credit note for the same amount.",
     }
 
     @app.get("/samples/documents")
@@ -587,7 +591,7 @@ def create_app(settings: Settings | None = None, db: Database | None = None,
     def add_invoice(inv: InvoiceIn, user: dict = Depends(require("admin", "accountant"))) -> dict:
         try:
             db.add_invoice(user["org"], inv.id, inv.vendor, inv.amount, inv.date.isoformat(),
-                           inv.bank_account, user["sub"])
+                           inv.bank_account, user["sub"], inv.kind)
         except Conflict:
             raise HTTPException(409, "Invoice id already exists") from None
         return {"id": inv.id}
@@ -598,7 +602,8 @@ def create_app(settings: Settings | None = None, db: Database | None = None,
         details = db.get_invoices(org, [i["invoice_id"] for i in items])
         for item in items:
             inv = details.get(item["invoice_id"], {})
-            item.update(vendor=inv.get("vendor"), amount=inv.get("amount"), date=inv.get("invoice_date"))
+            item.update(vendor=inv.get("vendor"), amount=inv.get("amount"), date=inv.get("invoice_date"),
+                        kind=inv.get("kind", "invoice"))
         return {i["invoice_id"]: i for i in items}
 
     @app.post("/export/annotated")
@@ -658,7 +663,7 @@ def create_app(settings: Settings | None = None, db: Database | None = None,
         if len(invoices) > MAX_BULK:
             raise HTTPException(413, f"At most {MAX_BULK} invoices per request")
         rows = [{"id": i.id, "vendor": i.vendor, "amount": i.amount, "date": i.date.isoformat(),
-                 "bank_account": i.bank_account} for i in invoices]
+                 "bank_account": i.bank_account, "kind": i.kind} for i in invoices]
         skipped = db.add_invoices(user["org"], rows, user["sub"])
         added = len(rows) - len(skipped)
         db.audit(user["org"], user["sub"], "invoices_imported", f"{added} added, {len(skipped)} skipped")
@@ -732,7 +737,10 @@ def create_app(settings: Settings | None = None, db: Database | None = None,
             new_ids = {inv["id"] for inv in result.invoices} - set(existing)
             detection["flagged_from_file"] = len({a["invoice_id"] for a in db.list_anomalies(user["org"], 5000)
                                                   if a["invoice_id"] in new_ids})
+        stored = set(existing)
         return {"added": added, "already_stored": len(existing), "blank_rows": result.blank_rows,
+                "credit_notes": sum(1 for inv in result.invoices
+                                    if inv["kind"] == "credit" and inv["id"] not in stored),
                 "error_count": len(result.errors), "errors": result.errors[:200],
                 "detection": detection}
 
@@ -766,7 +774,8 @@ def create_app(settings: Settings | None = None, db: Database | None = None,
         details = db.get_invoices(user["org"], [i["invoice_id"] for i in ranked])
         for item in ranked:
             inv = details.get(item["invoice_id"], {})
-            item.update(vendor=inv.get("vendor"), amount=inv.get("amount"), date=inv.get("invoice_date"))
+            item.update(vendor=inv.get("vendor"), amount=inv.get("amount"), date=inv.get("invoice_date"),
+                        kind=inv.get("kind", "invoice"))
         return ranked
 
     def full_queue(org: str) -> list[dict]:
@@ -798,12 +807,19 @@ def create_app(settings: Settings | None = None, db: Database | None = None,
         decisions = {i["invoice_id"]: i["decision"] for i in queue}
         money = {d: 0.0 for d in ("pay", "review", "hold", "do_not_pay")}
         counts = dict.fromkeys(money, 0)
+        credits = {"count": 0, "amount": 0.0, "to_apply": 0.0}
         for inv in db.all_invoices(org):
             decision = decisions.get(inv["id"], "pay")
-            money[decision] += inv["amount"]
+            money[decision] += inv["amount"]   # a credit note's amount is negative: totals are net
             counts[decision] += 1
+            if inv["kind"] == "credit":
+                credits["count"] += 1
+                credits["amount"] += -inv["amount"]
+                if decision == "pay":
+                    credits["to_apply"] += -inv["amount"]
+        credits = {k: round(v, 2) for k, v in credits.items()}
         return {"company": db.get_org(org)["name"], "invoices": db.count_invoices(org),
-                "flagged": len(queue), **by_status,
+                "flagged": len(queue), **by_status, "credit_notes": credits,
                 "decisions": counts, "amounts": {k: round(v, 2) for k, v in money.items()},
                 "high_risk_open": sum(i["status"] == "open" and i["risk"] >= 70 for i in queue),
                 "open_by_rule": dict(sorted(open_rules.items(), key=lambda kv: -kv[1])),

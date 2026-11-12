@@ -648,6 +648,42 @@ class DocumentApiTests(DbTestCase):
         self.assertEqual(self.client.get("/documents/stats", headers=self.h).json()["documents"], 2)
         self.assertEqual(self.extract("umbrella-ltd-3307.xlsx").json()["status"], "already_imported")
 
+    def test_a_credit_note_and_the_invoice_it_cancels(self):
+        drafts = [self.extract(n).json() for n in ("globex-corp-7730.pdf", "globex-corp-credit-note-118.pdf")]
+        self.assertEqual([d["kind"] for d in drafts], ["invoice", "credit"])
+        self.assertGreater(drafts[1]["fields"]["amount"], 0)          # read as a positive amount
+        items = [{"draft": d["draft"], "file": d["file"], "kind": d["kind"], **d["fields"]} for d in drafts]
+        result = self.client.post("/documents/import", json={"items": items}, headers=self.h).json()
+        self.assertEqual((result["added"], result["fields_corrected"]), (2, 0))
+        queue = {q["invoice_id"]: q for q in self.client.get("/review-queue", headers=self.h).json()}
+        bill, credit = drafts[0]["fields"]["id"], drafts[1]["fields"]["id"]
+        self.assertEqual((queue[bill]["rules"], queue[bill]["kind"]), (["credited_invoice"], "invoice"))
+        self.assertEqual((queue[credit]["rules"], queue[credit]["kind"]), (["matched_credit"], "credit"))
+        self.assertEqual((queue[bill]["decision"], queue[bill]["suggested_action"]), ("review", "do_not_pay"))
+        self.assertLess(queue[credit]["amount"], 0)                   # shown signed
+        summary = self.client.get("/summary", headers=self.h).json()
+        amount = drafts[1]["fields"]["amount"]
+        self.assertEqual(summary["credit_notes"], {"count": 1, "amount": amount, "to_apply": 0.0})
+        self.assertEqual(round(sum(summary["amounts"].values()), 2), 0.0)   # the pair nets to nothing
+        listed = {i["id"]: i for i in self.client.get("/invoices", headers=self.h).json()}
+        self.assertEqual((listed[credit]["kind"], listed[credit]["amount"]), ("credit", -amount))
+
+    def test_credit_notes_through_the_api_and_a_list(self):
+        body = {"id": "CN-1", "vendor": "Acme", "amount": 25.0, "date": "2026-01-09", "kind": "credit"}
+        self.assertIn(self.client.post("/invoices", json=body, headers=self.h).status_code, (200, 201))
+        self.assertEqual(self.client.post("/invoices", json=dict(body, id="CN-2", kind="refund"),
+                                          headers=self.h).status_code, 422)
+        csv_text = "Invoice No,Vendor,Date,Amount\nB-1,Acme,2026-01-05,100.00\nCN-9,Acme,2026-01-12,-40.00\n"
+        payload = {"filename": "a.csv", "content_base64": base64.b64encode(csv_text.encode()).decode(),
+                   "mapping": {"id": "Invoice No", "vendor": "Vendor", "date": "Date", "amount": "Amount"},
+                   "date_order": "MDY", "run_detection": True}
+        result = self.client.post("/import", json=payload, headers=self.h).json()
+        self.assertEqual((result["added"], result["credit_notes"]), (2, 1))
+        summary = self.client.get("/summary", headers=self.h).json()
+        self.assertEqual(summary["credit_notes"]["count"], 2)
+        self.assertEqual(summary["amounts"]["pay"] + summary["amounts"]["review"] + summary["amounts"]["hold"]
+                         + summary["amounts"]["do_not_pay"], 35.0)   # 100 - 40 - 25
+
     def test_unreadable_and_forbidden(self):
         self.assertEqual(self.extract("x.pdf", b"%PDF-1.4 broken").json()["status"], "unreadable")
         auditor = {"Authorization": "Bearer " + self.client.post(
@@ -672,9 +708,10 @@ class DocumentApiTests(DbTestCase):
         import zipfile
         r = self.client.get("/samples/invoice-documents.zip")
         self.assertEqual(r.headers["content-type"], "application/zip")
-        self.assertEqual(len(zipfile.ZipFile(io.BytesIO(r.content)).namelist()), 4)
+        self.assertEqual(len(zipfile.ZipFile(io.BytesIO(r.content)).namelist()), 6)
         listed = self.client.get("/samples/documents").json()
-        self.assertEqual(len(listed), 4)
+        self.assertEqual(len(listed), 6)
+        self.assertTrue(all(d["description"] for d in listed))
         one = self.client.get("/samples/documents/" + listed[1]["name"])
         self.assertTrue(one.content.startswith(b"%PDF"))
         self.assertEqual(self.client.get("/samples/documents/../../etc/passwd").status_code, 404)

@@ -252,27 +252,35 @@ def payment_file(invoices: list[dict], queue: dict[str, dict], company: str) -> 
     put(summary, 11, 4, "Invoices are not changed. This file sorts them by what should happen to the payment. "
                         "Run detection and finish reviews in the app before using it for a payment run.",
         alignment=WRAP)
+    credits = [inv for inv in invoices if inv.get("kind") == "credit"]
+    if credits:
+        put(summary, 12, 4, f"Includes {len(credits)} credit note{'s' if len(credits) != 1 else ''} "
+                            f"(shown with negative amounts, {round(-sum(c['amount'] for c in credits), 2):,.2f} in all): "
+                            "totals are net, so a credit in Ready to pay reduces what that vendor is paid.",
+            alignment=WRAP)
 
     titles = {"pay": "Ready to pay", "review": "Review first", "hold": "On hold", "do_not_pay": "Do not pay"}
     for d, rows in groups.items():
         ws = wb.create_sheet(titles[d])
-        headers = ["Invoice", "Vendor", "Date", "Amount", "Risk", "Flags", "What to do", "Reviewer note"]
-        _header_row(ws, 1, headers, widths=[16, 28, 12, 14, 8, 30, 70, 30])
+        headers = ["Invoice", "Type", "Vendor", "Date", "Amount", "Risk", "Flags", "What to do", "Reviewer note"]
+        _header_row(ws, 1, headers, widths=[16, 12, 28, 12, 14, 8, 30, 70, 30])
         for r, (inv, item) in enumerate(rows, start=2):
-            values = [inv["id"], inv["vendor"], inv["invoice_date"], inv["amount"],
+            values = [inv["id"], "Credit note" if inv.get("kind") == "credit" else "Invoice", inv["vendor"],
+                      inv["invoice_date"], inv["amount"],
                       item["risk"] if item else None,
                       ", ".join(label(x) for x in item["rules"]) if item else None,
                       " ".join(item.get("fixes") or fix_steps(item["rules"])) if item and d != "pay" else None,
                       item.get("note") if item else None]
             for c, value in enumerate(values, start=1):
                 put(ws, r, c, value, alignment=WRAP)
-            ws.cell(row=r, column=4).number_format = "#,##0.00"
+            ws.cell(row=r, column=5).number_format = "#,##0.00"
         total_row = len(rows) + 2
-        put(ws, total_row, 1, "Total", font=BOLD)
-        put(ws, total_row, 4, totals[d], font=BOLD).number_format = "#,##0.00"
+        put(ws, total_row, 1, "Total (net of credit notes)" if any(i.get("kind") == "credit" for i, _ in rows) else "Total",
+            font=BOLD)
+        put(ws, total_row, 5, totals[d], font=BOLD).number_format = "#,##0.00"
         ws.freeze_panes = "A2"
         if rows:
-            ws.auto_filter.ref = f"A1:H{len(rows) + 1}"
+            ws.auto_filter.ref = f"A1:I{len(rows) + 1}"
     return _save(wb)
 
 
@@ -294,6 +302,7 @@ def template() -> bytes:
         "One row per invoice. Replace the grey example row with your own.",
         "Required: invoice number, vendor, invoice date, amount. Bank account is optional but enables the bank checks.",
         "Dates: real Excel dates, or text like 2026-01-15. Amounts: numbers, with or without a currency symbol.",
+        "Credit notes: enter the amount as a negative number (-120.00), or add a Type column that says Credit note.",
         "Column names don't have to match exactly; you'll confirm which column is which when you upload.",
         "Upload the file on the 'Upload invoices' page of the web app.",
     ], start=1):

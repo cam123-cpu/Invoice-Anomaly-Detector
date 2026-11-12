@@ -13,10 +13,11 @@ import re
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 
-FIELDS = ("id", "vendor", "amount", "date", "bank_account")
+FIELDS = ("id", "vendor", "amount", "date", "bank_account", "kind")
 REQUIRED = ("id", "vendor", "amount", "date")
 FIELD_LABELS = {"id": "Invoice number", "vendor": "Vendor", "amount": "Amount",
-                "date": "Invoice date", "bank_account": "Bank account (optional)"}
+                "date": "Invoice date", "bank_account": "Bank account (optional)",
+                "kind": "Type: invoice or credit note (optional)"}
 MAX_BYTES = 10 * 1024 * 1024
 MAX_ROWS = 50_000
 MAX_UNZIPPED = 200 * 1024 * 1024   # an .xlsx is a zip; refuse ones that expand to more than this
@@ -38,7 +39,16 @@ SYNONYMS = {
     "bank_account": ["bankaccount", "bankaccountnumber", "bankacct", "iban", "payeeaccount",
                      "remittanceaccount", "vendorbankaccount", "supplierbankaccount",
                      "accountiban", "bankdetails"],
+    "kind": ["type", "documenttype", "doctype", "invoicetype", "transactiontype", "txntype", "trantype",
+             "recordtype", "kind"],
 }
+
+# What a "Type" column says when the row is a credit note.
+_CREDIT_WORDS = re.compile(r"(?i)\b(credit|cn|cr|crn|credit ?note|credit ?memo|creditmemo|refund|gutschrift|avoir)\b")
+
+
+def is_credit_text(value) -> bool:
+    return bool(_CREDIT_WORDS.search(str(value or "").replace("_", " ").replace("-", " ")))
 _ALL_SYNONYMS = {s for names in SYNONYMS.values() for s in names}
 
 
@@ -253,7 +263,9 @@ _TEXT_DATE_FORMATS = ("%d %b %Y", "%d %B %Y", "%b %d, %Y", "%B %d, %Y", "%b %d %
                       "%d-%b-%Y", "%d-%b-%y", "%d %b %y")
 
 
-def parse_amount(value) -> float:
+def parse_amount(value, signed: bool = False) -> float:
+    """A positive amount. With signed=True a negative amount is allowed and returned as
+    negative: that's how most systems export credit notes (-120.00, (120.00), 120.00-)."""
     if isinstance(value, bool):
         raise ValueError("amount is not a number")
     if isinstance(value, (int, float)):
@@ -262,9 +274,9 @@ def parse_amount(value) -> float:
         text = str(value or "").strip()
         if not text:
             raise ValueError("amount is missing")
-        negative = text.startswith("(") and text.endswith(")") or text.endswith("-") \
-            or text.startswith("-")
         text = _CURRENCY.sub("", text).replace(" ", "").replace(" ", "").replace("'", "")
+        negative = text.startswith("(") and text.endswith(")") or text.endswith("-") \
+            or text.startswith("-")   # after the currency sign is gone: $-5 and -$5 both count
         text = text.strip("()+-")
         if "," in text and "." in text:
             decimal = "," if text.rfind(",") > text.rfind(".") else "."
@@ -282,9 +294,9 @@ def parse_amount(value) -> float:
             amount = -amount
     if amount != amount or amount in (float("inf"), float("-inf")):
         raise ValueError("amount is not a number")
-    if amount <= 0:
-        raise ValueError("amount must be greater than zero (credit notes aren't supported yet)")
-    if amount >= 1e12:
+    if amount == 0 or (amount < 0 and not signed):
+        raise ValueError("amount must be greater than zero" if not signed else "amount is zero")
+    if abs(amount) >= 1e12:
         raise ValueError("amount is unrealistically large")
     return round(amount, 2)
 
@@ -407,10 +419,15 @@ def convert(table: Table, mapping: dict, date_order: str = "MDY") -> Converted:
             vendor = _text(cell["vendor"])
             if not vendor:
                 raise ValueError("vendor is missing")
+            # A credit note is a negative amount, or a row whose Type column says so. It is
+            # stored as its own kind with a positive amount.
+            amount = parse_amount(cell["amount"], signed=True)
+            credit = amount < 0 or is_credit_text(cell.get("kind"))
             invoice = {"id": inv_id, "vendor": vendor[:120],
-                       "amount": parse_amount(cell["amount"]),
+                       "amount": abs(amount),
                        "date": parse_date(cell["date"], date_order),
-                       "bank_account": _text(cell.get("bank_account"))[:64] or None}
+                       "bank_account": _text(cell.get("bank_account"))[:64] or None,
+                       "kind": "credit" if credit else "invoice"}
         except ValueError as exc:
             out.errors.append({"row": line, "message": str(exc)})
             continue

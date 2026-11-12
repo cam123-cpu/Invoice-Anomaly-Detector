@@ -108,7 +108,8 @@ class BenchmarkTests(unittest.TestCase):
 
     def test_sample_files(self):
         expected = {"wayne-office-1042.pdf": {}, "stark-freight-8811.pdf": {"bank_account": "GB29NWBK60161331926819"},
-                    "umbrella-ltd-3307.xlsx": {}, "acme-suplies-0091.pdf": {}}
+                    "umbrella-ltd-3307.xlsx": {}, "acme-suplies-0091.pdf": {},
+                    "globex-corp-7730.pdf": {}, "globex-corp-credit-note-118.pdf": {}}
         for name, data, doc in doc_samples.sample_docs():
             ex = read_document(name, data, "Acme Inc")
             truth = doc.truth()
@@ -118,6 +119,7 @@ class BenchmarkTests(unittest.TestCase):
                 self.assertAlmostEqual(ex.fields["amount"], truth["amount"], places=2)
                 for f, v in expected[name].items():
                     self.assertEqual(ex.fields[f], v)
+                self.assertEqual(ex.kind, "credit" if "credit-note" in name else "invoice")
                 self.assertEqual(any("add up" in w for w in ex.warnings), name.startswith("umbrella"))
 
 

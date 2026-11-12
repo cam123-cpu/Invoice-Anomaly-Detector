@@ -20,6 +20,19 @@ class DatabaseTests(DbTestCase):
             self.app.get_bank_account(self.a, "A1' OR '1'='1")
         self.assertIsNone(self.app.auth_lookup("nobody' OR '1'='1"))
 
+    def test_credit_notes_are_stored_positive_and_shown_signed(self):
+        self.add("B1", amount=100.0)
+        self.app.add_invoice(self.a, "CN1", "Acme", 30.0, "2026-01-09", None, "tester", kind="credit")
+        row = self.admin.conn.execute("SELECT amount, kind FROM invoices WHERE id = 'CN1'").fetchone()
+        self.assertEqual((float(row["amount"]), row["kind"]), (30.0, "credit"))
+        shown = {i["id"]: (i["amount"], i["kind"]) for i in self.app.list_invoices(self.a)}
+        self.assertEqual(shown, {"B1": (100.0, "invoice"), "CN1": (-30.0, "credit")})
+        self.assertEqual(self.app.get_invoices(self.a, ["CN1"])["CN1"]["amount"], -30.0)
+        self.assertEqual(sum(i["amount"] for i in self.app.all_invoices(self.a)), 70.0)
+        for_detection = {i.id: (i.amount, i.kind) for i in self.app.detection_inputs(self.a)}
+        self.assertEqual(for_detection["CN1"], (30.0, "credit"))
+        self.assertEqual(self.app.list_invoices(self.a, sort="amount")[0]["id"], "CN1")   # sorts as shown
+
     def test_sort_allow_list(self):
         for bad in ["amount; DROP TABLE invoices", "bank_enc", "org_id", "1", ""]:
             with self.assertRaises(ValueError):
@@ -163,6 +176,7 @@ class DatabaseTests(DbTestCase):
 class UpgradeTests(unittest.TestCase):
     def test_database_from_the_previous_version_is_upgraded(self):
         import os
+        import re
         import secrets
         import sqlite3
         import tempfile
@@ -172,8 +186,10 @@ class UpgradeTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, "old.db")
             old = sqlite3.connect(path)
-            old.executescript(SQLITE_SCHEMA.replace(
-                "  action TEXT CHECK (action IN ('pay', 'hold', 'do_not_pay')),\n  note TEXT,\n", ""))
+            previous = SQLITE_SCHEMA.replace(
+                "  action TEXT CHECK (action IN ('pay', 'hold', 'do_not_pay')),\n  note TEXT,\n", "")
+            previous = re.sub(r"\n  kind TEXT NOT NULL DEFAULT 'invoice'[^\n]*", "", previous)   # before credit notes
+            old.executescript(previous)
             old.execute("INSERT INTO orgs (id, name) VALUES ('o1', 'Old Co')")
             old.execute("INSERT INTO invoices VALUES ('o1','I1','V',10,'2026-01-05',NULL,NULL,'x')")
             old.execute("INSERT INTO anomalies VALUES ('o1','I1','duplicate','high','d')")
@@ -181,10 +197,12 @@ class UpgradeTests(unittest.TestCase):
                         "VALUES ('o1','I1','confirmed','duplicate','kim','2026-01-06')")
             old.commit()
             self.assertNotIn("action", [r[1] for r in old.execute("PRAGMA table_info(reviews)")])
+            self.assertNotIn("kind", [r[1] for r in old.execute("PRAGMA table_info(invoices)")])
             old.close()
             db = Database(path, {1: secrets.token_bytes(32)}, secrets.token_bytes(32))
             try:
                 self.assertEqual(db.review_details("o1")["I1"]["action"], None)  # old review kept
+                self.assertEqual(db.get_invoices("o1", ["I1"])["I1"]["kind"], "invoice")  # old rows are invoices
                 self.assertEqual(db.set_review("o1", "I1", "confirmed", "kim"), "do_not_pay")
             finally:
                 db.close()  # before the folder is deleted: Windows can't delete an open file
