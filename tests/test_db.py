@@ -188,7 +188,7 @@ class UpgradeTests(unittest.TestCase):
             old = sqlite3.connect(path)
             previous = SQLITE_SCHEMA.replace(
                 "  action TEXT CHECK (action IN ('pay', 'hold', 'do_not_pay')),\n  note TEXT,\n", "")
-            previous = re.sub(r"\n  kind TEXT NOT NULL DEFAULT 'invoice'[^\n]*", "", previous)   # before credit notes
+            previous = re.sub(r"\n  (kind|reference) TEXT [^\n]*", "", previous)   # before credit notes
             old.executescript(previous)
             old.execute("INSERT INTO orgs (id, name) VALUES ('o1', 'Old Co')")
             old.execute("INSERT INTO invoices VALUES ('o1','I1','V',10,'2026-01-05',NULL,NULL,'x')")

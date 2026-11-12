@@ -163,3 +163,25 @@ class CreditNoteIntakeTests(IntakeTestCase):
         draft = self.intake.extract(self.user, "a.pdf", data)
         result = self.intake.import_drafts(self.user, [self.checked(draft, kind="credit", amount=-5)])
         self.assertEqual(result["added"], 0)
+
+
+class EInvoiceIntakeTests(IntakeTestCase):
+    def test_an_xml_credit_note_naming_a_missing_invoice(self):
+        from invoice_detector.detection import detect
+        from test_einvoice import cii
+        draft = self.intake.extract(self.user, "gutschrift.xml", cii(id="GS-9", type="381", ref="RE-404"))
+        self.assertEqual((draft["status"], draft["kind"], draft["fields"]["reference"]), ("ready", "credit", "RE-404"))
+        result = self.intake.import_drafts(self.user, [self.checked(draft, kind="credit")])
+        self.assertEqual((result["added"], result["fields_corrected"]), (1, 0))
+        self.assertEqual(self.app.list_invoices(self.a)[0]["reference"], "RE-404")
+        flags = {(a.invoice_id, a.rule): a.detail for a in detect(self.app.detection_inputs(self.a))}
+        self.assertIn("isn't on file", flags[("GS-9", "unmatched_credit")])
+
+    def test_a_reference_is_kept_only_on_credit_notes_and_must_look_like_a_number(self):
+        from test_einvoice import cii
+        draft = self.intake.extract(self.user, "a.xml", cii(id="RE-1"))
+        bad = self.intake.extract(self.user, "b.xml", cii(id="RE-2", type="381"))
+        self.intake.import_drafts(self.user, [self.checked(draft, reference="RE-0"),
+                                              self.checked(bad, kind="credit", reference="<script>")])
+        stored = {i["id"]: i["reference"] for i in self.app.list_invoices(self.a)}
+        self.assertEqual(stored, {"RE-1": None, "RE-2": None})

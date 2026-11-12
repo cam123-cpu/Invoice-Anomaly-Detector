@@ -28,6 +28,7 @@ from datetime import date, datetime
 from difflib import SequenceMatcher
 
 from . import doc_languages as lang
+from . import einvoice
 from .importer import ID_PATTERN, FileProblem, MAX_BYTES, _check_xlsx, parse_date
 
 MAX_BOXES = 4000         # text boxes in one file; the largest real invoice tested has 269
@@ -874,6 +875,47 @@ def is_credit_note(boxes: list[Box]) -> bool:
     return any(_CREDIT_TITLE.match(b.text) and (b.y0 - top) / span < 0.5 for b in first)
 
 
+# On a credit note: the phrase that names the invoice it corrects, in the six languages.
+_CREDIT_REF = re.compile(
+    r"(?i)(?:original invoice|invoice reference|referenced invoice|related invoice|applies to(?: invoice)?|"
+    r"credit(?: note)? (?:for|against|on|to) invoice|corrects invoice|cancels invoice|relat(?:es|ing|ed) to invoice|in respect of invoice|"
+    r"(?:zu|zur|für|bezüglich|betr\.?|bezug:?)\s+(?:unserer\s+|der\s+)?rechnung|ursprungsrechnung|bezugsrechnung|"
+    r"ursprüngliche rechnung|rechnungsbezug|korrektur (?:zu|der) rechnung|storno (?:zu|der) rechnung|"
+    r"facture d'origine|facture initiale|facture d'origine n|(?:sur|de) (?:la )?facture|avoir sur facture|"
+    r"oorspronkelijke factuur|(?:op|bij) factuur|betreft factuur|creditering van factuur|"
+    r"factura (?:rectificada|original|de origen)|fattura (?:di riferimento|originale|collegata|n\. rif))"
+    r"(?:\s*(?:nr|no|n°|nº|#|number|nummer|numéro|numero|num))?\.?\s*[:.]?\s*(\S[^,;]{0,40})?$")
+
+
+def _credit_reference(ex: Extraction, boxes: list[Box]) -> None:
+    """Which invoice a credit note says it corrects, and make sure that number isn't taken
+    for the credit note's own number."""
+    for box in boxes:
+        if len(box.text) > MAX_VALUE_TEXT:
+            continue
+        m = _CREDIT_REF.search(box.text)
+        if not m:
+            continue
+        value, _ = parse_value("id", m.group(1)) if m.group(1) else (None, 0)
+        if value is None and not m.group(1):
+            value = find_value(boxes, box, "id", "")[0]
+        if value:
+            ex.fields["reference"], ex.confidence["reference"], ex.source["reference"] = str(value), 0.85, box.text
+            break
+    ref = ex.fields.get("reference")
+    if ref and ex.fields.get("id") and _squash(str(ex.fields["id"])) == _squash(ref):
+        # The number found was the original invoice's. Look for the credit note's own number
+        # among the other labels.
+        others = [b for b in boxes if _squash(ref) not in _squash(b.text)]
+        hit = best(others, "id")
+        if hit:
+            ex.fields["id"], ex.confidence["id"], ex.source["id"] = hit[0], hit[1], hit[2]
+        else:
+            del ex.fields["id"]
+            ex.confidence.pop("id", None)
+            ex.source.pop("id", None)
+
+
 def _find_fields(ex: Extraction, boxes: list[Box], company: str | None) -> Extraction:
 
     id_box = None
@@ -896,6 +938,9 @@ def _find_fields(ex: Extraction, boxes: list[Box], company: str | None) -> Extra
                 ex.fields["bank_account"], ex.confidence["bank_account"] = re.sub(r"\s", "", m.group(1)), 0.85
                 ex.source["bank_account"] = b.text
                 break
+
+    if ex.kind == "credit":
+        _credit_reference(ex, boxes)
 
     total = best(boxes, "amount", prefer_low=True)
     subtotal = best(boxes, "subtotal", prefer_low=True)
@@ -976,6 +1021,8 @@ def totals_issue(amount: float | None, totals: dict) -> str | None:
     rate allows, no tax line found at all, or a total elsewhere on the page that does add
     up (the amount read is then a balance after a part payment).
     """
+    if totals.get("embedded_conflict"):
+        return totals["embedded_conflict"]     # the page and the PDF's own e-invoice data disagree
     sub, lines = totals.get("subtotal"), totals.get("lines")
     if amount is None or sub is None:
         return None
@@ -1018,6 +1065,8 @@ def kind_of(filename: str, data: bytes) -> str:
         return "xlsx"
     if data.startswith(b"\x89PNG\r\n\x1a\n") or data.startswith(b"\xff\xd8\xff") or data[:4] in (b"II*\x00", b"MM\x00*"):
         return "image"
+    if einvoice.looks_like_xml(data):
+        return "xml"
     return "unknown"
 
 
@@ -1185,13 +1234,22 @@ def boxes_from_image(data: bytes) -> list[Box]:
     return boxes_from_image_obj(image.convert("RGB"))
 
 
-def read_document(filename: str, data: bytes, company: str | None = None) -> Extraction:
-    """The whole local pipeline for one file. Raises FileProblem for unusable files."""
+def read_document(filename: str, data: bytes, company: str | None = None, embedded: bool = True) -> Extraction:
+    """The whole local pipeline for one file. Raises FileProblem for unusable files.
+
+    embedded=False ignores e-invoice data inside a PDF and reads only the page (the real-invoice
+    benchmark uses it, since that data is where its right answers come from)."""
     if not data:
         raise FileProblem("The file is empty.")
     if len(data) > MAX_BYTES:
         raise FileProblem(f"The file is larger than {MAX_BYTES // (1024 * 1024)} MB.")
     kind = kind_of(filename, data)
+    if kind == "xml":
+        parsed = einvoice.parse_xml(data)
+        if not parsed or not parsed.get("id"):
+            raise FileProblem("This XML file isn't an e-invoice this app can read (UBL, PEPPOL, XRechnung, "
+                              "ZUGFeRD, Factur-X or FatturaPA).")
+        return from_einvoice(parsed, company)
     if kind == "xlsx":
         boxes, method = boxes_from_xlsx(data), "Excel layout"
     elif kind == "pdf":
@@ -1206,7 +1264,95 @@ def read_document(filename: str, data: bytes, company: str | None = None) -> Ext
     if method.startswith("OCR"):
         for f in ex.confidence:   # OCR can misread characters: always worth a look
             ex.confidence[f] = round(min(ex.confidence[f], 0.8), 2)
+    if kind == "pdf" and embedded:
+        parsed = einvoice.from_pdf(data)
+        if parsed:
+            return compare_with_page(from_einvoice(parsed, company), ex, boxes)
     return ex
+
+
+def from_einvoice(data: dict, company: str | None = None) -> Extraction:
+    """An Extraction from e-invoice data: exact values, read from the data, not the page."""
+    fmt = getattr(data, "format", "") or "e-invoice"
+    ex = Extraction(method=f"E-invoice data ({fmt})", kind=data.get("kind", "invoice"))
+    for f in ("id", "vendor", "date", "amount"):
+        if data.get(f) not in (None, ""):
+            ex.fields[f] = data[f]
+    account = data.get("bank_account")
+    if account and (iban_ok(account) or account_value(account)):
+        ex.fields["bank_account"] = re.sub(r"\s+", "", account).upper() if iban_ok(account) else account_value(account)
+    for f in ex.fields:
+        ex.confidence[f] = 0.99
+        ex.source[f] = f"e-invoice data ({fmt})"
+    ex.totals = dict(getattr(data, "totals", {}) or {})
+    if data.get("amount_due") is not None and data.get("amount") is not None \
+            and abs(data["amount_due"] - data["amount"]) > 0.005:
+        ex.totals["paid"] = round(data["amount"] - data["amount_due"], 2)
+        ex.warnings.append(f"Of the total {data['amount']:,.2f}, {data['amount_due']:,.2f} is still to pay "
+                           "(the rest was paid in advance).")
+    ex.customer, ex.currency = data.get("customer"), data.get("currency")
+    if data.get("batch"):
+        ex.warnings.append(f"This file holds {data['batch']} invoices; only the first was read. "
+                           "Upload them one per file.")
+    if data.get("reference"):
+        ex.fields["reference"] = str(data["reference"])[:60]
+    if ex.kind == "credit":
+        ex.warnings.append("This is a credit note: it reduces what is owed to the vendor."
+                           + (f" It refers to invoice {ex.fields['reference']}." if ex.fields.get("reference") else ""))
+    if company and ex.fields.get("vendor") and similar(ex.fields["vendor"], company) > 0.85:
+        ex.warnings.append(f"The seller in this e-invoice is {ex.fields['vendor']}, which is your own company. "
+                           "Is this an invoice you sent rather than one you received?")
+    return ex
+
+
+def _amount_spellings(value: float) -> set[str]:
+    """How an amount can be printed: 1589.8 -> 1589.80, 1,589.80, 1.589,80, 1589,80, 1 589,80."""
+    whole, cents = f"{abs(value):.2f}".split(".")
+    grouped = f"{int(whole):,}"
+    return {f"{whole}.{cents}", f"{whole},{cents}", f"{grouped}.{cents}",
+            f"{grouped.replace(',', '.')},{cents}", f"{grouped.replace(',', '')},{cents}",
+            f"{grouped.replace(',', chr(39))}.{cents}"}
+
+
+def compare_with_page(data_ex: Extraction, page: Extraction, boxes: list | None = None) -> Extraction:
+    """Check the e-invoice data against what a person sees on the page.
+
+    They should be the same invoice. If the page clearly shows a different total or number
+    (read with high confidence, not a doubtful reading), one of the two has been changed
+    after the invoice was made: the classic way to slip a different amount or bank account
+    past someone who only looks at the page. That becomes a warning and a flag."""
+    conflicts = []
+    shown = {"amount": "total", "id": "invoice number", "bank_account": "bank account"}
+    text = " ".join(str(b.text) for b in boxes or ())
+    squashed = re.sub(r"\s+", "", text).upper()
+    for f, label in shown.items():
+        mine, theirs = data_ex.fields.get(f), page.fields.get(f)
+        if mine is None or theirs is None or page.confidence.get(f, 0) < 0.9:
+            continue
+        # If the data's value is printed anywhere on the page, the page agrees and the reader
+        # merely picked another figure. A changed page doesn't show the real value at all.
+        if f == "amount":
+            values = [mine, mine - data_ex.totals.get("paid", 0)]
+            if any(sp in squashed for v in values for sp in _amount_spellings(v)):
+                continue
+        elif re.sub(r"\s+", "", str(mine)).upper() in squashed:
+            continue
+        if f == "amount":
+            due = data_ex.fields["amount"] - data_ex.totals.get("paid", 0)
+            same = any(abs(float(theirs) - v) < 0.005 for v in (mine, due))
+            show = lambda v: f"{float(v):,.2f}"   # noqa: E731
+        else:
+            same = _squash(str(mine)) == _squash(str(theirs))
+            show = str
+        if not same:
+            conflicts.append(f"the page shows {label} {show(theirs)}, but the e-invoice data in the file says {show(mine)}")
+    if conflicts:
+        message = ("This PDF contradicts itself: " + "; ".join(conflicts) + ". One of them has been changed. "
+                   "Confirm the invoice with the vendor before paying.")
+        data_ex.warnings.insert(0, message)
+        data_ex.totals["embedded_conflict"] = message
+    data_ex.pages = page.pages
+    return data_ex
 
 
 def document_text(filename: str, data: bytes) -> str:

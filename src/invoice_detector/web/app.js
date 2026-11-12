@@ -870,7 +870,7 @@ async function uploadView() {
   // (one invoice per file: PDFs, Excel invoice forms, scans).
   let mode = "list";
   const modeTabs = () => h("div", { class: "tabs", role: "tablist", "aria-label": "What are you uploading?" },
-    [["list", "A list of invoices (export)"], ["docs", "Invoice documents (PDF, Excel, scans)"]].map(([id, label]) =>
+    [["list", "A list of invoices (export)"], ["docs", "Invoice documents (PDF, e-invoice, Excel, scans)"]].map(([id, label]) =>
       h("button", { class: mode === id ? "on" : "", role: "tab", "aria-selected": String(mode === id), id: "mode-" + id,
         onclick: () => { mode = id; if (id === "docs") docsChoose(); else chooseStep(); } }, label)));
 
@@ -1024,14 +1024,14 @@ async function uploadView() {
   let docSamples = null;
   async function docsChoose(error) {
     const input = h("input", { type: "file", multiple: true, class: "hidden", id: "doc-input",
-      accept: ".pdf,.xlsx,.xlsm,.png,.jpg,.jpeg,.tif,.tiff,.webp",
+      accept: ".pdf,.xml,.xlsx,.xlsm,.png,.jpg,.jpeg,.tif,.tiff,.webp",
       onchange: () => input.files.length && docsRead([...input.files]) });
     const drop = h("div", { class: "drop",
       ondragover: (e) => { e.preventDefault(); drop.classList.add("over"); },
       ondragleave: () => drop.classList.remove("over"),
       ondrop: (e) => { e.preventDefault(); drop.classList.remove("over"); if (e.dataTransfer.files.length) docsRead([...e.dataTransfer.files]); } },
       h("div", { class: "big" }, "Drop invoices here"),
-      h("p", { class: "muted" }, "PDFs, Excel invoices, or photos and scans of paper invoices. Several at once is fine: up to 50 files, 10 MB each."),
+      h("p", { class: "muted" }, "PDFs, e-invoices (XRechnung, ZUGFeRD, Factur-X, UBL/PEPPOL, FatturaPA), Excel invoices, or photos and scans of paper invoices. Several at once is fine: up to 50 files, 10 MB each."),
       h("button", { class: "btn primary", onclick: () => input.click() }, "Choose files"), input);
     const sampleBox = h("div");
     put(holder, modeTabs(), spacer(16), error ? failure(error) : null, error ? spacer(12) : null, drop, spacer(16),
@@ -1128,8 +1128,16 @@ async function uploadView() {
         h("option", { value: "invoice", selected: r.kind !== "credit" }, "Invoice"),
         h("option", { value: "credit", selected: r.kind === "credit" }, "Credit note"));
       st.kind = kind;
+      // A credit note can name the invoice it corrects; the checks use it.
+      const ref = h("input", { type: "text", class: "doc-input doc-ref", id: `doc-${index}-reference`, maxlength: "64",
+        value: r.fields.reference || "", placeholder: "For invoice #",
+        "aria-label": `Invoice that ${r.file} corrects`,
+        title: r.fields.reference ? `Read from: “${r.source.reference || r.fields.reference}”` : "The invoice this credit note corrects" });
+      ref.hidden = kind.value !== "credit";
+      kind.addEventListener("change", () => { ref.hidden = kind.value !== "credit"; });
+      st.ref = ref;
       const tr = h("tr", { class: "doc-row" + (r.warnings.length ? " has-notes" : "") }, h("td", {}, include),
-        h("td", { class: "doc-file" }, h("div", { class: "small" }, r.file), h("div", { class: "muted small" }, r.method), kind),
+        h("td", { class: "doc-file" }, h("div", { class: "small" }, r.file), h("div", { class: "muted small" }, r.method), kind, ref),
         cells);
       // Notes go on their own line under the invoice, full width, so they're never cut off.
       const notes = r.warnings.length ? h("tr", { class: "doc-notes" }, h("td", {}),
@@ -1143,7 +1151,8 @@ async function uploadView() {
       const items = [];
       let missing = 0;
       for (const st of rows.filter((x) => x.include)) {
-        const item = { draft: st.r.draft, file: st.r.file, kind: st.kind.value };
+        const item = { draft: st.r.draft, file: st.r.file, kind: st.kind.value,
+          reference: st.kind.value === "credit" ? (st.ref.value.trim() || null) : null };
         for (const [f] of DOC_FIELDS) {
           const v = st.inputs[f].value.trim();
           item[f] = f === "amount" ? (v === "" ? null : Number(v)) : (v || null);

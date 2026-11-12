@@ -37,7 +37,7 @@ class Conflict(Exception):
 
 # For display and totals a credit note counts as a negative amount (it reduces what is
 # owed); in the table its amount is positive and its kind says what it is.
-SIGNED_AMOUNT = "CASE WHEN kind = 'credit' THEN -amount ELSE amount END AS amount, kind"
+SIGNED_AMOUNT = "CASE WHEN kind = 'credit' THEN -amount ELSE amount END AS amount, kind, reference"
 
 
 class KeyMismatch(RuntimeError):
@@ -342,7 +342,8 @@ class Database:
 
     # ----- invoices -----
     def add_invoice(self, org_id: str, inv_id: str, vendor: str, amount: float,
-                    invoice_date: str, bank_account: str | None, created_by: str, kind: str = "invoice") -> None:
+                    invoice_date: str, bank_account: str | None, created_by: str, kind: str = "invoice",
+                    reference: str | None = None) -> None:
         bank_enc = bank_idx = None
         if bank_account:
             vault = self.vault(org_id)
@@ -350,8 +351,9 @@ class Database:
             bank_idx = vault.blind_index(normalize_account(bank_account))
         with self._tx(org_id) as run:
             run("INSERT INTO invoices (org_id, id, vendor, amount, invoice_date, bank_enc, "
-                "bank_idx, created_by, kind) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (org_id, inv_id, vendor, amount, invoice_date, bank_enc, bank_idx, created_by, kind))
+                "bank_idx, created_by, kind, reference) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (org_id, inv_id, vendor, amount, invoice_date, bank_enc, bank_idx, created_by, kind,
+                 _reference(kind, reference)))
 
     def add_invoices(self, org_id: str, invoices: list[dict], created_by: str) -> list[str]:
         """Insert many invoices in one transaction. Returns the ids that were already
@@ -363,10 +365,10 @@ class Database:
             rows.append((org_id, inv["id"], inv["vendor"], inv["amount"], inv["date"],
                          vault.encrypt(bank, f"invoices.bank:{org_id}:{inv['id']}") if bank else None,
                          vault.blind_index(normalize_account(bank)) if bank else None, created_by,
-                         inv.get("kind") or "invoice"))
+                         inv.get("kind") or "invoice", _reference(inv.get("kind"), inv.get("reference"))))
         existing = []
         query = ("INSERT INTO invoices (org_id, id, vendor, amount, invoice_date, bank_enc, bank_idx, "
-                 "created_by, kind) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (org_id, id) DO NOTHING")
+                 "created_by, kind, reference) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (org_id, id) DO NOTHING")
         if self.is_postgres:
             query = query.replace("?", "%s")
         with self._tx(org_id):
@@ -415,11 +417,11 @@ class Database:
 
     def detection_inputs(self, org_id: str) -> list[Invoice]:
         with self._tx(org_id) as run:
-            rows = run("SELECT i.id, i.vendor, i.amount, i.invoice_date, i.bank_idx, d.totals_issue, i.kind "
+            rows = run("SELECT i.id, i.vendor, i.amount, i.invoice_date, i.bank_idx, d.totals_issue, i.kind, i.reference "
                        "FROM invoices i LEFT JOIN documents d ON d.org_id = i.org_id AND d.invoice_id = i.id "
                        "WHERE i.org_id = ?", (org_id,))
         return [Invoice(r["id"], r["vendor"], r["amount"], r["invoice_date"], r["bank_idx"], r["totals_issue"],
-                        r["kind"]) for r in rows]
+                        r["kind"], r["reference"]) for r in rows]
 
     # ----- invoice documents -----
     def document_by_hash(self, org_id: str, sha256: str) -> dict | None:
@@ -444,11 +446,11 @@ class Database:
                 bank = r.get("bank_account")
                 inserted = self.conn.execute(mark(
                     "INSERT INTO invoices (org_id, id, vendor, amount, invoice_date, bank_enc, bank_idx, created_by, "
-                    "kind) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (org_id, id) DO NOTHING"),
+                    "kind, reference) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (org_id, id) DO NOTHING"),
                     (org_id, r["id"], r["vendor"], r["amount"], r["date"],
                      vault.encrypt(bank, f"invoices.bank:{org_id}:{r['id']}") if bank else None,
                      vault.blind_index(normalize_account(bank)) if bank else None, created_by,
-                     r.get("kind") or "invoice")).rowcount
+                     r.get("kind") or "invoice", _reference(r.get("kind"), r.get("reference")))).rowcount
                 if not inserted:
                     skipped.append(r["id"])
                     continue
@@ -556,6 +558,13 @@ class Database:
         with self._tx(org_id) as run:
             return run("SELECT at, username, action, detail FROM audit_log WHERE org_id = ? "
                        "ORDER BY id DESC LIMIT ?", (org_id, limit))
+
+
+def _reference(kind: str | None, reference) -> str | None:
+    """Only a credit note names another invoice; keep it short and plain."""
+    if kind != "credit" or reference in (None, ""):
+        return None
+    return " ".join(str(reference).split())[:64] or None
 
 
 class DbRateLimiter:

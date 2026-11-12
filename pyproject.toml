@@ -16,6 +16,7 @@ dependencies = [
   "openpyxl>=3.1",
   "defusedxml>=0.7.1",   # makes openpyxl refuse XML "bomb" spreadsheets
   "pdfplumber>=0.11",
+  "pypdf>=6.0",          # finds the e-invoice data (ZUGFeRD / Factur-X) attached inside a PDF
 ]
 
 [project.optional-dependencies]

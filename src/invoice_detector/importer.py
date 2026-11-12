@@ -13,11 +13,12 @@ import re
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 
-FIELDS = ("id", "vendor", "amount", "date", "bank_account", "kind")
+FIELDS = ("id", "vendor", "amount", "date", "bank_account", "kind", "reference")
 REQUIRED = ("id", "vendor", "amount", "date")
 FIELD_LABELS = {"id": "Invoice number", "vendor": "Vendor", "amount": "Amount",
                 "date": "Invoice date", "bank_account": "Bank account (optional)",
-                "kind": "Type: invoice or credit note (optional)"}
+                "kind": "Type: invoice or credit note (optional)",
+                "reference": "Credit notes: the invoice they apply to (optional)"}
 MAX_BYTES = 10 * 1024 * 1024
 MAX_ROWS = 50_000
 MAX_UNZIPPED = 200 * 1024 * 1024   # an .xlsx is a zip; refuse ones that expand to more than this
@@ -41,6 +42,10 @@ SYNONYMS = {
                      "accountiban", "bankdetails"],
     "kind": ["type", "documenttype", "doctype", "invoicetype", "transactiontype", "txntype", "trantype",
              "recordtype", "kind"],
+    # Only names that can't mean the row's own number: "Reference" alone often is.
+    "reference": ["appliesto", "appliestoinvoice", "originalinvoice", "originalinvoiceno", "originalinvoicenumber",
+                  "relatedinvoice", "creditedinvoice", "correctsinvoice", "creditforinvoice", "againstinvoice",
+                  "bezugsrechnung", "ursprungsrechnung", "factureorigine", "facturedorigine", "oorspronkelijkefactuur"],
 }
 
 # What a "Type" column says when the row is a credit note.
@@ -428,6 +433,9 @@ def convert(table: Table, mapping: dict, date_order: str = "MDY") -> Converted:
                        "date": parse_date(cell["date"], date_order),
                        "bank_account": _text(cell.get("bank_account"))[:64] or None,
                        "kind": "credit" if credit else "invoice"}
+            ref = _text(cell.get("reference"))[:64] if credit else ""
+            if ref and ID_PATTERN.match(ref):
+                invoice["reference"] = ref
         except ValueError as exc:
             out.errors.append({"row": line, "message": str(exc)})
             continue

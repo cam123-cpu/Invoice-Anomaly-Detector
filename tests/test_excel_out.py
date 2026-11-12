@@ -144,7 +144,7 @@ class ReportAndTemplateTests(unittest.TestCase):
         table = read_table("template.xlsx", template())
         info = preview(table)
         self.assertEqual(info["mapping"], {"id": "Invoice number", "vendor": "Vendor", "amount": "Amount",
-                                           "date": "Invoice date", "bank_account": "Bank account", "kind": None})
+                                           "date": "Invoice date", "bank_account": "Bank account", "kind": None, "reference": None})
         self.assertEqual(len(convert(table, info["mapping"]).invoices), 1)
 
 

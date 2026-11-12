@@ -154,8 +154,11 @@ class DocumentIntake:
         if bank and len(bank) > 64:
             return None, "the bank account is too long"
         kind = "credit" if item.get("kind") == "credit" else "invoice"
+        reference = " ".join(str(item.get("reference") or "").split())[:64] or None
+        if kind != "credit" or (reference and not ID_PATTERN.match(reference)):
+            reference = None
         return {"id": inv_id, "vendor": vendor, "amount": amount, "date": when.isoformat(),
-                "bank_account": bank, "kind": kind}, None
+                "bank_account": bank, "kind": kind, "reference": reference}, None
 
     def import_drafts(self, user: dict, items: list[dict]) -> dict:
         if len(items) > MAX_BATCH:
@@ -184,6 +187,8 @@ class DocumentIntake:
             read = draft.get("read") or {}
             corrections = {f: [read.get(f), row[f]] for f in ("id", "vendor", "amount", "date", "bank_account")
                            if not _same(read.get(f), row[f])}
+            if row["kind"] == "credit" and not _same(read.get("reference"), row["reference"]):
+                corrections["reference"] = [read.get("reference"), row["reference"]]
             if (read.get("kind") or "invoice") != row["kind"]:
                 corrections["kind"] = [read.get("kind") or "invoice", row["kind"]]
             row.update(sha256=draft["sha"], filename=draft["file"], method=draft["method"],

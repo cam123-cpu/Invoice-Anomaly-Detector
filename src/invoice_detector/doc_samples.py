@@ -89,6 +89,8 @@ class Doc:
     total_error: float = 0.0         # >0: the printed total is wrong by this much
     credit: bool = False             # a credit note instead of an invoice
     negative_totals: bool = False    # credit notes often print their amounts with a minus sign
+    reference: str | None = None     # on a credit note: the invoice it corrects
+    reference_label: str = "Original invoice:"
 
     @property
     def subtotal(self) -> float:
@@ -130,7 +132,8 @@ class Doc:
     def truth(self) -> dict:
         return {"id": self.number, "vendor": self.vendor, "date": self.issued.isoformat(),
                 "amount": self.printed_total, "bank_account": (self.bank or "").replace(" ", "") or None,
-                "kind": "credit" if self.credit else "invoice"}
+                "kind": "credit" if self.credit else "invoice",
+                "reference": self.reference if self.credit else None}
 
 
 CREDIT_LABELS = {
@@ -143,6 +146,10 @@ CREDIT_LABELS = {
 
 
 # ------------------------------------------------------------------ layouts
+REFERENCE_LABELS = ("Original invoice:", "Credit for invoice", "Relates to invoice no.", "Applies to invoice",
+                    "Invoice reference:", "Credit note for invoice")
+
+
 def layout(doc: Doc) -> list[tuple]:
     """Positioned text for one invoice, in one of four common layouts."""
     T = []
@@ -256,6 +263,8 @@ def layout(doc: Doc) -> list[tuple]:
         y = totals(table(270))
         if doc.bank:
             text(50, y, f"{doc.label('bank', 'IBAN')}: {doc.bank}", 9)
+    if doc.credit and doc.reference:
+        text(50, 700, f"{doc.reference_label} {doc.reference}", 10)
     return T
 
 
@@ -344,9 +353,13 @@ def random_doc(rng: random.Random, style: str | None = None) -> Doc:
     if eu:
         labels["tax"] = "VAT 20%"
     credit = rng.random() < 0.12
+    reference = None
     if credit:
         number = rng.choice([f"CN-{rng.randint(1, 9999):04d}", f"CR{rng.randint(100, 9999)}"])
+        if rng.random() < 0.7:
+            reference = f"INV-{rng.randint(1000, 9999)}"
     return Doc(
+        reference=reference, reference_label=rng.choice(REFERENCE_LABELS),
         credit=credit, negative_totals=credit and rng.random() < 0.5,
         vendor=vendor, vendor_lines=[rng.choice(STREETS), rng.choice(CITIES)], email=f"billing@{domain}",
         customer=rng.choice(CUSTOMERS), customer_lines=["Accounts Payable", rng.choice(STREETS)],
@@ -404,6 +417,7 @@ def sample_docs() -> list[tuple[str, bytes, Doc]]:
                                                 issued=date(2026, 10, 29), due=date(2026, 10, 29),
                                                 items=[("Server maintenance (invoice GX-7730 cancelled)", 2, 1340.0)],
                                                 tax_rate=0.08, style="classic", credit=True, negative_totals=True,
+                                                reference="GX-7730", reference_label="Credit for invoice",
                                                 **base), "pdf"),
     ]
     return [(name, to_pdf(doc) if kind == "pdf" else to_xlsx(doc), doc) for name, doc, kind in docs]
@@ -423,7 +437,7 @@ def evaluate_documents(n: int = 100, seed: int = 7, company: str = "Acme Inc") -
     formats) and score each field against the known answer. Also scores the arithmetic
     check: planted wrong totals caught, and false alarms on correct invoices."""
     from .documents import norm, read_document
-    fields = ("id", "vendor", "date", "amount", "bank_account", "kind")
+    fields = ("id", "vendor", "date", "amount", "bank_account", "kind", "reference")
     right = dict.fromkeys(fields, 0)
     total = dict.fromkeys(fields, 0)
     caught = missed = false_alarms = 0

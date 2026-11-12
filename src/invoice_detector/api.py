@@ -101,6 +101,7 @@ class InvoiceIn(StrictModel):
     date: Date
     bank_account: str | None = Field(default=None, max_length=64)
     kind: Literal["invoice", "credit"] = "invoice"   # "credit" for a credit note; the amount stays positive
+    reference: str | None = Field(default=None, max_length=64, pattern=ID_PATTERN.pattern)  # the invoice a credit applies to
 
 
 class UserIn(StrictModel):
@@ -198,6 +199,7 @@ class CheckedDocument(StrictModel):
     amount: float | None = Field(default=None, ge=0, lt=1e12)
     bank_account: str | None = Field(default=None, max_length=64)
     kind: Literal["invoice", "credit"] = "invoice"
+    reference: str | None = Field(default=None, max_length=64)
 
 
 class DocumentsImportIn(StrictModel):
@@ -591,7 +593,7 @@ def create_app(settings: Settings | None = None, db: Database | None = None,
     def add_invoice(inv: InvoiceIn, user: dict = Depends(require("admin", "accountant"))) -> dict:
         try:
             db.add_invoice(user["org"], inv.id, inv.vendor, inv.amount, inv.date.isoformat(),
-                           inv.bank_account, user["sub"], inv.kind)
+                           inv.bank_account, user["sub"], inv.kind, inv.reference)
         except Conflict:
             raise HTTPException(409, "Invoice id already exists") from None
         return {"id": inv.id}
@@ -603,7 +605,7 @@ def create_app(settings: Settings | None = None, db: Database | None = None,
         for item in items:
             inv = details.get(item["invoice_id"], {})
             item.update(vendor=inv.get("vendor"), amount=inv.get("amount"), date=inv.get("invoice_date"),
-                        kind=inv.get("kind", "invoice"))
+                        kind=inv.get("kind", "invoice"), reference=inv.get("reference"))
         return {i["invoice_id"]: i for i in items}
 
     @app.post("/export/annotated")
@@ -663,7 +665,7 @@ def create_app(settings: Settings | None = None, db: Database | None = None,
         if len(invoices) > MAX_BULK:
             raise HTTPException(413, f"At most {MAX_BULK} invoices per request")
         rows = [{"id": i.id, "vendor": i.vendor, "amount": i.amount, "date": i.date.isoformat(),
-                 "bank_account": i.bank_account, "kind": i.kind} for i in invoices]
+                 "bank_account": i.bank_account, "kind": i.kind, "reference": i.reference} for i in invoices]
         skipped = db.add_invoices(user["org"], rows, user["sub"])
         added = len(rows) - len(skipped)
         db.audit(user["org"], user["sub"], "invoices_imported", f"{added} added, {len(skipped)} skipped")
@@ -775,7 +777,7 @@ def create_app(settings: Settings | None = None, db: Database | None = None,
         for item in ranked:
             inv = details.get(item["invoice_id"], {})
             item.update(vendor=inv.get("vendor"), amount=inv.get("amount"), date=inv.get("invoice_date"),
-                        kind=inv.get("kind", "invoice"))
+                        kind=inv.get("kind", "invoice"), reference=inv.get("reference"))
         return ranked
 
     def full_queue(org: str) -> list[dict]:
