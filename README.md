@@ -27,7 +27,8 @@ sorts every invoice into Ready to pay, Review first, On hold and Do not pay.
 | `totals_mismatch` | 0.45 | The invoice's own line items, subtotal, tax and total don't agree (invoices read from documents) |
 | `credited_invoice` / `matched_credit` | 0.65 | An invoice and the credit note that cancels it in full (flagged as a pair) |
 | `duplicate_credit` | 0.50 | The same credit note recorded twice |
-| `unmatched_credit` | 0.45 | A credit note from a vendor with nothing, or less, billed |
+| `unmatched_credit` | 0.45 | A credit note from a vendor with nothing (or less) billed, or naming an invoice that isn't on file, is another vendor's, or is already fully credited |
+| `reissued_invoice` | 0.35 | Same vendor and amount as an invoice a credit note cancelled: held until the credit is confirmed |
 | `split_invoice` | 0.50 | Several invoices in a few days, each under the approval threshold, together over it |
 | `near_duplicate` | 0.50 | Same vendor + amount a few days apart |
 | `similar_vendor_name` | 0.50 | Vendor name almost identical to another vendor's |
@@ -55,22 +56,30 @@ positive amount and its type, and shown with a minus sign, so every total is net
   says credit ("Credit Memo", "Vendor Credit", "Gutschrift"...) makes the row a credit note.
 - **As a document:** recognised by its title ("Credit note", "Avoir", "Rechnungskorrektur"...);
   the review screen has a Type box to change it.
-- **Checks of their own:** a credit for exactly an invoice's amount, from the same vendor,
-  cancels that invoice. Both are flagged as a pair (*Cancelled by a credit note* / *Cancels an
-  invoice*), so the invoice isn't paid and the credit isn't also deducted elsewhere, and the
-  re-issued invoice is not mistaken for a duplicate. A credit from a vendor with nothing billed
-  (or less billed than the credit) is flagged, as is the same credit recorded twice.
-- Credits for other amounts (a price adjustment, a return) are ordinary: they reduce what the
-  vendor is paid. They are left out of the checks that learn what is normal for a vendor.
+- **Which invoice it corrects:** read from e-invoice data, from the page ("Credit for invoice
+  INV-5521", "zu Rechnung Nr.", "Avoir sur facture n°"...), from an *Applies to* column, or typed
+  on the review screen.
+- **Checks of their own:** a credit that cancels an invoice in full (the one it names, or else
+  one for exactly its amount from the same vendor) is flagged together with that invoice
+  (*Cancelled by a credit note* / *Cancels an invoice*), so the invoice isn't paid and the credit
+  isn't also deducted elsewhere. A credit is also flagged if it comes from a vendor with nothing
+  billed, names an invoice that isn't on file or belongs to another vendor, pushes the credits
+  for one invoice above the invoice itself, or is recorded twice.
+- **The re-issued invoice** is not called a duplicate of the one it replaces, but it waits
+  (*Replaces a cancelled invoice*, hold) until the credit is confirmed with the vendor. Otherwise
+  a fake credit note could "cancel" an invoice that was already paid and slip its copy through.
+- Credits for part of an invoice (a price adjustment, a return) are ordinary: they reduce what
+  the vendor is paid. They are left out of the checks that learn what is normal for a vendor.
 - The dashboard and the payment file show how much credit is included and how much is ready
   to deduct.
 
-## Invoice documents (PDF, Excel invoices, scans)
+## Invoice documents (PDF, e-invoices, Excel invoices, scans)
 
 Besides exports (one invoice per row), the app reads the invoices themselves, one per file:
 
 | File | How it's read | Where |
 |---|---|---|
+| E-invoice: ZUGFeRD, Factur-X, XRechnung (in a PDF or as .xml), UBL / PEPPOL, FatturaPA | Its structured data, exactly; the page is checked against it | On your server |
 | PDF made by software | Its text and where each word sits on the page (pdfplumber) | On your server |
 | Excel invoice form (like Microsoft's invoice templates) | Each cell's value and position | On your server |
 | Photo or scanned PDF | OCR with Tesseract, then the same reading | On your server (optional extra) |
@@ -93,7 +102,19 @@ fields in amber and missing ones in red, and shows the text each value came from
 
 The reader knows English, German, French, Dutch, Spanish and Italian labels
 (`doc_languages.py`; adding a language is adding its words), month names and day-first dates,
-and recognises a credit note by its title.
+and recognises a credit note by its title or by a total printed negative.
+
+**E-invoices are read exactly** (`einvoice.py`). Many European invoices carry their data as
+XML, inside the PDF or as the file itself. When it is there, every field comes from it, with
+no guessing. It is also a check: if the page shows a total, invoice number or bank account
+that the data doesn't contain anywhere, the PDF contradicts itself, which is how an altered
+invoice looks, and the invoice is flagged. The XML is parsed with defusedxml (no DTDs or
+entities), at most 2 MB; a hostile attachment just means the page is read instead.
+
+**It learns from corrections.** When someone corrects the invoice number, date or total to a
+value that was printed beside another label, the app remembers that label for that vendor,
+in that company only. The vendor's next invoice is read there, with a note saying so. A
+lesson that keeps being corrected away is dropped, and each new lesson is in the activity log.
 
 **How accurate?** Two different answers, and the second is the one that matters:
 
@@ -104,18 +125,19 @@ and recognises a credit note by its title.
   public collections (156 different PDFs from 24 vendors, mostly German, French and Dutch)
   and compares the reading with their known answers:
 
-  | Set | Documents | All four fields right | Before this work |
+  | Set (reading the page only) | Documents | All four fields right | First run |
   |---|---|---|---|
-  | Real company invoices (invoice2data) | 10 | 60% | 10% |
-  | E-invoices, vendors used for tuning | 102 | 77% | 0% |
-  | E-invoices, vendors held out | 44 | 84% (73% when first run, before any fix made from it) | 0% |
+  | Real company invoices (invoice2data) | 10 | 70% | 10% |
+  | E-invoices, vendors used for tuning | 102 | 79% | 0% |
+  | E-invoices, vendors held out | 44 | 84% | 0% (73% after the first round of fixes, before any fix made from this set) |
+  | **E-invoices read from their own data** | 146 | **100%** | n/a |
 
-  By field, over all 156: invoice number 88%, vendor 90%, date 94%, amount 91%. One document
-  in 156 was wrongly told its totals don't add up. CI re-runs this on every push and fails if
-  it gets worse.
+  By field, reading the page of all 156: invoice number 90%, vendor 96%, date 96%, total 94%.
+  One document in 156 was wrongly told its totals don't add up. CI re-runs this on every push
+  and fails if any set drops below 60% or e-invoice data isn't read exactly.
 
-So expect roughly three real invoices in four to need no correction, and one in four to need
-a field fixed on the review screen. Vendors whose name exists only inside a logo image, and
+So for a paper or plain-PDF invoice expect roughly four in five to need no correction, and
+one in five to need a field fixed on the review screen; an e-invoice needs none. Vendors whose name exists only inside a logo image, and
 receipts that aren't invoices, are the usual misses. Measure it on your own vendors before
 relying on it: put a sample in a folder with a `truth.csv` and run
 `cli evaluate-documents --folder DIR`.

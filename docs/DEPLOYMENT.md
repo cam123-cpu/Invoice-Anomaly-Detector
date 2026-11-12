@@ -186,9 +186,11 @@ same image works too; if you build your own image, install `tesseract-ocr` and t
 Uploaded files are read in a separate, short-lived process with a 45-second limit and (on Linux)
 a 2 GB memory limit, so a broken file can't hang the app. Leave `DOC_ISOLATION` at its default.
 
-**How well it reads.** English, German, French, Dutch, Spanish and Italian invoices. On 156
-real public invoices, about three in four are read with number, vendor, date and total all
-correct; the rest need a field corrected on the review screen. Before rolling it out, measure
+**How well it reads.** E-invoices (ZUGFeRD, Factur-X, XRechnung, UBL / PEPPOL, FatturaPA) are
+read exactly from their data. Other invoices in English, German, French, Dutch, Spanish and
+Italian: on 156 real public invoices, four in five are read with number, vendor, date and
+total all correct; the rest need a field corrected on the review screen, and the reader
+remembers each vendor's corrections. Before rolling it out, measure
 it on your own vendors: put 30 or so of their invoices in a folder with a `truth.csv`
 (`file,id,vendor,date,amount`) and run
 `python -m invoice_detector.cli evaluate-documents --folder DIR`.

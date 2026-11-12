@@ -30,6 +30,18 @@ data, have an independent tester repeat it.
 | 11 | Low | **Steal a token with an injected script at sign-in.** The token was in an HttpOnly cookie, but also in the JSON the page received. | The web app no longer receives the token at all; only programs calling the API do. |
 | 12 | Low | **Guess long but obvious passwords** such as `password1234` or the username plus digits. | Common words, keyboard runs, repeats and username-based passwords are refused wherever a password is set. |
 
+### Second round (after several servers, credit notes, e-invoices and learning)
+
+| # | Severity | What an attacker could do | Fix |
+|---|---|---|---|
+| 13 | Medium | **Get a duplicate paid with a fake credit note.** Copy an invoice that was already paid, and add a credit note "cancelling" the original: the copy was no longer a duplicate and went straight to *Ready to pay*. | The copy is flagged *Replaces a cancelled invoice* (hold) until the credit is confirmed with the vendor. |
+| 14 | Medium | **Tie up the document reader** with one very long line of text in a PDF: reading was quadratic, 1.6 s for 6,000 characters, so a page of such lines held a reader for its full 45 s. | Values are read from at most 200 characters; a file with more than 4,000 pieces of text (largest real invoice tested: 269) is refused. |
+| 15 | Low | **Dodge the per-address sign-in limit behind the load balancer** by sending a forged `X-Forwarded-For`. Caddy already replaced the header by default, but nothing guaranteed it. | The Caddyfile sets the header from the connection explicitly; CI forges it on 40 attempts and checks the limit still stops them. |
+| 16 | Low | **Learn which usernames were attacked** from a copy of the rate-limit table: keys were a plain hash of the username. | Keys are an HMAC with the server's index key. |
+| 17 | Low | **Teach the reader a misleading label** for a vendor (an insider correcting one invoice), so colleagues see a wrong pre-filled value. | Every value is still shown for checking, with a note when it was read from a learned label; the totals check still applies; each new lesson is in the activity log with who taught it. |
+
+Checked in this round and found sound: XML in e-invoices (DTDs and entities refused, 2 MB cap, 140,000-level nesting, 380,000 elements and 140,000 attributes each parse in under a second); a 100 MB attachment compressed into a small PDF (refused by pypdf's limit, the page is read instead); a credit note's reference (validated like an invoice number, shown as text, scoped to the company); lessons (signed in the draft, reduced to letters, isolated per company by row-level security).
+
 ## Checked and found sound
 
 These were attacked and held, so nothing was changed:
@@ -48,10 +60,11 @@ These were attacked and held, so nothing was changed:
 
 ## Known limits that remain
 
-- Sign-in rate limits are now kept in the database (hashed keys, one atomic statement per attempt), so they hold across any number of app copies. An attacker can still lock a known username out for 15 minutes by guessing wrong five times; that is the trade the limiter makes.
+- Sign-in rate limits are kept in the database (keyed hashes, one atomic statement per attempt), so they hold across any number of app copies. An attacker can still lock a known username out for 15 minutes by guessing wrong five times; that is the trade the limiter makes.
 - On SQLite (laptop use) company separation relies on the application code alone; PostgreSQL adds the database-level guarantee.
 - A company admin can tell that a username is taken by another company (usernames are global).
 - Signing out ends all of that person's sessions, not just one device.
+- A credit note confirmed by a reviewer releases its re-issued invoice only by the reviewer's judgement: the app can't check with the vendor itself.
 
 ## Re-running it
 
