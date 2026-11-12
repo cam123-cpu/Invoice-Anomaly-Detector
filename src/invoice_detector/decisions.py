@@ -49,6 +49,16 @@ RULE_FIX = {
                         "Check whether the amount was set to stay under the approval limit; if so, get the "
                         "approval it should have had."),
     "round_amount": ("hold", "Ask the vendor for an itemised breakdown supporting the round figure."),
+    "credited_invoice": ("do_not_pay",
+                         "Don't pay this invoice: the vendor cancelled it with a credit note. Confirm the "
+                         "credit note is genuine, then mark both as dealt with."),
+    "matched_credit": ("do_not_pay",
+                       "This credit note cancels one specific invoice. Don't also deduct it from another "
+                       "payment to the vendor. Confirm it together with the invoice it cancels."),
+    "unmatched_credit": ("hold",
+                         "Ask the vendor which invoice this credit relates to before deducting it. A credit "
+                         "with nothing behind it can be used to hide a missing payment."),
+    "duplicate_credit": ("do_not_pay", "Apply only one of the two identical credit notes."),
     "totals_mismatch": ("hold",
                         "Recalculate the invoice. Pay only the correct amount, and ask the vendor for a corrected "
                         "invoice; if the total looks altered, confirm it with the vendor by phone."),

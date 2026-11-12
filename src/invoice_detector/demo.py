@@ -36,13 +36,13 @@ def generate_demo(seed: int = 0):
     injected: dict[str, set] = {}
     banks = {name: f"ACCT{idx:02d}{rng.randrange(10**10):010d}" for idx, (name, *_) in enumerate(VENDORS)}
 
-    def add(vendor, amount, when, bank, rules=None):
+    def add(vendor, amount, when, bank, rules=None, kind="invoice"):
         amount = round(amount, 2)
         if rules is None and amount % 1000 == 0:
             amount += 0.37  # keep the clean data free of accidental round amounts
-        inv_id = f"INV-{len(rows) + 1:04d}"
+        inv_id = f"{'CN' if kind == 'credit' else 'INV'}-{len(rows) + 1:04d}"
         rows.append({"id": inv_id, "vendor": vendor, "amount": amount,
-                     "date": when.isoformat(), "bank_account": bank})
+                     "date": when.isoformat(), "bank_account": bank, "kind": kind})
         if rules:
             injected[inv_id] = set(rules)
         return rows[-1]
@@ -102,5 +102,17 @@ def generate_demo(seed: int = 0):
     # 11. brand-new vendor, large first invoice
     add("Vandelay Industries", 18400.55, on("Globex Corp", 1), "ACCT92" + "5" * 10,
         {"new_vendor_large"})
+
+    # 12. an invoice billed at the wrong amount, cancelled by a credit note, then re-issued for
+    #     the same amount two days later. The pair is flagged; the re-issue must NOT be called a
+    #     duplicate of the invoice it replaces.
+    when = on("Globex Corp", 6)
+    add("Globex Corp", 1842.75, when, banks["Globex Corp"], {"credited_invoice"})
+    add("Globex Corp", 1842.75, _weekday(when + timedelta(days=2)), None, {"matched_credit"}, kind="credit")
+    add("Globex Corp", 1842.75, _weekday(when + timedelta(days=4)), banks["Globex Corp"])
+    # 13. an ordinary small credit (a returned item): clean, it just reduces what is owed
+    add("Wayne Office", 38.20, on("Wayne Office", 5), None, kind="credit")
+    # 14. a credit note from a company that has never billed anything
+    add("Soylent Partners", 2600.00, on("Initech LLC", 2), None, {"unmatched_credit"}, kind="credit")
 
     return rows, injected

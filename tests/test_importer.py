@@ -62,7 +62,9 @@ class MappingTests(unittest.TestCase):
     def test_typical_exports(self):
         self.assertEqual(suggest_mapping(["Invoice #", "Supplier", "Invoice Date", "Total", "IBAN"]),
                          {"id": "Invoice #", "vendor": "Supplier", "date": "Invoice Date",
-                          "amount": "Total", "bank_account": "IBAN"})
+                          "amount": "Total", "bank_account": "IBAN", "kind": None})
+        self.assertEqual(suggest_mapping(["Bill No", "Vendor", "Date", "Amount", "Document Type"])["kind"],
+                         "Document Type")
         qb = suggest_mapping(["Date", "Transaction Type", "Num", "Name", "Memo", "Amount"])
         self.assertEqual((qb["date"], qb["vendor"], qb["amount"]), ("Date", "Name", "Amount"))
         fuzzy = suggest_mapping(["Supplier Name (legal)", "Doc Number", "Invoice Date", "Amount Due USD"])
@@ -95,21 +97,24 @@ class ReadAndConvertTests(unittest.TestCase):
         self.assertEqual(result.blank_rows, 2)
         self.assertEqual(result.invoices, [
             {"id": "INV/2026/001", "vendor": "Acme Ltd", "amount": 1234.5, "date": "2026-03-05",
-             "bank_account": "DE89 3704"},
-            {"id": "1002", "vendor": "Globex", "amount": 2000.0, "date": "2026-03-25", "bank_account": None}])
+             "bank_account": "DE89 3704", "kind": "invoice"},
+            {"id": "1002", "vendor": "Globex", "amount": 2000.0, "date": "2026-03-25", "bank_account": None,
+             "kind": "invoice"}])
 
     def test_csv_semicolon_european_and_row_errors(self):
         text = ("Rechnung;Lieferant;Datum;Betrag\n"  # unknown German headers: mapped by hand
                 "R-1;Müller GmbH;05.03.2026;1.234,50\n"
-                "R-2;Schmidt AG;31.03.2026;-5,00\n"
+                "R-2;Schmidt AG;31.03.2026;0,00\n"
                 "R-1;Müller GmbH;06.03.2026;10,00\n"
-                "R 4!;X;06.03.2026;1\n")
+                "R 4!;X;06.03.2026;1\n"
+                "G-9;Schmidt AG;31.03.2026;-5,00\n")
         table = read_table("export.csv", text.encode("cp1252"))
         mapping = {"id": "Rechnung", "vendor": "Lieferant", "date": "Datum", "amount": "Betrag"}
         result = convert(table, mapping, "DMY")
-        self.assertEqual([i["vendor"] for i in result.invoices], ["Müller GmbH"])
+        self.assertEqual([(i["vendor"], i["amount"], i["kind"]) for i in result.invoices],
+                         [("Müller GmbH", 1234.5, "invoice"), ("Schmidt AG", 5.0, "credit")])  # negative = credit note
         self.assertEqual([e["row"] for e in result.errors], [3, 4, 5])
-        self.assertIn("greater than zero", result.errors[0]["message"])
+        self.assertIn("zero", result.errors[0]["message"])
         self.assertIn("already appears on row 2", result.errors[1]["message"])
 
     def test_utf16_tab_separated(self):
@@ -164,6 +169,37 @@ class ReadAndConvertTests(unittest.TestCase):
     def test_duplicate_header_names_are_kept_apart(self):
         table = read_table("x.csv", b"Amount,Amount,Vendor,Date,Invoice\n1,2,V,2026-01-05,A\n")
         self.assertEqual(table.headers[:2], ["Amount", "Amount (2)"])
+
+
+
+class CreditNoteImportTests(unittest.TestCase):
+    def convert(self, headers, *rows):
+        table = read_table("x.csv", "\n".join(",".join(r) for r in (headers, *rows)).encode())
+        return convert(table, suggest_mapping(table.headers))
+
+    def test_a_negative_amount_is_a_credit_note(self):
+        result = self.convert(["Invoice No", "Vendor", "Date", "Amount"],
+                              ["A1", "Acme", "2026-01-05", "100.00"],
+                              ["CN1", "Acme", "2026-01-09", "-$38.20"],
+                              ["CN2", "Acme", "2026-01-10", "(12.50)"],
+                              ["CN3", "Acme", "2026-01-11", "7.00-"])
+        self.assertEqual(result.errors, [])
+        self.assertEqual([(i["id"], i["amount"], i["kind"]) for i in result.invoices],
+                         [("A1", 100.0, "invoice"), ("CN1", 38.2, "credit"), ("CN2", 12.5, "credit"),
+                          ("CN3", 7.0, "credit")])
+
+    def test_a_type_column_marks_credit_notes(self):
+        result = self.convert(["Type", "Invoice No", "Vendor", "Date", "Amount"],
+                              ["Bill", "A1", "Acme", "2026-01-05", "100.00"],
+                              ["Vendor Credit", "CN1", "Acme", "2026-01-09", "38.20"],
+                              ["Credit Memo", "CN2", "Acme", "2026-01-09", "-5.00"],
+                              ["Gutschrift", "CN3", "Acme", "2026-01-09", "5.00"])
+        self.assertEqual([i["kind"] for i in result.invoices], ["invoice", "credit", "credit", "credit"])
+        self.assertEqual([i["amount"] for i in result.invoices], [100.0, 38.2, 5.0, 5.0])   # stored positive
+
+    def test_zero_is_still_refused(self):
+        result = self.convert(["Invoice No", "Vendor", "Date", "Amount"], ["A1", "Acme", "2026-01-05", "0.00"])
+        self.assertEqual((result.invoices, len(result.errors)), ([], 1))
 
 
 if __name__ == "__main__":

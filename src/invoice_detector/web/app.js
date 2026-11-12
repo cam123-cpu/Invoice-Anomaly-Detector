@@ -17,7 +17,14 @@ const RULES = {
   round_amount: ["Round amount", "Suspiciously round figure", "low"],
   weekend_invoice: ["Weekend date", "Invoice is dated on a weekend", "low"],
   totals_mismatch: ["Totals don't add up", "The invoice's line items, subtotal, tax and total don't agree", "mid"],
+  credited_invoice: ["Cancelled by a credit note", "A credit note for the same vendor and amount cancels this invoice", "high"],
+  matched_credit: ["Cancels an invoice", "This credit note cancels a specific invoice in full", "mid"],
+  unmatched_credit: ["Credit with no matching invoices", "Credit note from a vendor with nothing, or less, billed", "mid"],
+  duplicate_credit: ["Duplicate credit note", "Same vendor, amount and date as another credit note", "mid"],
 };
+
+/* A small tag after the number of a credit note (its amount is shown negative). */
+const kindTag = (kind) => (kind === "credit" ? [" ", h("span", { class: "pill credit" }, "Credit note")] : null);
 const ACTIONS = {
   login: "Signed in", login_failed: "Failed sign-in", file_imported: "Imported a file",
   documents_imported: "Imported invoice documents", ai_document_read: "Sent a document for AI reading",
@@ -596,10 +603,15 @@ async function dashboardView() {
   const stack = h("div", { class: "stack", role: "img",
     "aria-label": order.map(([d, label]) => `${label} ${fmtAmount(s.amounts[d])}`).join(", ") },
   order.filter(([d]) => s.amounts[d] > 0).map(([d, label]) => {
+    const positive = order.reduce((t, [x]) => t + Math.max(0, s.amounts[x] || 0), 0);   // credits can make a row negative
     const seg = h("span", { class: "d-" + d, title: `${label}: ${fmtAmount(s.amounts[d])}` });
-    seg.style.width = (100 * s.amounts[d] / (totalAmount || 1)) + "%";
+    seg.style.width = (100 * s.amounts[d] / (positive || 1)) + "%";
     return seg;
   }));
+  const cn = s.credit_notes || { count: 0 };
+  const creditLine = cn.count ? h("p", { class: "muted small", id: "credit-line" },
+    `Includes ${whole.format(cn.count)} credit note${cn.count === 1 ? "" : "s"} worth ${fmtAmount(cn.amount)}. ` +
+    `Amounts are net: ${fmtAmount(cn.to_apply)} of credit is ready to deduct from what those vendors are paid.`) : null;
   const ledger = h("div", { class: "table-wrap" }, h("table", { class: "ledger" },
     h("thead", {}, h("tr", {}, h("th", {}, "Decision"), h("th", { class: "num" }, "Invoices"),
       h("th", { class: "num" }, "Amount"), h("th", { class: "meaning" }, "Meaning"))),
@@ -613,7 +625,7 @@ async function dashboardView() {
   const payments = h("section", { class: "card payments" },
     h("div", { class: "section-head" }, h("h2", {}, "Payments"), h("span", { class: "spacer" }),
       downloadButton("Download payment file", "GET", "/export/payment-file.xlsx", undefined, "sm")),
-    stack, ledger);
+    stack, ledger, creditLine ? spacer(8) : null, creditLine);
   const maxRule = Math.max(1, ...Object.values(s.open_by_rule));
   const reasons = h("div", { class: "card" }, h("h2", {}, "Why open invoices were flagged"),
     Object.keys(s.open_by_rule).length
@@ -757,7 +769,7 @@ async function reviewView() {
       onclick: () => toggle(), onkeydown: (e) => { if (e.target === row && (e.key === "Enter" || e.key === " ")) { e.preventDefault(); toggle(); } } },
       h("td", { class: "c-risk" }, h("span", { class: "risk " + level, title: `Risk ${item.risk} of 100` },
         h("span", { class: "n" }, item.risk), h("span", { class: "bar" }, fill))),
-      h("td", { class: "mono c-id" }, item.invoice_id),
+      h("td", { class: "mono c-id" }, item.invoice_id, kindTag(item.kind)),
       h("td", { class: "c-vendor" }, item.vendor),
       h("td", { class: "num c-amount" }, fmtAmount(item.amount)),
       h("td", { class: "c-date" }, fmtDate(item.date)),
@@ -988,6 +1000,7 @@ async function uploadView() {
       h("div", { class: "label" }, label), h("div", { class: "value" }, whole.format(value)));
     put(holder, steps(3),
       h("div", { class: "kpis" }, kpi("Invoices added", r.added), kpi("Already stored, skipped", r.already_stored),
+        r.credit_notes ? kpi("Of which credit notes", r.credit_notes) : null,
         kpi("Rows with problems", r.error_count, r.error_count > 0),
         r.detection ? kpi("Flagged from this file", r.detection.flagged_from_file, r.detection.flagged_from_file > 0) : null),
       h("div", { class: "row" },
@@ -1110,8 +1123,12 @@ async function uploadView() {
           [tr, notes].forEach((row) => row && row.classList.toggle("excluded", !include.checked));
           count();
         } });
+      const kind = h("select", { class: "doc-kind", "aria-label": `Type of ${r.file}` },
+        h("option", { value: "invoice", selected: r.kind !== "credit" }, "Invoice"),
+        h("option", { value: "credit", selected: r.kind === "credit" }, "Credit note"));
+      st.kind = kind;
       const tr = h("tr", { class: "doc-row" + (r.warnings.length ? " has-notes" : "") }, h("td", {}, include),
-        h("td", { class: "doc-file" }, h("div", { class: "small" }, r.file), h("div", { class: "muted small" }, r.method)),
+        h("td", { class: "doc-file" }, h("div", { class: "small" }, r.file), h("div", { class: "muted small" }, r.method), kind),
         cells);
       // Notes go on their own line under the invoice, full width, so they're never cut off.
       const notes = r.warnings.length ? h("tr", { class: "doc-notes" }, h("td", {}),
@@ -1125,7 +1142,7 @@ async function uploadView() {
       const items = [];
       let missing = 0;
       for (const st of rows.filter((x) => x.include)) {
-        const item = { draft: st.r.draft, file: st.r.file };
+        const item = { draft: st.r.draft, file: st.r.file, kind: st.kind.value };
         for (const [f] of DOC_FIELDS) {
           const v = st.inputs[f].value.trim();
           item[f] = f === "amount" ? (v === "" ? null : Number(v)) : (v || null);
@@ -1190,7 +1207,7 @@ async function uploadView() {
           h("thead", {}, h("tr", {}, h("th", {}, "Risk"), h("th", {}, "Invoice"), h("th", {}, "Vendor"), h("th", { class: "num" }, "Amount"), h("th", {}, "Why flagged"))),
           h("tbody", {}, flagged.map((q) => h("tr", {},
             h("td", {}, h("span", { class: "risk " + riskClass(q.risk) }, h("span", { class: "n" }, q.risk))),
-            h("td", { class: "mono" }, q.invoice_id), h("td", {}, q.vendor), h("td", { class: "num" }, fmtAmount(q.amount)),
+            h("td", { class: "mono" }, q.invoice_id, kindTag(q.kind)), h("td", {}, q.vendor), h("td", { class: "num" }, fmtAmount(q.amount)),
             h("td", {}, h("div", { class: "chips" }, q.rules.map((rule) => h("span", { class: "chip " + ruleLevel(rule), title: (RULES[rule] || [, ""])[1] }, ruleLabel(rule)))))))))),
         spacer(16)) : null,
       r.skipped.length ? h("div", {}, h("h2", {}, "Skipped"),
@@ -1230,7 +1247,7 @@ async function invoicesView() {
           put(bankCell, h("span", { class: "mono" }, b.bank_account || "none on file"));
         } catch (err) { toast(err.message, true); }
       } }, "Show") : h("span", { class: "muted small" }, "admins only"));
-      return h("tr", {}, h("td", { class: "mono" }, r.id), h("td", {}, r.vendor),
+      return h("tr", {}, h("td", { class: "mono" }, r.id, kindTag(r.kind)), h("td", {}, r.vendor),
         h("td", { class: "num" }, fmtAmount(r.amount)), h("td", {}, fmtDate(r.invoice_date)), bankCell);
     }));
     note.textContent = rows.length === 500 ? "Showing the first 500 invoices in this order." : `${whole.format(rows.length)} invoices.`;

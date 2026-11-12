@@ -4,7 +4,7 @@ from invoice_detector.demo import generate_demo
 from invoice_detector.detection import (DetectionConfig, Invoice, detect, find_amount_outliers,
                                         find_bank_account_changes, find_ml_outliers,
                                         find_near_duplicates, find_similar_vendor_names,
-                                        find_split_invoices, learned_weights, review_queue,
+                                        find_split_invoices, learned_weights, match_credits, review_queue,
                                         risk_scores, RULE_WEIGHT)
 from invoice_detector.evaluate import to_invoices
 
@@ -107,6 +107,92 @@ class RuleTests(unittest.TestCase):
         self.assertEqual(review_queue(found)[0]["invoice_id"], "2")
         tuned = learned_weights({"duplicate": (0, 500), "round_amount": (0, 500)})
         self.assertLess(risk_scores(found, tuned)["2"], risk_scores(found)["2"])
+
+
+
+def credit(i, vendor="V", amount=100.0, date="2026-01-20"):
+    return Invoice(str(i), vendor, amount, date, None, kind="credit")
+
+
+class CreditNoteTests(unittest.TestCase):
+    def rules(self, invoices):
+        fired = {}
+        for a in detect(invoices):
+            fired.setdefault(a.invoice_id, set()).add(a.rule)
+        return fired
+
+    def history(self, vendor="V", n=8):
+        """Ordinary invoices, so the vendor has a history and nothing else fires."""
+        from datetime import date, timedelta
+        days = [date(2025, k + 1, 10) for k in range(n)]
+        days = [d + timedelta(days=2) if d.weekday() >= 5 else d for d in days]   # keep them on weekdays
+        return [inv(f"H{k}", vendor, 400.0 + 37 * k, d.isoformat()) for k, d in enumerate(days)]
+
+    def test_a_cancelled_invoice_and_its_credit_are_flagged_as_a_pair(self):
+        invoices = self.history() + [inv("B1", amount=912.40, date="2026-01-12"),
+                                     credit("CN1", amount=912.40, date="2026-01-15")]
+        self.assertEqual(match_credits(invoices), {"CN1": "B1"})
+        fired = self.rules(invoices)
+        self.assertEqual(fired["B1"], {"credited_invoice"})
+        self.assertEqual(fired["CN1"], {"matched_credit"})
+        details = {a.invoice_id: a.detail for a in detect(invoices)}
+        self.assertIn("CN1", details["B1"])
+        self.assertIn("B1", details["CN1"])
+
+    def test_the_reissued_invoice_is_not_called_a_duplicate(self):
+        invoices = self.history() + [inv("B1", amount=912.40, date="2026-01-12"),
+                                     credit("CN1", amount=912.40, date="2026-01-15"),
+                                     inv("B2", amount=912.40, date="2026-01-16")]   # the correct re-issue
+        fired = self.rules(invoices)
+        self.assertNotIn("B2", fired)
+        self.assertEqual(fired["B1"], {"credited_invoice"})
+        # ...but without the credit note, the same two invoices are a duplicate.
+        without = self.rules([i for i in invoices if i.id != "CN1"])
+        self.assertTrue({"duplicate", "near_duplicate"} & (without.get("B1", set()) | without.get("B2", set())))
+
+    def test_each_invoice_is_cancelled_once_and_the_latest_one_is_taken(self):
+        invoices = [inv("B1", amount=50, date="2026-01-02"), inv("B2", amount=50, date="2026-02-02"),
+                    credit("CN1", amount=50, date="2026-02-10"), credit("CN2", amount=50, date="2026-02-11")]
+        self.assertEqual(match_credits(invoices), {"CN1": "B2", "CN2": "B1"})
+
+    def test_a_credit_never_cancels_a_later_or_much_older_invoice(self):
+        self.assertEqual(match_credits([credit("CN1", amount=50, date="2026-01-01"),
+                                        inv("B1", amount=50, date="2026-01-05")]), {})
+        self.assertEqual(match_credits([inv("B1", amount=50, date="2024-01-05"),
+                                        credit("CN1", amount=50, date="2026-01-01")]), {})
+        self.assertEqual(match_credits([inv("B1", "Other", 50, "2026-01-05"),
+                                        credit("CN1", amount=50, date="2026-01-09")]), {})
+
+    def test_a_partial_credit_is_ordinary(self):
+        invoices = self.history() + [inv("B1", amount=912.40, date="2026-01-12"),
+                                     credit("CN1", amount=38.20, date="2026-01-15")]
+        self.assertEqual(self.rules(invoices), {})
+
+    def test_a_credit_from_nowhere_is_flagged(self):
+        fired = self.rules(self.history() + [credit("CN1", "Soylent Partners", 4200.0)])
+        self.assertEqual(fired["CN1"], {"unmatched_credit"})
+        too_big = self.rules([inv("B1", amount=100, date="2026-01-02"), credit("CN1", amount=5000.0)])
+        self.assertEqual(too_big["CN1"], {"unmatched_credit"})
+
+    def test_the_same_credit_twice(self):
+        invoices = self.history() + [credit("CN1", amount=38.20), credit("CN2", amount=38.20)]
+        self.assertEqual(self.rules(invoices), {"CN2": {"duplicate_credit"}})
+
+    def test_credits_do_not_teach_the_amount_checks(self):
+        """A large credit must not look like a large purchase, nor shift what is normal."""
+        base = self.history(n=10)
+        with_credit = base + [credit("CN1", amount=399.0, date="2026-01-15")]
+        self.assertEqual(self.rules(with_credit), self.rules(base))
+        for a in detect(with_credit):
+            self.assertNotEqual(a.invoice_id, "CN1")
+
+    def test_every_credit_rule_has_a_weight_a_description_and_an_action(self):
+        from invoice_detector.decisions import suggested_action
+        from invoice_detector.detection import RULE_INFO
+        for rule in ("credited_invoice", "matched_credit", "unmatched_credit", "duplicate_credit"):
+            self.assertIn(rule, RULE_WEIGHT)
+            self.assertIn(rule, RULE_INFO)
+            self.assertIn(suggested_action([rule]), ("hold", "do_not_pay"))
 
 
 if __name__ == "__main__":

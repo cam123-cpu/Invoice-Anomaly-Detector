@@ -18,6 +18,7 @@ optional step that asks Claude, and only when a company has switched it on.
 """
 from __future__ import annotations
 
+import contextvars
 import io
 import re
 import shutil
@@ -68,6 +69,7 @@ class Extraction:
     warnings: list = field(default_factory=list)
     method: str = ""
     pages: int = 1
+    kind: str = "invoice"        # or "credit" when the document is a credit note
 
     @property
     def missing(self) -> list[str]:
@@ -92,12 +94,19 @@ _CURRENCY_SIGNS = {"$": "USD", "€": "EUR", "£": "GBP", "¥": "JPY", "₹": "I
 _CURRENCY_CODES = ("USD", "EUR", "GBP", "CAD", "AUD", "CHF", "JPY", "INR", "NZD", "SEK", "NOK", "DKK")
 
 
+# On a credit note the amounts are often printed negative (-120.00 or (120.00)). While one is
+# being read this is switched on, and such amounts are taken at their size.
+_CREDIT_NOTE = contextvars.ContextVar("credit_note", default=False)
+
+
 def money(value) -> float | None:
     """A non-negative amount, or None. Accepts zero (unlike the importer), since a tax or
     discount line is often 0.00."""
     if isinstance(value, bool):
         return None
     if isinstance(value, (int, float)):
+        if value < 0 and _CREDIT_NOTE.get():
+            value = -value
         return round(float(value), 2) if value >= 0 else None
     text = str(value or "").strip()
     if not text or "%" in text or not _MONEY.match(text) or not re.search(r"\d", text):
@@ -118,7 +127,7 @@ def money(value) -> float | None:
         amount = float(body)
     except ValueError:
         return None
-    if negative or amount >= 1e12:
+    if (negative and not _CREDIT_NOTE.get()) or amount >= 1e12:
         return None
     return round(amount, 2)
 
@@ -162,7 +171,7 @@ _ADDRESS = re.compile(
     r"\b[A-Z]{1,2}\d[A-Z\d]? ?\d[A-Z]{2}\b|,\s*[A-Z]{2}\s+\d{5}")
 _CONTACT = re.compile(r"(?i)@|www\.|https?://|\.com\b|\.co\b|\.org\b|\.net\b|^\(?\+?\d[\d\s().-]{6,}$|"
                       r"\b(tel|phone|fax|email|e-mail|mobile)\b")
-_NOT_A_NAME = {"invoice", "tax invoice", "commercial invoice", "sales invoice", "proforma invoice",
+_NOT_A_NAME = {"credit note", "credit memo", "tax credit note", "credit invoice", "credit", "invoice", "tax invoice", "commercial invoice", "sales invoice", "proforma invoice",
                "your logo", "logo", "company logo", "your company", "company name", "thank you",
                "thank you for your business", "bill", "receipt", "statement", "original", "copy",
                "page", "description", "qty", "quantity", "unit price", "amount", "total", "notes",
@@ -177,7 +186,7 @@ def looks_like_name(text: str) -> bool:
         return False
     if _ADDRESS.search(t) or _CONTACT.search(t) or money(t) is not None or as_date(None, t)[0]:
         return False
-    if re.search(r"(?i)\b(invoice|page \d|thank|logo|payable|due|terms)\b", t):
+    if re.search(r"(?i)\b(invoice|credit note|credit memo|page \d|thank|logo|payable|due|terms)\b", t):
         return False
     return sum(c.isdigit() for c in t) <= len(t) // 3
 
@@ -217,14 +226,20 @@ LABELS = {
     "id": [("invoice number", 3), ("invoice no", 3), ("invoice #", 3), ("invoice num", 3), ("invoice id", 3),
            ("inv no", 3), ("inv #", 3), ("inv number", 3), ("invoice ref", 3), ("bill number", 2), ("bill no", 2),
            ("bill #", 2), ("document number", 2), ("document no", 2), ("receipt number", 2), ("receipt no", 2),
-           ("reference", 1), ("ref no", 1), ("ref", 1), ("number", 1), ("no", 1), ("#", 1), ("invoice", 1)],
+           ("credit note number", 3), ("credit note no", 3), ("credit note #", 3), ("credit memo number", 3),
+           ("credit memo no", 3), ("credit memo #", 3), ("credit number", 3), ("credit no", 3), ("credit #", 2),
+           ("reference", 1), ("ref no", 1), ("ref", 1), ("number", 1), ("no", 1), ("#", 1), ("invoice", 1),
+           ("credit note", 1), ("credit memo", 1)],
     "date": [("invoice date", 3), ("date of invoice", 3), ("date of issue", 3), ("issue date", 3), ("issued on", 3),
-             ("date issued", 3), ("billing date", 2), ("bill date", 2), ("document date", 2), ("tax point", 2),
+             ("date issued", 3), ("credit note date", 3), ("credit date", 3), ("credit memo date", 3),
+             ("billing date", 2), ("bill date", 2), ("document date", 2), ("tax point", 2),
              ("issued", 1), ("dated", 1), ("date", 2)],
     "amount": [("amount due", 3), ("balance due", 3), ("total due", 3), ("grand total", 3), ("invoice total", 3),
                ("total amount due", 3), ("total amount", 3), ("amount payable", 3), ("total payable", 3),
                ("please pay", 3), ("total to pay", 3), ("total incl", 3), ("total inc", 3), ("total usd", 3),
-               ("total eur", 3), ("total gbp", 3), ("total", 2), ("balance", 1), ("amount", 1)],
+               ("total eur", 3), ("total gbp", 3), ("total credit", 3), ("credit total", 3), ("credit amount", 3),
+               ("amount credited", 3), ("total refund", 3), ("refund amount", 3), ("total", 2), ("balance", 1),
+               ("amount", 1)],
     "bank_account": [("iban", 3), ("bank account number", 3), ("bank account no", 3), ("bank account", 3),
                      ("account number", 2), ("account no", 2), ("acct no", 2), ("acct #", 2), ("account #", 2),
                      ("a c no", 2)],
@@ -251,7 +266,8 @@ NOT_LABEL = {
                "total quantity", "total hours", "total paid", "total before", "total excl", "amount paid",
                "amount in words", "total weight", "total units", "tax", "discount", "total due in",
                "total due within", "balance due in", "amount due in", "amount due within"),
-    "id": ("invoice date", "invoice total", "invoice subtotal", "invoice to", "invoice amount", "invoice due", "number of", "no of",
+    "id": ("invoice date", "invoice total", "invoice subtotal", "invoice to", "credit note date", "credit note total",
+           "credit note to", "credit memo date", "credit memo total", "credit note for", "credit note against", "invoice amount", "invoice due", "number of", "no of",
            "no.of", "phone number", "tax number", "vat number", "account number", "order number", "po number",
            "customer number", "routing number", "reg number", "registration number", "number of items"),
     "tax": ("tax rate", "tax id", "tax number", "vat number", "vat no", "vat reg", "tax invoice", "taxable",
@@ -561,6 +577,30 @@ def find_fields(boxes: list[Box], company: str | None = None, method: str = "") 
     if not boxes:
         ex.warnings.append("No text was found in this file.")
         return ex
+    if is_credit_note(boxes):
+        ex.kind = "credit"
+    token = _CREDIT_NOTE.set(ex.kind == "credit")
+    try:
+        return _find_fields(ex, boxes, company)
+    finally:
+        _CREDIT_NOTE.reset(token)
+
+
+_CREDIT_TITLE = re.compile(r"(?i)^\s*(tax |vat )?(credit (note|memo|memorandum|invoice)|creditnote|gutschrift|avoir|"
+                           r"nota de cr[eé]dito|creditnota)\b")
+
+
+def is_credit_note(boxes: list[Box]) -> bool:
+    """A credit note says so in its title, or labels its number "Credit note no."."""
+    first = [b for b in boxes if b.page == 0]
+    if not first:
+        return False
+    top = min(b.y0 for b in first)
+    span = max(max(b.y1 for b in first) - top, 1)
+    return any(_CREDIT_TITLE.match(b.text) and (b.y0 - top) / span < 0.5 for b in first)
+
+
+def _find_fields(ex: Extraction, boxes: list[Box], company: str | None) -> Extraction:
 
     id_box = None
     for kind in ("id", "date", "bank_account"):
@@ -615,6 +655,8 @@ def find_fields(boxes: list[Box], company: str | None = None, method: str = "") 
     for f in REQUIRED:
         if not ex.fields.get(f):
             ex.warnings.append(f"Couldn't find the {LABEL_NAMES[f].lower()}. Type it in.")
+    if ex.kind == "credit":
+        ex.warnings.insert(0, "This is a credit note: it reduces what you owe this vendor.")
     return ex
 
 

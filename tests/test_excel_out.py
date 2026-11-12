@@ -136,16 +136,31 @@ class ReportAndTemplateTests(unittest.TestCase):
         self.assertEqual(ids, {"Ready to pay": ["P1", "X1"], "Review first": ["R1"], "On hold": ["H1"], "Do not pay": ["D1"]})
         summary = wb["Summary"]
         self.assertEqual([summary.cell(r, 3).value for r in range(5, 10)], [101.0, 7.5, 40.0, 250.0, 398.5])
-        self.assertEqual(wb["On hold"].cell(2, 8).value, "calling them")
-        self.assertIn("phone number", wb["On hold"].cell(2, 7).value)
-        self.assertEqual(wb["Do not pay"].cell(3, 4).value, 250.0)  # total row
+        self.assertEqual(wb["On hold"].cell(2, 9).value, "calling them")
+        self.assertIn("phone number", wb["On hold"].cell(2, 8).value)
+        self.assertEqual(wb["Do not pay"].cell(3, 5).value, 250.0)  # total row
 
     def test_template_round_trips_through_the_importer(self):
         table = read_table("template.xlsx", template())
         info = preview(table)
         self.assertEqual(info["mapping"], {"id": "Invoice number", "vendor": "Vendor", "amount": "Amount",
-                                           "date": "Invoice date", "bank_account": "Bank account"})
+                                           "date": "Invoice date", "bank_account": "Bank account", "kind": None})
         self.assertEqual(len(convert(table, info["mapping"]).invoices), 1)
+
+
+
+class CreditNotePaymentFileTests(unittest.TestCase):
+    def test_credit_notes_are_labelled_and_totals_are_net(self):
+        invoices = [{"id": "P1", "vendor": "A", "amount": 100.0, "invoice_date": "2026-01-05", "kind": "invoice"},
+                    {"id": "CN1", "vendor": "A", "amount": -30.0, "invoice_date": "2026-01-06", "kind": "credit"}]
+        wb = load_workbook(io.BytesIO(payment_file(invoices, {}, "Acme Inc")))
+        ready = wb["Ready to pay"]
+        self.assertEqual([ready.cell(1, c).value for c in (1, 2, 5)], ["Invoice", "Type", "Amount"])
+        self.assertEqual([(ready.cell(r, 1).value, ready.cell(r, 2).value, ready.cell(r, 5).value) for r in (2, 3)],
+                         [("P1", "Invoice", 100.0), ("CN1", "Credit note", -30.0)])
+        self.assertIn("net of credit notes", ready.cell(4, 1).value)
+        self.assertEqual(ready.cell(4, 5).value, 70.0)
+        self.assertIn("1 credit note", wb["Summary"].cell(12, 4).value)
 
 
 if __name__ == "__main__":

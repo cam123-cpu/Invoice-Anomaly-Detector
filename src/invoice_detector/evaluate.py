@@ -18,7 +18,8 @@ from .detection import DEFAULT_CONFIG, DetectionConfig, Invoice, detect, risk_sc
 
 def to_invoices(rows: list[dict]) -> list[Invoice]:
     # in the real app bank_idx is a keyed hash; the raw string works the same for matching
-    return [Invoice(r["id"], r["vendor"], r["amount"], r["date"], r["bank_account"]) for r in rows]
+    return [Invoice(r["id"], r["vendor"], r["amount"], r["date"], r["bank_account"], kind=r.get("kind", "invoice"))
+            for r in rows]
 
 
 def evaluate(seeds=range(10), min_risk: int = 30, cfg: DetectionConfig = DEFAULT_CONFIG) -> dict:

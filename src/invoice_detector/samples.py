@@ -19,8 +19,11 @@ FIXED_TIME = datetime(2026, 1, 1)
 def _rename(rows, names, id_fmt):
     out = []
     for i, r in enumerate(rows, start=1):
+        # Credit notes appear the way accounting systems export them: a negative amount.
+        credit = r.get("kind") == "credit"
         out.append({**r, "id": id_fmt(i), "vendor": names.get(r["vendor"], r["vendor"]),
-                    "date": date.fromisoformat(r["date"])})
+                    "date": date.fromisoformat(r["date"]), "amount": -r["amount"] if credit else r["amount"],
+                    "bank_account": r["bank_account"] or "", "credit": credit})
     return out
 
 
@@ -52,7 +55,8 @@ def quickbooks() -> bytes:
         c.font = Font(bold=True)
     for r in rows:
         due = date.fromordinal(r["date"].toordinal() + 30)
-        ws.append([r["date"], "Bill", r["id"], r["vendor"], due, r["amount"], r["amount"]])
+        ws.append([r["date"], "Vendor Credit" if r["credit"] else "Bill", r["id"], r["vendor"], due, r["amount"],
+                   r["amount"]])
     total = round(sum(r["amount"] for r in rows), 2)
     ws.append([None, None, None, "TOTAL", None, total, total])
     for row in ws.iter_rows(min_row=6):
@@ -126,7 +130,7 @@ def ap_register() -> bytes:
         for c in ws[2]:
             c.font = Font(bold=True)
         for i, r in enumerate(part):
-            amount = f"${r['amount']:,.2f}" if i % 3 == 0 else r["amount"]
+            amount = f"${r['amount']:,.2f}".replace("$-", "-$") if i % 3 == 0 else r["amount"]
             ws.append([r["id"], r["vendor"], r["date"], amount, r["bank_account"], ["J. Ortiz", "M. Chen"][i % 2]])
             if i % 25 == 24:
                 ws.append([])
