@@ -73,6 +73,8 @@ class Extraction:
     method: str = ""
     pages: int = 1
     kind: str = "invoice"        # or "credit" when the document is a credit note
+    candidates: dict = field(default_factory=dict)   # field -> [[label, value], ...] seen on the page
+    learned: dict = field(default_factory=dict)      # field -> the learned label it was read beside
 
     @property
     def missing(self) -> list[str]:
@@ -575,8 +577,23 @@ def _in_table_header(box: Box, boxes: list[Box]) -> bool:
     return sum(1 for text in row if text in _COLUMN_HEADINGS) >= 2
 
 
-def best(boxes: list[Box], kind: str, prefer_low: bool = False):
-    """The most convincing (value, confidence, source text, label box) for a field."""
+# Labels reviewers taught the reader for the vendor being read: {field: [label keys]}.
+_LEARNED = contextvars.ContextVar("learned", default=None)
+
+
+def label_key(text: str, remainder: str = "") -> str:
+    """A label as it can be recognised again on the next invoice: lower case, no digits or
+    punctuation, without the value that followed it ("Rechnungsnr. 30064443" -> "rechnungsnr")."""
+    t = norm(text)
+    if remainder:
+        t = t.replace(norm(remainder), " ")
+    t = re.sub(r"[^a-z ]+", " ", t)
+    return " ".join(t.split())[:60]
+
+
+def all_candidates(boxes: list[Box], kind: str) -> list[tuple]:
+    """Every labelled value on the page for a field, best first:
+    (strength, position, value, confidence, source text, label box, quality, value box, label key)."""
     found = []
     for box in boxes:
         m = match_label(box.text, kind)
@@ -588,11 +605,27 @@ def best(boxes: list[Box], kind: str, prefer_low: bool = False):
         value, q, src = find_value(boxes, box, kind, remainder)
         if value is None:
             continue
-        position = (box.page, box.y0) if prefer_low else (-box.page, -box.y0)
+        position = (box.page, box.y0)
         found.append((strength, position, value, STRENGTH_CONFIDENCE[strength] * q,
-                      src.text if src else box.text, box, q, src or box))
+                      src.text if src else box.text, box, q, src or box, label_key(box.text, remainder)))
+    return found
+
+
+def best(boxes: list[Box], kind: str, prefer_low: bool = False):
+    """The most convincing (value, confidence, source text, label box) for a field."""
+    found = all_candidates(boxes, kind)
     if not found:
         return None
+    if not prefer_low:
+        found = [(f[0], (-f[1][0], -f[1][1]), *f[2:]) for f in found]
+    learned = (_LEARNED.get() or {}).get(kind)
+    if learned:
+        # A reviewer showed which label this vendor prints the value beside: take that one.
+        taught = [f for f in found if f[8] in learned]
+        if taught:
+            taught.sort(key=lambda f: (learned.index(f[8]), f[1]))
+            strength, _, value, conf, text, box, q, src, key = taught[0]
+            return value, max(round(conf, 2), 0.9), text, box, q, src
     if prefer_low:
         # Totals: a figure printed under several labels ("Total", "Amount due") beats one printed once.
         top = max(f[0] for f in found)
@@ -603,7 +636,7 @@ def best(boxes: list[Box], kind: str, prefer_low: bool = False):
         found.sort(key=lambda f: (f[0], times.get(f[2], 0) if f[0] == top else 0, f[1]), reverse=True)
     else:
         found.sort(key=lambda f: (f[0], f[1]), reverse=True)
-    strength, _, value, conf, text, box, q, src = found[0]
+    strength, _, value, conf, text, box, q, src, key = found[0]
     return value, round(conf, 2), text, box, q, src
 
 
@@ -1234,11 +1267,13 @@ def boxes_from_image(data: bytes) -> list[Box]:
     return boxes_from_image_obj(image.convert("RGB"))
 
 
-def read_document(filename: str, data: bytes, company: str | None = None, embedded: bool = True) -> Extraction:
+def read_document(filename: str, data: bytes, company: str | None = None, embedded: bool = True,
+                  hints: dict | None = None) -> Extraction:
     """The whole local pipeline for one file. Raises FileProblem for unusable files.
 
     embedded=False ignores e-invoice data inside a PDF and reads only the page (the real-invoice
-    benchmark uses it, since that data is where its right answers come from)."""
+    benchmark uses it, since that data is where its right answers come from).
+    hints: what reviewers taught the reader, {canonical vendor: {field: [label keys]}}."""
     if not data:
         raise FileProblem("The file is empty.")
     if len(data) > MAX_BYTES:
@@ -1261,6 +1296,24 @@ def read_document(filename: str, data: bytes, company: str | None = None, embedd
     if len(boxes) > MAX_BOXES:
         raise FileProblem("This file has far more text than an invoice. Upload one invoice per file.")
     ex = find_fields(boxes, company, method)
+    taught = (hints or {}).get(canonical_vendor(ex.fields.get("vendor") or ""))
+    if taught:
+        # This vendor's invoices were corrected before: read again, preferring the labels
+        # the corrections pointed to.
+        token = _LEARNED.set(taught)
+        try:
+            again = find_fields(boxes, company, method)
+        finally:
+            _LEARNED.reset(token)
+        for f in ("id", "date", "amount"):
+            source = again.source.get(f)
+            if f in again.fields and again.fields.get(f) != ex.fields.get(f) and source is not None:
+                again.learned[f] = next((c[8] for c in all_candidates(boxes, f) if c[8] in taught.get(f, ())
+                                         and c[2] == again.fields[f]), "")
+                again.warnings.append(f"The {LABEL_NAMES[f].lower()} was read where you corrected it on an "
+                                      f"earlier {again.fields.get('vendor')} invoice.")
+        ex = again
+    ex.candidates = page_candidates(boxes)
     if method.startswith("OCR"):
         for f in ex.confidence:   # OCR can misread characters: always worth a look
             ex.confidence[f] = round(min(ex.confidence[f], 0.8), 2)
@@ -1269,6 +1322,31 @@ def read_document(filename: str, data: bytes, company: str | None = None, embedd
         if parsed:
             return compare_with_page(from_einvoice(parsed, company), ex, boxes)
     return ex
+
+
+def canonical_vendor(name: str) -> str:
+    """A vendor name without formatting: lower case, no punctuation, no legal suffix."""
+    words = re.sub(r"[^a-z0-9 ]+", " ", norm(name)).split()
+    while words and words[-1] in ("inc", "llc", "ltd", "limited", "corp", "corporation", "co", "plc", "gmbh"):
+        words.pop()
+    return " ".join(words)
+
+
+def page_candidates(boxes: list[Box], per_field: int = 6) -> dict:
+    """The labelled values on the page for the fields people correct most, kept with the
+    draft so a correction can be traced back to the label the right value was printed beside."""
+    out = {}
+    for f in ("id", "date", "amount"):
+        seen, rows = set(), []
+        for c in all_candidates(boxes, f):
+            value, key = c[2], c[8]
+            if key and (key, str(value)) not in seen and len(key) >= 3:
+                seen.add((key, str(value)))
+                rows.append([key, value])
+            if len(rows) >= per_field:
+                break
+        out[f] = rows
+    return out
 
 
 def from_einvoice(data: dict, company: str | None = None) -> Extraction:

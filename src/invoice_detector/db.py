@@ -461,6 +461,30 @@ class Database:
                      json.dumps(r.get("corrections") or {}), created_by, now))
         return skipped
 
+    # ----- what reviewers taught the document reader -----
+    MAX_HINTS = 2000
+
+    def reading_hints(self, org_id: str) -> dict[str, dict[str, list[str]]]:
+        """{vendor: {field: [labels, most useful first]}} for labels that helped more than they hurt."""
+        with self._tx(org_id) as run:
+            rows = run("SELECT vendor, field, label FROM reading_hints WHERE org_id = ? AND hits > misses "
+                       "ORDER BY hits - misses DESC, label LIMIT ?", (org_id, self.MAX_HINTS))
+        hints: dict[str, dict[str, list[str]]] = {}
+        for r in rows:
+            hints.setdefault(r["vendor"], {}).setdefault(r["field"], []).append(r["label"])
+        return hints
+
+    def learn_reading(self, org_id: str, vendor: str, field: str, label: str, helped: bool) -> None:
+        if field not in ("id", "date", "amount") or not vendor or not label:
+            return
+        vendor, label = vendor[:120], label[:60]
+        hit, miss = (1, 0) if helped else (0, 1)
+        with self._tx(org_id) as run:
+            run("INSERT INTO reading_hints (org_id, vendor, field, label, hits, misses) VALUES (?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT (org_id, vendor, field, label) DO UPDATE SET "
+                "hits = reading_hints.hits + ?, misses = reading_hints.misses + ?",
+                (org_id, vendor, field, label, hit, miss, hit, miss))
+
     def document_stats(self, org_id: str) -> dict:
         """How well documents are being read: how many, and how many fields people corrected."""
         with self._tx(org_id) as run:

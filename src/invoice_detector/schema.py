@@ -81,6 +81,18 @@ CREATE TABLE IF NOT EXISTS documents (
 -- rather than in each server's memory, so every server shares one count: five wrong
 -- passwords are five, whichever servers they landed on. Keys are hashes: no usernames or
 -- addresses are stored.
+-- What reviewers taught the document reader: for this vendor, this field is printed next
+-- to this label. hits: a person corrected a field to the value beside it; misses: a value
+-- read from it was corrected away. Used while hits > misses.
+CREATE TABLE IF NOT EXISTS reading_hints (
+  org_id TEXT NOT NULL REFERENCES orgs(id),
+  vendor TEXT NOT NULL CHECK (length(vendor) <= 120),
+  field TEXT NOT NULL CHECK (field IN ('id', 'date', 'amount')),
+  label TEXT NOT NULL CHECK (length(label) <= 60),
+  hits INTEGER NOT NULL DEFAULT 0,
+  misses INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (org_id, vendor, field, label)
+);
 CREATE TABLE IF NOT EXISTS rate_limits (
   key TEXT PRIMARY KEY,
   failures INTEGER NOT NULL,
@@ -153,12 +165,13 @@ GRANT EXECUTE ON FUNCTION app_org_id() TO invoice_app;
 
 -- Least privilege: the app cannot create companies, cannot edit or delete invoices,
 -- and cannot change or delete audit records.
-REVOKE ALL ON orgs, users, invoices, anomalies, reviews, audit_log, meta, documents, rate_limits
+REVOKE ALL ON orgs, users, invoices, anomalies, reviews, audit_log, meta, documents, rate_limits, reading_hints
   FROM PUBLIC, invoice_app;
 GRANT SELECT ON orgs TO invoice_app;
 GRANT UPDATE (approval_threshold, require_2fa, ai_extraction) ON orgs TO invoice_app;
-GRANT SELECT, INSERT ON documents TO invoice_app;
-GRANT SELECT, INSERT, UPDATE, DELETE ON rate_limits TO invoice_app;  -- a record of what was imported: never edited
+GRANT SELECT, INSERT ON documents TO invoice_app;  -- a record of what was imported: never edited
+GRANT SELECT, INSERT, UPDATE, DELETE ON rate_limits TO invoice_app;
+GRANT SELECT, INSERT, UPDATE ON reading_hints TO invoice_app;
 GRANT SELECT, INSERT ON users TO invoice_app;
 GRANT UPDATE (password_hash, totp_secret, totp_enabled, totp_last_step, recovery_codes, session_epoch, disabled)
   ON users TO invoice_app;
@@ -175,6 +188,7 @@ ALTER TABLE anomalies ENABLE ROW LEVEL SECURITY;
 ALTER TABLE reviews   ENABLE ROW LEVEL SECURITY;
 ALTER TABLE audit_log ENABLE ROW LEVEL SECURITY;
 ALTER TABLE documents ENABLE ROW LEVEL SECURITY;
+ALTER TABLE reading_hints ENABLE ROW LEVEL SECURITY;
 -- With RLS on, a row is visible or writable only if a policy allows it. With no
 -- company set, app_org_id() is NULL, nothing matches, and every table looks empty.
 
@@ -195,6 +209,9 @@ CREATE POLICY tenant_isolation ON reviews
   USING (org_id = app_org_id()) WITH CHECK (org_id = app_org_id());
 DROP POLICY IF EXISTS tenant_isolation ON documents;
 CREATE POLICY tenant_isolation ON documents
+  USING (org_id = app_org_id()) WITH CHECK (org_id = app_org_id());
+DROP POLICY IF EXISTS tenant_isolation ON reading_hints;
+CREATE POLICY tenant_isolation ON reading_hints
   USING (org_id = app_org_id()) WITH CHECK (org_id = app_org_id());
 DROP POLICY IF EXISTS tenant_isolation ON audit_log;
 CREATE POLICY tenant_isolation ON audit_log
