@@ -30,6 +30,7 @@ from difflib import SequenceMatcher
 from . import doc_languages as lang
 from .importer import ID_PATTERN, FileProblem, MAX_BYTES, _check_xlsx, parse_date
 
+MAX_BOXES = 4000         # text boxes in one file; the largest real invoice tested has 269
 MAX_PAGES = 5            # an invoice longer than this is almost certainly something else
 MAX_CELLS = 20_000       # Excel: enough for any invoice form
 MAX_IMAGE_PIXELS = 40_000_000
@@ -100,10 +101,15 @@ _CURRENCY_CODES = ("USD", "EUR", "GBP", "CAD", "AUD", "CHF", "JPY", "INR", "NZD"
 _CREDIT_NOTE = contextvars.ContextVar("credit_note", default=False)
 
 
+# Longest text a single value is read from. Real values are far shorter; the cap keeps every
+# parser linear in the size of the document, however a hostile PDF lays out its text.
+MAX_VALUE_TEXT = 200
+
+
 def money(value) -> float | None:
     """A non-negative amount, or None. Accepts zero (unlike the importer), since a tax or
     discount line is often 0.00."""
-    if isinstance(value, bool):
+    if isinstance(value, bool) or (isinstance(value, str) and len(value) > MAX_VALUE_TEXT):
         return None
     if isinstance(value, (int, float)):
         if value < 0 and _CREDIT_NOTE.get():
@@ -176,6 +182,8 @@ def as_date(value, text: str) -> tuple[str | None, bool]:
     with dots (03.04.2026) is always day-first."""
     if isinstance(value, datetime):
         return value.date().isoformat(), False
+    if len(str(text or "")) > MAX_VALUE_TEXT:
+        return None, False
     if isinstance(value, date):
         return value.isoformat(), False
     text = re.sub(r"(?i)\b(\d{1,2})(st|nd|rd|th)\b", r"\1", str(text or "")).strip(" ,.")
@@ -440,8 +448,8 @@ def match_label(text: str, kind: str) -> tuple[int, str] | None:
 def parse_value(kind: str, text: str, raw=None):
     """(value, quality 0..1) or (None, 0)."""
     t = str(text).strip().strip(":").strip()
-    if not t:
-        return None, 0
+    if not t or len(t) > MAX_VALUE_TEXT:
+        return None, 0          # no field is that long; and the parsers below must stay cheap
     if kind == "id":
         t = re.sub(r"(?i)^(no\.?|number|#|nr\.?)\s*", "", t).strip(" :#")
         if raw is not None and isinstance(raw, (int, float)) and not isinstance(raw, bool):
@@ -1192,6 +1200,8 @@ def read_document(filename: str, data: bytes, company: str | None = None) -> Ext
         boxes, method = boxes_from_image(data), "OCR (image)"
     else:
         raise FileProblem("Upload a PDF, an Excel invoice (.xlsx), or a photo or scan (.png, .jpg).")
+    if len(boxes) > MAX_BOXES:
+        raise FileProblem("This file has far more text than an invoice. Upload one invoice per file.")
     ex = find_fields(boxes, company, method)
     if method.startswith("OCR"):
         for f in ex.confidence:   # OCR can misread characters: always worth a look

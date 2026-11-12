@@ -105,11 +105,11 @@ def generate_demo(seed: int = 0):
 
     # 12. an invoice billed at the wrong amount, cancelled by a credit note, then re-issued for
     #     the same amount two days later. The pair is flagged; the re-issue must NOT be called a
-    #     duplicate of the invoice it replaces.
+    #     duplicate of the invoice it replaces, but waits (lightly flagged) until the credit is confirmed.
     when = on("Globex Corp", 6)
     add("Globex Corp", 1842.75, when, banks["Globex Corp"], {"credited_invoice"})
     add("Globex Corp", 1842.75, _weekday(when + timedelta(days=2)), None, {"matched_credit"}, kind="credit")
-    add("Globex Corp", 1842.75, _weekday(when + timedelta(days=4)), banks["Globex Corp"])
+    add("Globex Corp", 1842.75, _weekday(when + timedelta(days=4)), banks["Globex Corp"], {"reissued_invoice"})
     # 13. an ordinary small credit (a returned item): clean, it just reduces what is owed
     add("Wayne Office", 38.20, on("Wayne Office", 5), None, kind="credit")
     # 14. a credit note from a company that has never billed anything

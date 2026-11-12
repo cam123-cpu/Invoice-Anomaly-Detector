@@ -9,6 +9,7 @@ This uses one connection guarded by a lock, which is fine for a small deployment
 Use a connection pool (e.g. psycopg_pool) when you need more throughput.
 """
 import hashlib
+import hmac
 import json
 import secrets
 import sqlite3
@@ -570,7 +571,8 @@ class DbRateLimiter:
         self.max, self.window, self.lockout = max_attempts, window, lockout
 
     def _key(self, key: str) -> str:
-        return hashlib.sha256(f"{self.name}:{key}".encode()).hexdigest()
+        # Keyed, so a copy of the table doesn't reveal which usernames or addresses were tried.
+        return hmac.new(self.db._index_key, f"{self.name}:{key}".encode(), hashlib.sha256).hexdigest()
 
     def check(self, key: str, now: float | None = None) -> None:
         now = int(time.time() if now is None else now)

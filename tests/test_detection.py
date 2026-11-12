@@ -144,8 +144,9 @@ class CreditNoteTests(unittest.TestCase):
                                      credit("CN1", amount=912.40, date="2026-01-15"),
                                      inv("B2", amount=912.40, date="2026-01-16")]   # the correct re-issue
         fired = self.rules(invoices)
-        self.assertNotIn("B2", fired)
+        self.assertEqual(fired["B2"], {"reissued_invoice"})        # not a duplicate; waits for the credit
         self.assertEqual(fired["B1"], {"credited_invoice"})
+        self.assertLess(RULE_WEIGHT["reissued_invoice"], RULE_WEIGHT["duplicate"])
         # ...but without the credit note, the same two invoices are a duplicate.
         without = self.rules([i for i in invoices if i.id != "CN1"])
         self.assertTrue({"duplicate", "near_duplicate"} & (without.get("B1", set()) | without.get("B2", set())))
@@ -186,10 +187,26 @@ class CreditNoteTests(unittest.TestCase):
         for a in detect(with_credit):
             self.assertNotEqual(a.invoice_id, "CN1")
 
+    def test_a_fake_credit_cannot_launder_a_duplicate(self):
+        """Attack: an invoice already paid is copied, and a credit note "cancels" the original
+        so the copy no longer looks like a duplicate. The copy must not be ready to pay."""
+        from invoice_detector.decisions import suggested_action
+        invoices = self.history() + [inv("PAID-1", amount=548.0, date="2026-01-05"),
+                                     inv("COPY-1", amount=548.0, date="2026-02-20"),
+                                     credit("CN-FAKE", amount=548.0, date="2026-02-19")]
+        fired = self.rules(invoices)
+        self.assertEqual(fired["COPY-1"], {"reissued_invoice"})
+        self.assertEqual(suggested_action(["reissued_invoice"]), "hold")
+        detail = next(a.detail for a in detect(invoices) if a.invoice_id == "COPY-1")
+        self.assertIn("CN-FAKE", detail)
+        # each cancelled invoice has at most one replacement; a third copy is an ordinary duplicate
+        invoices.append(inv("COPY-2", amount=548.0, date="2026-02-23"))
+        self.assertIn("near_duplicate", self.rules(invoices)["COPY-2"])
+
     def test_every_credit_rule_has_a_weight_a_description_and_an_action(self):
         from invoice_detector.decisions import suggested_action
         from invoice_detector.detection import RULE_INFO
-        for rule in ("credited_invoice", "matched_credit", "unmatched_credit", "duplicate_credit"):
+        for rule in ("credited_invoice", "matched_credit", "unmatched_credit", "duplicate_credit", "reissued_invoice"):
             self.assertIn(rule, RULE_WEIGHT)
             self.assertIn(rule, RULE_INFO)
             self.assertIn(suggested_action([rule]), ("hold", "do_not_pay"))

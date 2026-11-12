@@ -21,6 +21,7 @@ const RULES = {
   matched_credit: ["Cancels an invoice", "This credit note cancels a specific invoice in full", "mid"],
   unmatched_credit: ["Credit with no matching invoices", "Credit note from a vendor with nothing, or less, billed", "mid"],
   duplicate_credit: ["Duplicate credit note", "Same vendor, amount and date as another credit note", "mid"],
+  reissued_invoice: ["Replaces a cancelled invoice", "Same vendor and amount as an invoice a credit note cancelled", "low"],
 };
 
 /* A small tag after the number of a credit note (its amount is shown negative). */

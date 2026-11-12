@@ -15,6 +15,10 @@
 			port 8000
 			refresh 5s
 		}
+		# The app limits sign-in attempts per address, so the address must be the real one:
+		# replace whatever X-Forwarded-For the client sent, never pass it along.
+		header_up X-Forwarded-For {remote_host}
+		header_up X-Real-IP {remote_host}
 		lb_policy least_conn
 		lb_try_duration 5s
 		fail_duration 15s

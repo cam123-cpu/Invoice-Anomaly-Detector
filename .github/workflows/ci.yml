@@ -184,6 +184,15 @@ jobs:
             -H 'content-type: application/json' -d '{"username":"ci.admin","password":"wrong-password-000"}'; }
           for i in 1 2 3 4 5; do [ "$(attempt)" = 401 ]; done
           for i in $(seq 9); do code=$(attempt); echo "attempt after lock: $code"; [ "$code" = 429 ]; done
+          # A forged X-Forwarded-For must not give each guess a fresh address: the per-address
+          # limit (30) still stops a bot trying many usernames.
+          locked=0
+          for i in $(seq 40); do
+            code=$(curl -sk -o /dev/null -w '%{http_code}' https://localhost/login -H "X-Forwarded-For: 203.0.113.$i" \
+              -H 'content-type: application/json' -d "{\"username\":\"nobody$i\",\"password\":\"wrong-password-000\"}")
+            [ "$code" = 429 ] && { locked=$i; break; }
+          done
+          echo "address locked after $locked forged attempts"; [ "$locked" -ge 1 ] && [ "$locked" -le 31 ]
 
       - name: Back up, wipe, restore
         run: |

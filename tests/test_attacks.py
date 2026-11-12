@@ -290,6 +290,41 @@ if __name__ == "__main__":
     unittest.main()
 
 
+class HostileDocumentTextTests(unittest.TestCase):
+    """A PDF can put any text it likes on a line. Reading must stay fast whatever it is."""
+
+    def test_one_enormous_line_is_cheap(self):
+        import time
+
+        from invoice_detector import documents as d
+        for text in ("1 " * 3000, "Invoice" + " " * 6000 + "#", "0,00 " * 1500, "Rechnung " + "(x) " * 1500 + "Nr"):
+            start = time.perf_counter()
+            for kind in ("id", "date", "amount", "tax", "bank_account"):
+                d.parse_value(kind, text)
+            d.money(text), d.as_date(None, text), d.match_label(text, "id")
+            self.assertLess(time.perf_counter() - start, 0.5, text[:20])
+
+    def test_a_page_with_far_more_text_than_an_invoice_is_refused(self):
+        from unittest import mock
+
+        from invoice_detector import documents as d
+        boxes = [d.Box(f"word {i}", i % 9 * 60, i // 9 % 700, i % 9 * 60 + 50, i // 9 % 700 + 8, 0, 8)
+                 for i in range(d.MAX_BOXES + 1)]
+        with mock.patch.object(d, "boxes_from_pdf", return_value=(boxes, "PDF text")):
+            with self.assertRaises(d.FileProblem):
+                d.read_document("big.pdf", b"%PDF-1.7 ...", "X")
+
+
+class RateLimitStorageTests(base.AccountsTestCase):
+    def test_the_table_does_not_reveal_who_was_tried(self):
+        import hashlib
+        self.acc.login_limiter.record_failure("alice@acme.example")
+        keys = [r["key"] for r in self.admin.conn.execute("SELECT key FROM rate_limits")]
+        self.assertEqual(len(keys), 1)
+        plain = hashlib.sha256(b"login:alice@acme.example").hexdigest()
+        self.assertNotIn(plain, keys)
+
+
 class SeveralServersTests(base.AccountsTestCase):
     """Two copies of the app behind a load balancer, sharing one database."""
 
