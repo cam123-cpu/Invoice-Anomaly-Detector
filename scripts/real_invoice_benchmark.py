@@ -124,6 +124,8 @@ def main() -> int:
     parser.add_argument("--keep", help="download into this folder and keep it (default: a temporary folder)")
     parser.add_argument("--min-all-four", type=float, default=0.0,
                         help="fail unless at least this share of documents has all four fields right, in each set")
+    parser.add_argument("--min-exact", type=float, default=0.0,
+                        help="fail unless at least this share of e-invoices is read exactly from their own data")
     parser.add_argument("--max-totals-warnings", type=int, default=None,
                         help="fail if more documents than this are told their totals don't add up")
     args = parser.parse_args()
@@ -159,6 +161,8 @@ def main() -> int:
     print("  (Told \"the totals don't add up\" above includes PDFs whose page contradicts their own data:"
           " several samples in this corpus really do.)")
     if args.max_totals_warnings is not None and warnings > args.max_totals_warnings:
+        failed = True
+    if exact["all_four"] is None or exact["all_four"] < args.min_exact:
         failed = True
     return 1 if failed else 0
 

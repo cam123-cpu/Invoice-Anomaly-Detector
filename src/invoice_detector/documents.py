@@ -23,7 +23,7 @@ import io
 import re
 import shutil
 import unicodedata
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from datetime import date, datetime
 from difflib import SequenceMatcher
 
@@ -270,6 +270,12 @@ _NOT_A_NAME = {"eur", "usd", "gbp", "chf", "euro", "seite", "page", "pagina", "b
                "unit", "unit cost", "product", "service", "details", "sku", "code"}
 
 
+_SENTENCE_WORDS = {"is", "are", "was", "were", "be", "will", "would", "can", "please", "thank", "thanks", "zijn", "worden",
+                   "wordt", "sind", "ist", "wird", "werden", "bitte", "sont", "est", "seront", "merci", "veuillez",
+                   "son", "es", "sono", "inclusief", "inklusive", "inclus", "including", "included", "incl",
+                   "prices", "prijzen", "preise", "prix", "precios", "prezzi", "graag", "svp", "vielen", "dank"}
+
+
 def looks_like_name(text: str) -> bool:
     t = text.strip()
     n = norm(t)
@@ -281,8 +287,13 @@ def looks_like_name(text: str) -> bool:
         return False
     if _HOUSE_NUMBER.match(t) and not has_legal_form(t):
         return False
-    if re.search(r"(?i)\b(invoice|credit note|credit memo|page \d|thank|logo|payable|due|terms)\b", t):
+    if re.search(r"(?i)\b(invoices?|bills?|receipts?|credit note|credit memo|page \d|thank|logo|payable|due|terms)\b", t):
         return False
+    words = n.replace(".", " ").split()
+    if len(words) >= 3 and _SENTENCE_WORDS & set(words):
+        return False               # a sentence ("Prijzen zijn inclusief BTW"), not a name
+    if re.search(r"(?i)\d\s*x\s*\d|\bx\s*\d+\s*(night|room|pcs|pc|stk|units?)\b", t):
+        return False               # an item line ("Rs 1939 x 1 Night x 1 Room")
     return sum(c.isdigit() for c in t) <= len(t) // 3
 
 
@@ -349,7 +360,9 @@ LABELS = {
     "payable_to": [("make all checks payable to", 3), ("make checks payable to", 3), ("make all cheques payable to", 3),
                    ("checks payable to", 3), ("cheques payable to", 3), ("payable to", 3), ("remit to", 3),
                    ("pay to", 2), ("vendor name", 3), ("vendor", 3), ("supplier name", 3), ("supplier", 3),
-                   ("seller", 3), ("from", 2), ("issued by", 3), ("company name", 1)],
+                   ("seller", 3), ("from", 2), ("issued by", 3), ("company name", 1), ("sold by", 3),
+                   ("payment received by", 3), ("account holder", 3), ("account name", 2), ("beneficiary name", 3),
+                   ("beneficiary", 3), ("payee name", 3), ("payee", 3)],
     "customer": [("bill to", 3), ("billed to", 3), ("invoice to", 3), ("invoiced to", 3), ("sold to", 3),
                  ("ship to", 2), ("customer name", 3), ("customer", 2), ("client", 2), ("to", 1), ("buyer", 2)],
 }
@@ -595,6 +608,14 @@ def all_candidates(boxes: list[Box], kind: str) -> list[tuple]:
     """Every labelled value on the page for a field, best first:
     (strength, position, value, confidence, source text, label box, quality, value box, label key)."""
     found = []
+    if kind == "payable_to":
+        # A footer packs several things into one line: "BRED BANQUE POPULAIRE – Titulaire du
+        # compte : NETPRESSE". Each part can carry the payee's label.
+        extra = []
+        for box in boxes:
+            parts = re.split(r"\s+[–—|•·]\s+|\s+-\s+", box.text) if len(box.text) <= MAX_VALUE_TEXT else []
+            extra += [replace(box, text=part.strip()) for part in parts[1:] if part.strip()]
+        boxes = [*boxes, *extra]
     for box in boxes:
         m = match_label(box.text, kind)
         if not m:
@@ -768,8 +789,11 @@ def find_vendor(boxes: list[Box], company: str | None, ex: Extraction):
         same = [c for c in candidates if similar(c[1], explicit[0]) > 0.9]
         if same:   # the name at the top and the payee agree: as sure as it gets
             return same[0][1], 0.95, same[0][2].text
-        if explicit[1] >= 0.85 and not looks_like_person(explicit[0]) and explicit[5] is not explicit[3]:
-            return explicit[0], explicit[1], explicit[2]      # "Verkäufer:" with the name under it
+        if not looks_like_person(explicit[0]) and (explicit[1] >= 0.9 or (
+                explicit[1] >= 0.85 and explicit[5] is not explicit[3])):
+            # A strong label ("Sold by", "Account holder", "Verkäufer:") naming a company wins
+            # over the name at the top, which is often the customer's address window.
+            return explicit[0], explicit[1], explicit[2]
     if not candidates:
         return (explicit[0], explicit[1], explicit[2]) if explicit else None
     candidates.sort(key=lambda c: -c[0])
@@ -883,12 +907,29 @@ def find_fields(boxes: list[Box], company: str | None = None, method: str = "") 
         return ex
     if is_credit_note(boxes):
         ex.kind = "credit"
-    token = _CREDIT_NOTE.set(ex.kind == "credit")
     order = _DAY_FIRST.set(date_order_hint(boxes))
     try:
-        return _find_fields(ex, boxes, company)
+        token = _CREDIT_NOTE.set(ex.kind == "credit")
+        try:
+            found = _find_fields(ex, boxes, company)
+        finally:
+            _CREDIT_NOTE.reset(token)
+        if found.kind == "credit" or "amount" in found.fields:
+            return found
+        # No positive total anywhere. If the total is printed negative ("Endbetrag -8,79"),
+        # this is a credit in effect (a correction, a refund) even without the word on it.
+        token = _CREDIT_NOTE.set(True)
+        try:
+            negative = best(boxes, "amount", prefer_low=True)
+            if not negative or not re.search(r"-\s*[\d€$£]|\(\s*[\d€$£]|\d\s*-\s*$", str(negative[5].text)):
+                return found
+            again = Extraction(method=method, pages=ex.pages, kind="credit")
+            again = _find_fields(again, boxes, company)
+        finally:
+            _CREDIT_NOTE.reset(token)
+        again.warnings.append("The total is negative, so this is treated as a credit note.")
+        return again
     finally:
-        _CREDIT_NOTE.reset(token)
         _DAY_FIRST.reset(order)
 
 
@@ -1198,10 +1239,12 @@ def boxes_from_pdf(data: bytes, ocr: bool = True) -> tuple[list[Box], str]:
                 raise FileProblem(f"This PDF has {len(pdf.pages)} pages. Upload one invoice per file "
                                   f"(at most {MAX_PAGES} pages).")
             for i, page in enumerate(pdf.pages):
-                # x_tolerance: how close two letters must be to count as one word. The default (3
-                # points) glues the words of small or tightly set text together.
+                # How close two letters must be to count as one word, as a share of the font size:
+                # a fixed 3 points glues small words together, a fixed 1.5 splits large kerned
+                # titles ("Rechnungskor rektur"). Letters in a word sit within ~0.12 of the size,
+                # words ~0.25 or more apart.
                 words = page.extract_words(extra_attrs=["size"], keep_blank_chars=False, use_text_flow=False,
-                                           x_tolerance=1.5)
+                                           x_tolerance_ratio=0.15)
                 if sum(len(w["text"]) for w in words) < MIN_PDF_TEXT:
                     scanned.append(i)
                     if ocr and ocr_available():
