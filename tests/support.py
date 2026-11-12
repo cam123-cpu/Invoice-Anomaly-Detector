@@ -30,7 +30,7 @@ def make_dbs():
     if USING_POSTGRES:
         admin = Database(ADMIN_URL, KEYS, INDEX_KEY)
         admin.migrate()
-        admin.conn.execute(f"TRUNCATE {', '.join(TABLES + ('meta',))} RESTART IDENTITY")
+        admin.conn.execute(f"TRUNCATE {', '.join(TABLES + ('meta', 'rate_limits'))} RESTART IDENTITY")
         return admin, Database(APP_URL, KEYS, INDEX_KEY)
     db = Database(":memory:", KEYS, INDEX_KEY)
     return db, db

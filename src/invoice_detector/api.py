@@ -32,7 +32,7 @@ from .intake import DocumentIntake, IntakeError
 from .accounts import AccountError, Accounts
 from .mailer import from_settings as mailer_from_settings
 from .isolation import run_isolated
-from .security import RateLimiter, RateLimitError, TokenSigner, password_problem
+from .security import RateLimitError, TokenSigner, password_problem
 
 MAX_BULK = 1000
 MAX_BODY = 16 * 1024 * 1024   # an upload is at most 10 MB, about 13.4 MB once base64-encoded
@@ -266,10 +266,10 @@ def create_app(settings: Settings | None = None, db: Database | None = None,
         return result
 
     # Heavy or paid work, capped per company so one account can't monopolise the server.
-    extract_limiter = RateLimiter(max_attempts=300, window=600, lockout=600)   # documents per 10 minutes
-    explain_limiter = RateLimiter(max_attempts=30, window=3600, lockout=3600)  # AI summaries per hour
+    extract_limiter = db.limiter("extract", max_attempts=300, window=600, lockout=600)   # documents per 10 minutes
+    explain_limiter = db.limiter("explain", max_attempts=30, window=3600, lockout=3600)  # AI summaries per hour
 
-    def spend(limiter: RateLimiter, org: str, what: str) -> None:
+    def spend(limiter, org: str, what: str) -> None:
         try:
             limiter.check(org)
         except RateLimitError:

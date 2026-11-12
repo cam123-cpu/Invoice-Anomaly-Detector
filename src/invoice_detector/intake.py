@@ -26,7 +26,7 @@ from .documents import (LABEL_NAMES, REQUIRED, Extraction, document_text, kind_o
                         totals_issue)
 from .importer import ID_PATTERN, FileProblem
 from .isolation import run_isolated
-from .security import AuthError, RateLimiter, RateLimitError, TokenSigner
+from .security import AuthError, RateLimitError, TokenSigner
 
 DRAFT_TTL = 4 * 3600          # a person has four hours to check a batch
 MAX_BATCH = 200
@@ -44,7 +44,7 @@ class DocumentIntake:
         self.db, self.signer, self.settings = db, signer, settings
         self.ai_post = ai_post
         self.isolate = isolate
-        self.ai_limiter = RateLimiter(max_attempts=AI_PER_HOUR, window=3600, lockout=3600)
+        self.ai_limiter = db.limiter("ai", max_attempts=AI_PER_HOUR, window=3600, lockout=3600)
 
     # ------------------------------------------------------------ step 1
     def ai_available(self, org: dict) -> bool:

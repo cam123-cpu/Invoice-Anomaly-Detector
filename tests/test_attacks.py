@@ -288,3 +288,61 @@ class HostileSpreadsheetTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SeveralServersTests(base.AccountsTestCase):
+    """Two copies of the app behind a load balancer, sharing one database."""
+
+    def second_server(self):
+        from invoice_detector.accounts import Accounts
+        return Accounts(self.app, self.signer, self.acc.settings, self.acc.mailer)
+
+    def test_wrong_passwords_are_counted_across_servers(self):
+        """With a counter in each server's memory, an attacker gets five guesses per server."""
+        servers = [self.acc, self.second_server(), self.second_server()]
+        for i in range(5):
+            with self.assertRaises(AccountError) as cm:
+                servers[i % 3].login("bob", "wrong-password-000", "6.6.6.6")
+            self.assertEqual(cm.exception.status, 401)
+        for server in servers:   # locked everywhere, even with the right password
+            with self.assertRaises(AccountError) as cm:
+                server.login("bob", "bob-password-12345", "6.6.6.6")
+            self.assertEqual(cm.exception.status, 429)
+
+    def test_sign_out_on_one_server_ends_the_session_on_the_others(self):
+        other = self.second_server()
+        token = self.acc.login("alice@acme.example", PW, "1.2.3.4")["access_token"]
+        self.assertEqual(other.authenticate(token)["sub"], "alice@acme.example")
+        other.logout(other.authenticate(token))
+        with self.assertRaises(AccountError):
+            self.acc.authenticate(token)
+
+
+class SharedLimiterTests(base.AccountsTestCase):
+    def test_window_lockout_and_expiry(self):
+        limiter = self.app.limiter("t", max_attempts=3, window=100, lockout=50)
+        for t in (0, 10, 20):
+            limiter.check("k", now=1000 + t)
+            limiter.record_failure("k", now=1000 + t)
+        with self.assertRaises(Exception) as cm:
+            limiter.check("k", now=1021)
+        self.assertEqual(type(cm.exception).__name__, "RateLimitError")
+        limiter.check("k", now=1071)            # the lockout has ended
+        limiter.check("other", now=1021)        # other keys are unaffected
+        limiter.record_failure("k", now=5000)   # a stale window starts again from one
+        limiter.check("k", now=5001)
+
+    def test_simultaneous_failures_all_count(self):
+        import threading
+        limiter = self.app.limiter("t2", max_attempts=1000, window=900)
+        threads = [threading.Thread(target=lambda: [limiter.record_failure("k") for _ in range(25)]) for _ in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        with self.app._tx() as run:
+            rows = run("SELECT key, failures FROM rate_limits")
+        mine = [r for r in rows if r["failures"] == 200]
+        self.assertEqual(len(mine), 1)
+        self.assertNotIn("k", [r["key"] for r in rows])                 # keys are stored hashed
+        self.assertTrue(all(len(r["key"]) == 64 for r in rows))

@@ -8,9 +8,12 @@
 This uses one connection guarded by a lock, which is fine for a small deployment.
 Use a connection pool (e.g. psycopg_pool) when you need more throughput.
 """
+import hashlib
 import json
+import secrets
 import sqlite3
 import threading
+import time
 import uuid
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -20,7 +23,7 @@ from .crypto import Vault
 from .detection import Anomaly, Invoice
 from .decisions import ACTIONS, suggested_action
 from .schema import ADDED_COLUMNS, POSTGRES_SECURITY, POSTGRES_TABLES, SQLITE_SCHEMA
-from .security import hash_password
+from .security import RateLimitError, hash_password
 
 SORTABLE = {"id", "vendor", "amount", "invoice_date"}  # column names can't be parameters
 ROLES = ("admin", "accountant", "auditor")
@@ -102,6 +105,8 @@ class Database:
             return
         from psycopg import sql
         with self._lock, self.conn.transaction():
+            # Several servers may start at once and all run migrate: one at a time, please.
+            self.conn.execute("SELECT pg_advisory_xact_lock(7272740001)")
             self.conn.execute(POSTGRES_TABLES)
             for table, column, definition in ADDED_COLUMNS:
                 self.conn.execute(f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {column} {definition}")
@@ -111,6 +116,10 @@ class Database:
             if password:
                 self.conn.execute(sql.SQL("ALTER ROLE invoice_app PASSWORD {}").format(
                     sql.Literal(password)))
+
+    def limiter(self, name: str, max_attempts: int = 5, window: int = 900, lockout: int = 900) -> "DbRateLimiter":
+        """A rate limiter whose counts live in this database, shared by every server."""
+        return DbRateLimiter(self, name, max_attempts, window, lockout)
 
     # ----- plumbing -----
     @contextmanager
@@ -455,6 +464,8 @@ class Database:
     # ----- flags -----
     def save_flags(self, org_id: str, anomalies: list[Anomaly]) -> None:
         with self._tx(org_id) as run:
+            if self.is_postgres:   # two servers detecting for the same company: one after the other
+                run("SELECT pg_advisory_xact_lock(hashtext(?))", ("flags:" + org_id,))
             run("DELETE FROM anomalies WHERE org_id = ?", (org_id,))
             for a in anomalies:
                 run("INSERT INTO anomalies (org_id, invoice_id, rule, severity, detail) "
@@ -537,3 +548,46 @@ class Database:
         with self._tx(org_id) as run:
             return run("SELECT at, username, action, detail FROM audit_log WHERE org_id = ? "
                        "ORDER BY id DESC LIMIT ?", (org_id, limit))
+
+
+class DbRateLimiter:
+    """Count failures per key in the database; after max_attempts within the window, lock
+    the key out. Same interface as security.RateLimiter, but the count is shared by every
+    server and survives restarts, so adding servers doesn't multiply an attacker's guesses.
+
+    Each operation is one SQL statement (an upsert with the arithmetic inside it), so two
+    servers recording a failure at the same moment both count."""
+
+    def __init__(self, db: Database, name: str, max_attempts: int = 5, window: int = 900, lockout: int = 900):
+        self.db, self.name = db, name
+        self.max, self.window, self.lockout = max_attempts, window, lockout
+
+    def _key(self, key: str) -> str:
+        return hashlib.sha256(f"{self.name}:{key}".encode()).hexdigest()
+
+    def check(self, key: str, now: float | None = None) -> None:
+        now = int(time.time() if now is None else now)
+        with self.db._tx() as run:
+            rows = run("SELECT locked_until FROM rate_limits WHERE key = ?", (self._key(key),))
+        if rows and rows[0]["locked_until"] > now:
+            raise RateLimitError(int(rows[0]["locked_until"] - now) + 1)
+
+    def record_failure(self, key: str, now: float | None = None) -> None:
+        now = int(time.time() if now is None else now)
+        expired = now - self.window
+        with self.db._tx() as run:
+            # A stale window starts again at 1; otherwise add one. Reaching the maximum locks.
+            run("INSERT INTO rate_limits (key, failures, window_start, locked_until) VALUES (?, 1, ?, ?) "
+                "ON CONFLICT (key) DO UPDATE SET "
+                "failures = CASE WHEN rate_limits.window_start < ? THEN 1 ELSE rate_limits.failures + 1 END, "
+                "window_start = CASE WHEN rate_limits.window_start < ? THEN ? ELSE rate_limits.window_start END, "
+                "locked_until = CASE WHEN (CASE WHEN rate_limits.window_start < ? THEN 1 "
+                "ELSE rate_limits.failures + 1 END) >= ? THEN ? ELSE rate_limits.locked_until END",
+                (self._key(key), now, now + self.lockout if self.max <= 1 else 0,
+                 expired, expired, now, expired, self.max, now + self.lockout))
+            if secrets.randbelow(200) == 0:   # now and then, clear out long-finished entries
+                run("DELETE FROM rate_limits WHERE window_start < ? AND locked_until < ?", (now - 86400, now))
+
+    def record_success(self, key: str) -> None:
+        with self.db._tx() as run:
+            run("DELETE FROM rate_limits WHERE key = ? AND locked_until <= ?", (self._key(key), int(time.time())))

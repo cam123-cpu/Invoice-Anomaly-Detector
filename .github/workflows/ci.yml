@@ -165,6 +165,26 @@ jobs:
             $COMPOSE exec -T app python -m invoice_detector.cli create-user "CI Company" ci.admin admin
           curl -skf https://localhost/login -H 'content-type: application/json' \
             -d '{"username":"ci.admin","password":"ci-password-123456"}' | grep -q access_token
+      - name: Scale to three copies; they share one set of rate limits
+        run: |
+          APP_REPLICAS=3 $COMPOSE up -d --no-build --scale app=3
+          for i in $(seq 60); do
+            [ "$($COMPOSE ps app --format '{{.Health}}' | grep -c healthy)" = 3 ] && break; sleep 3
+          done
+          $COMPOSE ps
+          [ "$($COMPOSE ps app --format '{{.Health}}' | grep -c healthy)" = 3 ]
+          sleep 8   # let the proxy discover the new copies
+          # Requests are spread over the copies...
+          for i in $(seq 30); do curl -sk -o /dev/null https://localhost/me; done
+          served=$($COMPOSE logs app --no-color | grep '"GET /me' | cut -d'|' -f1 | sort -u | wc -l)
+          echo "copies that served requests: $served"; [ "$served" -ge 2 ]
+          # ...and five wrong passwords lock the account on ALL of them. With a counter in each
+          # copy's memory, an attacker would get five guesses per copy.
+          attempt() { curl -sk -o /dev/null -w '%{http_code}' https://localhost/login \
+            -H 'content-type: application/json' -d '{"username":"ci.admin","password":"wrong-password-000"}'; }
+          for i in 1 2 3 4 5; do [ "$(attempt)" = 401 ]; done
+          for i in $(seq 9); do code=$(attempt); echo "attempt after lock: $code"; [ "$code" = 429 ]; done
+
       - name: Back up, wipe, restore
         run: |
           $COMPOSE exec -T backup bash /backup.sh once
