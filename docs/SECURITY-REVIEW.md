@@ -48,7 +48,7 @@ These were attacked and held, so nothing was changed:
 
 ## Known limits that remain
 
-- The sign-in rate limiter lives in each server's memory: run one web server, or move it to a shared store first.
+- Sign-in rate limits are now kept in the database (hashed keys, one atomic statement per attempt), so they hold across any number of app copies. An attacker can still lock a known username out for 15 minutes by guessing wrong five times; that is the trade the limiter makes.
 - On SQLite (laptop use) company separation relies on the application code alone; PostgreSQL adds the database-level guarantee.
 - A company admin can tell that a username is taken by another company (usernames are global).
 - Signing out ends all of that person's sessions, not just one device.

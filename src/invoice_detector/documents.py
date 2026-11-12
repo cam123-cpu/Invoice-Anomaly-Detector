@@ -27,6 +27,7 @@ from dataclasses import asdict, dataclass, field
 from datetime import date, datetime
 from difflib import SequenceMatcher
 
+from . import doc_languages as lang
 from .importer import ID_PATTERN, FileProblem, MAX_BYTES, _check_xlsx, parse_date
 
 MAX_PAGES = 5            # an invoice longer than this is almost certainly something else
@@ -84,7 +85,7 @@ class Extraction:
 # ------------------------------------------------------------------ text helpers
 def norm(text: str) -> str:
     """Lower case, accents removed, punctuation except # % & turned into spaces."""
-    text = unicodedata.normalize("NFKD", str(text)).encode("ascii", "ignore").decode()
+    text = unicodedata.normalize("NFKD", str(text).replace("ß", "ss")).encode("ascii", "ignore").decode()
     text = re.sub(r"[^a-z0-9#%&@.$€£ ]+", " ", text.lower().replace("nº", "no").replace("n°", "no"))
     return re.sub(r"\s+", " ", text).strip(" .")
 
@@ -109,6 +110,8 @@ def money(value) -> float | None:
             value = -value
         return round(float(value), 2) if value >= 0 else None
     text = str(value or "").strip()
+    text = re.sub(r"(?i)\s*\b(t\.?t\.?c|h\.?t|brutto|netto)\b\.?$", "", text)          # "29,99 € TTC"
+    text = re.sub(r"(?<=\d) (?=\d{3}(?: \d{3})*[.,]\d{2}(?:\D|$))", "", text)           # "120 000,00"
     if not text or "%" in text or not _MONEY.match(text) or not re.search(r"\d", text):
         return None
     if re.search(r"\d{1,4}[/-]\d{1,2}[/-]\d{1,4}", text):  # a date, not money
@@ -140,16 +143,46 @@ def currency_of(text: str) -> str | None:
     return m.group(1) if m else None
 
 
+# Is the day written first in this document's dates? None: unknown (03/04 is then read
+# month-first and marked ambiguous). "likely": probably (a pound or euro sign). "sure":
+# another date on the page settles it, or the document isn't in English.
+_DAY_FIRST = contextvars.ContextVar("day_first", default=None)
+
+_DATE_IN_TEXT = re.compile(
+    r"\b\d{1,4}[./-]\d{1,2}[./-]\d{2,4}\b"
+    r"|\b\d{1,2}(?:er|\.|st|nd|rd|th)?\s+(?:de\s+)?[A-Za-zÀ-ÿ]{3,10}\.?,?\s+(?:de\s+)?\d{4}\b"
+    r"|\b[A-Za-z]{3,9}\.?\s+\d{1,2}(?:st|nd|rd|th)?,?\s+\d{4}\b")
+
+
+_OTHER_DATE = re.compile(r"\b(" + "|".join(lang.OTHER_DATE_WORDS) + ")")
+
+
+def _english_months(text: str) -> str:
+    """'7. Mai 2014', '02 juillet 2015', '5 de marzo de 2024' -> '7 May 2014' and so on."""
+    text = re.sub(r"^(\d{1,2})(?:\.|er)\s*(?=[A-Za-zÀ-ÿ])", r"\1 ", text)
+    text = re.sub(r"(?i)\s+(de|del|di)\s+", " ", text)
+
+    def swap(m):
+        word = unicodedata.normalize("NFKD", m.group(0)).encode("ascii", "ignore").decode().lower()
+        number = lang.MONTHS.get(word)
+        return lang.ENGLISH_MONTHS[number - 1] if number else m.group(0)
+    return re.sub(r"[A-Za-zÀ-ÿ]{3,10}", swap, text).replace(".", " ") if re.search(r"[A-Za-zÀ-ÿ]{3}", text) else text
+
+
 def as_date(value, text: str) -> tuple[str | None, bool]:
-    """(ISO date or None, ambiguous?). 03/04/2026 could be March or April: it's read
-    month-first (US style) and reported as ambiguous so a person checks it."""
+    """(ISO date or None, ambiguous?). 03/04/2026 could be March or April. If the document
+    shows that it writes the day first (see _DAY_FIRST) it is read that way; otherwise
+    month-first (US style) and reported as ambiguous so a person checks it. A date written
+    with dots (03.04.2026) is always day-first."""
     if isinstance(value, datetime):
         return value.date().isoformat(), False
     if isinstance(value, date):
         return value.isoformat(), False
     text = re.sub(r"(?i)\b(\d{1,2})(st|nd|rd|th)\b", r"\1", str(text or "")).strip(" ,.")
     text = re.sub(r"(?i)^(mon|tue|wed|thu|fri|sat|sun)[a-z]*,?\s+", "", text)
-    text = re.sub(r"\s+", " ", text)
+    text = re.sub(r"(?i)^(le|den|am|vom|du|el|il)\s+(?=\d)", "", text)
+    text = re.sub(r"\s+,", ",", text)                                   # "August 3 , 2014"
+    text = re.sub(r"\s+", " ", _english_months(text)).strip()
     mdy = dmy = None
     for order in ("MDY", "DMY"):
         try:
@@ -160,18 +193,65 @@ def as_date(value, text: str) -> tuple[str | None, bool]:
             mdy = iso
         else:
             dmy = iso
+    if dmy and re.fullmatch(r"\d{1,2}\.\d{1,2}\.\d{2,4}", text):
+        return dmy, False
     if mdy and dmy and mdy != dmy:
+        hint = _DAY_FIRST.get()
+        if hint:
+            return dmy, hint != "sure"
         return mdy, True
     return mdy or dmy, False
+
+
+def date_order_hint(boxes: list) -> str | None:
+    """Work out from the whole document whether its dates are day-first."""
+    text = " ".join(str(b.text) for b in boxes)
+    day_first = month_first = 0
+    for a, b, _ in re.findall(r"\b(\d{1,2})[/-](\d{1,2})[/-](\d{2,4})\b", text):
+        a, b = int(a), int(b)
+        if a > 12 >= b >= 1:
+            day_first += 1
+        elif b > 12 >= a >= 1:
+            month_first += 1
+    if month_first:
+        return None
+    if day_first:
+        return "sure"
+    words = set(norm(text).replace(".", " ").split())
+    if len(words & set(lang.FOREIGN_MARKERS)) >= 2 or re.search(r"\b\d{1,2}\.\d{1,2}\.(19|20)\d{2}\b", text):
+        return "sure"
+    if re.search(r"[£€]|\b(GBP|EUR|AUD|NZD|INR|CHF)\b", text):
+        return "likely"
+    return None
 
 
 _ADDRESS = re.compile(
     r"(?i)(^\d+\s+\w+)|\b(street|st\.?|avenue|ave\.?|road|rd\.?|suite|ste\.?|blvd|boulevard|lane|ln\.?|"
     r"drive|dr\.?|floor|p\.?o\.? box|city|state|zip|postcode|address)\b|\b\d{5}(-\d{4})?\b|"
-    r"\b[A-Z]{1,2}\d[A-Z\d]? ?\d[A-Z]{2}\b|,\s*[A-Z]{2}\s+\d{5}")
+    r"\b[A-Z]{1,2}\d[A-Z\d]? ?\d[A-Z]{2}\b|,\s*[A-Z]{2}\s+\d{5}|"
+    # continental Europe: "Hauptstraße 20", "Uferweg 40-42", "rue de la Paix", "3012 CN Rotterdam", "D-63571 Ort"
+    r"\b\w*(stra[sß]e|str\.|weg|platz|allee|gasse|laan|straat|plein|gracht|kade)\s+\d|"
+    r"\b(rue|avenue|chemin|boulevard|place|all[ée]e|impasse|quai|calle|avenida|plaza|via|viale|piazza|corso)\s+\w|"
+    r"^\d{4}\s?[A-Z]{2}\s+\w|^[A-Z]{1,2}-\d{4,5}\s|^\d{4}\s+[A-ZÀ-Ý]\w+$|"
+    r"^(deutschland|germany|france|nederland|netherlands|the netherlands|belgi[eë]|belgique|[öo]sterreich|austria|"
+    r"schweiz|suisse|switzerland|espa[ñn]a|spain|italia|italy|united kingdom|uk|usa|united states|hong kong|"
+    r"india|canada|australia|ireland|luxembourg|portugal)$")
+_HOUSE_NUMBER = re.compile(r"^[A-Za-zÀ-ÿ.' -]{3,40}\s\d{1,4}\s?[A-Za-z]?(-\d{1,4})?$")   # "Weena 664"
+_PERSON_PREFIX = re.compile(r"(?i)^(herrn?|frau|monsieur|madame|mme|mr|mrs|ms|dhr|mevr|sr|sra|sig|t\.a\.v|z\.\s?hd|"
+                            r"c/o|attn|att|attention|a l'attention)\b\.?")
+_DOC_WORD = re.compile(r"(?i)\b(" + "|".join(re.escape(w) for w in lang.DOCUMENT_WORDS) + r")")
+_LEGAL = {re.sub(r"[^a-z0-9]", "", f) for f in lang.LEGAL_FORMS}
+
+
+def has_legal_form(name: str) -> bool:
+    """Does the name carry a company's legal form (GmbH, B.V., SARL, Ltd...)?"""
+    words = [re.sub(r"[^a-z0-9]", "", w) for w in norm(name).split()]
+    return any(w in _LEGAL for w in words[1:])
 _CONTACT = re.compile(r"(?i)@|www\.|https?://|\.com\b|\.co\b|\.org\b|\.net\b|^\(?\+?\d[\d\s().-]{6,}$|"
                       r"\b(tel|phone|fax|email|e-mail|mobile)\b")
-_NOT_A_NAME = {"credit note", "credit memo", "tax credit note", "credit invoice", "credit", "invoice", "tax invoice", "commercial invoice", "sales invoice", "proforma invoice",
+_NOT_A_NAME = {"eur", "usd", "gbp", "chf", "euro", "seite", "page", "pagina", "blatt", "datum", "betrag", "menge", "preis",
+               "bezeichnung", "beschreibung", "designation", "quantite", "prix", "omschrijving", "aantal", "prijs",
+               "descripcion", "cantidad", "precio", "descrizione", "quantita", "prezzo", "pos", "artikel","credit note", "credit memo", "tax credit note", "credit invoice", "credit", "invoice", "tax invoice", "commercial invoice", "sales invoice", "proforma invoice",
                "your logo", "logo", "company logo", "your company", "company name", "thank you",
                "thank you for your business", "bill", "receipt", "statement", "original", "copy",
                "page", "description", "qty", "quantity", "unit price", "amount", "total", "notes",
@@ -185,6 +265,10 @@ def looks_like_name(text: str) -> bool:
     if len(n) < 2 or len(t) > 80 or n in _NOT_A_NAME or not re.search(r"[A-Za-z]{2}", t):
         return False
     if _ADDRESS.search(t) or _CONTACT.search(t) or money(t) is not None or as_date(None, t)[0]:
+        return False
+    if _DOC_WORD.search(norm(t)) or _PERSON_PREFIX.match(t) or re.search(r":\s|:$|^\(c\)|©|^\(", t):
+        return False
+    if _HOUSE_NUMBER.match(t) and not has_legal_form(t):
         return False
     if re.search(r"(?i)\b(invoice|credit note|credit memo|page \d|thank|logo|payable|due|terms)\b", t):
         return False
@@ -234,7 +318,7 @@ LABELS = {
              ("date issued", 3), ("credit note date", 3), ("credit date", 3), ("credit memo date", 3),
              ("billing date", 2), ("bill date", 2), ("document date", 2), ("tax point", 2),
              ("issued", 1), ("dated", 1), ("date", 2)],
-    "amount": [("amount due", 3), ("balance due", 3), ("total due", 3), ("grand total", 3), ("invoice total", 3),
+    "amount": [("amount due", 3), ("balance due", 3), ("total due", 3), ("due payable", 3), ("total payable amount", 3), ("grand total", 3), ("invoice total", 3),
                ("total amount due", 3), ("total amount", 3), ("amount payable", 3), ("total payable", 3),
                ("please pay", 3), ("total to pay", 3), ("total incl", 3), ("total inc", 3), ("total usd", 3),
                ("total eur", 3), ("total gbp", 3), ("total credit", 3), ("credit total", 3), ("credit amount", 3),
@@ -278,32 +362,77 @@ NOT_LABEL = {
 }
 
 
+def _plain(n: str) -> str:
+    """Normalised text without the dots of abbreviations: 'rechnungsnr. 12' -> 'rechnungsnr 12'."""
+    return re.sub(r"(?<=[a-z0-9])\.(?= |$)", "", n)
+
+
+def _table(kind: str) -> list[tuple[str, int, bool]]:
+    """Every label for a field, in every language: (label, strength, needs a colon).
+    Longest first, so the most specific label wins."""
+    rows = [(label, strength, False) for label, strength in LABELS[kind]]
+    rows += [(_plain(norm(label.rstrip(":"))), strength, label.endswith(":"))
+             for label, strength in lang.LABELS.get(kind, ())]
+    return sorted(dict.fromkeys(rows), key=lambda r: -len(r[0]))
+
+
+_TABLES = {kind: _table(kind) for kind in LABELS}
+_NOT_FOREIGN = {kind: tuple(_plain(norm(p)) for p in phrases) for kind, phrases in lang.NOT_LABEL.items()}
+_GENERIC = {"no", "#", "ref", "number", "to", "from", "other", "invoice", "date", "amount", "balance", "customer",
+            "client"} | {label for rows in _TABLES.values() for label, strength, _ in rows if strength == 1}
+
+# A title that carries the number and date itself: "Handelsrechnung Nr. 471102 vom 05.06.2018",
+# "Facture n°562044387 du 02 Juillet 2015", "Tax Invoice No: 77 dated 3 May 2024".
+_DOC = (r"(?:rechnung|rechnungskorrektur|gutschrift|beleg|invoice|bill|credit note|credit memo|facture|avoir|"
+        r"factuur|creditnota|factura|fattura)")
+_INLINE_ID = re.compile(r"(?i)\b[a-zäöü]*" + _DOC + r"s?(?:\s*\([^)]{0,50}\))*[\s.-]*"
+                        r"(?:nr|no|n°|nº|num|nummer|number|numéro|numero|#)"
+                        r"(?![a-zé])[.:]?\s*(\S.*)$")
+_INLINE_DATE = re.compile(r"(?i)\b[a-zäöü]*" + _DOC + r"\b.{0,80}?\s(?:vom|du|dated|del|van|d\.d\.)(?:\s+(\S.*))?$")
+_ORDER_WORDS = re.compile(r"(?i)bestell|commande|\border\b|lieferschein|pedido|ordine|\bpo\b|purchase")
+
+
 def match_label(text: str, kind: str) -> tuple[int, str] | None:
     """(strength, the rest of the text after the label) if text starts with a label."""
     text = re.sub(r"(?i)^\s*(please|kindly)\s+", "", str(text))
-    n = norm(text)
+    text = re.sub(r"^([A-Z]) (?=[a-z]{4})", r"\1", text)      # a kerned capital: "F actuurnummer"
+    text = re.sub(r"(?i)\bn[°º]\s*", "n° ", text)             # "n°5620" -> "n° 5620"
+    n = _plain(norm(text))
     if any(n.startswith(bad) for bad in NOT_LABEL.get(kind, ())):
         return None
-    for label, strength in LABELS[kind]:
+    if any(n == bad or n.startswith(bad + " ") for bad in _NOT_FOREIGN.get(kind, ())):
+        return None
+    for label, strength, needs_colon in _TABLES[kind]:
         if n == label or n.startswith(label + " ") or n.startswith(label + "#") or (label.endswith("#") and n.startswith(label)):
+            if needs_colon and (":" not in text or _plain(norm(text.split(":")[0])) != label):
+                continue
             rest = text.strip()
             # cut the label off the original text, keeping the value's own punctuation
             words = len(label.replace("#", " # ").split())
-            parts = re.split(r"(\s+|:|#)", rest)
+            parts = re.split(r"(\s+|:|#|/|'|’|(?<=[A-Za-zÀ-ÿ])-(?=[A-Za-zÀ-ÿ])|(?<=[A-Za-z])\.(?=[A-Za-z-]))", rest)
             seen, cut = 0, 0
             for i, part in enumerate(parts):
-                if part.strip() and part not in (":", "#") and not re.fullmatch(r"\s+", part):
+                if not part:
+                    continue
+                if part == "#" and "#" in label:
                     seen += 1
-                elif part == "#" and "#" in label:
+                elif part.strip() and part not in (":", "#", "/", "'", "’", "-", ".") and norm(part):
                     seen += 1
                 if seen >= words:
                     cut = i + 1
                     break
-            remainder = "".join(parts[cut:]).lstrip(" :#-–.\t").rstrip(" :\t") if seen >= words else ""
-            if label in ("no", "#", "ref", "number", "to", "from", "other", "invoice", "date", "amount",
-                         "balance", "customer", "client") and remainder and len(remainder) > 40:
+            remainder = "".join(p for p in parts[cut:] if p).lstrip(" :#-–.\t°º").rstrip(" :\t") if seen >= words else ""
+            if label in _GENERIC and remainder and len(remainder) > 40:
                 continue
             return strength, remainder
+    if kind == "id":
+        m = _INLINE_ID.search(text)
+        if m:
+            return 3, m.group(1).strip()
+    if kind == "date" and not _ORDER_WORDS.search(text):
+        m = _INLINE_DATE.search(text)
+        if m:
+            return 3, (m.group(1) or "").strip()
     return None
 
 
@@ -317,6 +446,16 @@ def parse_value(kind: str, text: str, raw=None):
         t = re.sub(r"(?i)^(no\.?|number|#|nr\.?)\s*", "", t).strip(" :#")
         if raw is not None and isinstance(raw, (int, float)) and not isinstance(raw, bool):
             t = str(int(raw)) if float(raw).is_integer() else t
+        # The number ends where ordinary words begin: "471102 vom 05.06.2018", "30064443 Kundennr. 47774".
+        kept = []
+        for token in t.split():
+            bare = token.strip(".,;:()")
+            if not re.search(r"\d", bare) and re.search(r"[a-zà-ÿ]", bare):
+                break
+            if kept and (as_date(None, bare)[0] or re.fullmatch(r"\d{1,2}", bare) and _DATE_IN_TEXT.search(t)):
+                break
+            kept.append(token)
+        t = " ".join(kept).strip(" .,;:")
         if not re.search(r"\d", t) or not ID_PATTERN.match(t) or len(t) > 40:
             return None, 0
         if as_date(None, t)[0] or (money(t) is not None and "." in t and not re.search(r"[A-Za-z#-]", t)):
@@ -326,14 +465,27 @@ def parse_value(kind: str, text: str, raw=None):
         return t, 1.0
     if kind == "date":
         iso, ambiguous = as_date(raw, t)
+        if not iso and len(t) <= 70:       # a date inside a phrase: "13/11/2017 Contact commercial"
+            m = _DATE_IN_TEXT.search(t)
+            before = norm(t[:m.start()]) if m else ""
+            if m and not _OTHER_DATE.search(before):
+                iso, ambiguous = as_date(None, m.group(0))
         return (iso, 0.7 if ambiguous else 1.0) if iso else (None, 0)
     if kind in ("amount", "subtotal", "tax", "shipping", "discount", "paid", "line"):
         value = money(raw if isinstance(raw, (int, float)) and not isinstance(raw, bool) else t)
+        quality = 1.0
+        if value is None and isinstance(text, str) and len(t) <= 70:
+            # Several things in one phrase: "20,0% 81,90 € 16,38 €", "EUR 24.99 5.00 29.99".
+            joined = re.sub(r"(?<=\d) (?=\d{3}(?: \d{3})*[.,]\d{2}(?:\D|$))", "", t)
+            found = [money(tok) for tok in re.findall(r"[-(]?\d[\d.,']*[.,]\d{2}\)?(?![\d%])", joined)]
+            found = [v for v in found if v is not None]
+            if found:
+                value, quality = (found[0] if kind in ("subtotal", "line") else found[-1]), 0.9
         if value is None:
             return None, 0
         if kind == "amount" and value <= 0:
             return None, 0
-        return value, 1.0
+        return value, quality
     if kind == "bank_account":
         value = account_value(t)
         return (value, 1.0 if iban_ok(value or "") else 0.8) if value else (None, 0)
@@ -367,6 +519,13 @@ def find_value(boxes: list[Box], label: Box, kind: str, remainder: str):
     names = kind in ("payable_to", "customer")
     right = sorted((b for b in boxes if b is not label and _same_line(label, b) and b.x0 >= label.x1 - 2),
                    key=lambda b: b.x0)
+    if kind == "amount":
+        # A totals row with columns: net, tax, gross. When the first two add up to the third,
+        # the third is the total, whatever order the labels came in.
+        row = [(parse_value("amount", b.text, b.raw)[0], b) for b in right[:5]]
+        row = [(v, b) for v, b in row if v is not None]
+        if len(row) >= 3 and abs(row[-3][0] + row[-2][0] - row[-1][0]) <= 0.015 and row[-2][0] < row[-3][0]:
+            return row[-1][0], 0.98, row[-1][1]
     for b in right[:4]:
         if _is_any_label(b) and (names or parse_value(kind, b.text, b.raw)[0] is None):
             break
@@ -393,6 +552,18 @@ def find_value(boxes: list[Box], label: Box, kind: str, remainder: str):
 
 
 STRENGTH_CONFIDENCE = {3: 0.95, 2: 0.8, 1: 0.6}
+_COLUMN_HEADINGS = {"description", "item", "items", "qty", "quantity", "unit price", "price", "rate", "hours", "service",
+                    "product", "details", "vat", "tax", "unit", "units", "sku", "code", "article", "pos", "no", "#",
+                    "bezeichnung", "beschreibung", "menge", "einzelpreis", "preis", "artikel", "mwst", "ust", "einheit",
+                    "designation", "quantite", "prix unitaire", "prix", "tva", "p.u", "p.u. ht", "nombre",
+                    "omschrijving", "aantal", "prijs", "prijs per stuk", "btw", "stuks",
+                    "descripcion", "cantidad", "precio", "iva", "descrizione", "quantita", "prezzo"}
+
+
+def _in_table_header(box: Box, boxes: list[Box]) -> bool:
+    """Is this box one of the column headings of the line-item table?"""
+    row = [norm(b.text) for b in boxes if b is not box and _same_line(box, b)]
+    return sum(1 for text in row if text in _COLUMN_HEADINGS) >= 2
 
 
 def best(boxes: list[Box], kind: str, prefer_low: bool = False):
@@ -403,17 +574,28 @@ def best(boxes: list[Box], kind: str, prefer_low: bool = False):
         if not m:
             continue
         strength, remainder = m
+        if kind == "amount" and not remainder and _in_table_header(box, boxes):
+            continue               # "Total" heading a column of line totals, not the invoice total
         value, q, src = find_value(boxes, box, kind, remainder)
         if value is None:
             continue
         position = (box.page, box.y0) if prefer_low else (-box.page, -box.y0)
         found.append((strength, position, value, STRENGTH_CONFIDENCE[strength] * q,
-                      src.text if src else box.text, box, q))
+                      src.text if src else box.text, box, q, src or box))
     if not found:
         return None
-    found.sort(key=lambda f: (f[0], f[1]), reverse=True)
-    strength, _, value, conf, text, box, q = found[0]
-    return value, round(conf, 2), text, box, q
+    if prefer_low:
+        # Totals: a figure printed under several labels ("Total", "Amount due") beats one printed once.
+        top = max(f[0] for f in found)
+        times: dict = {}
+        for f in found:
+            if f[0] == top:
+                times[f[2]] = times.get(f[2], 0) + 1
+        found.sort(key=lambda f: (f[0], times.get(f[2], 0) if f[0] == top else 0, f[1]), reverse=True)
+    else:
+        found.sort(key=lambda f: (f[0], f[1]), reverse=True)
+    strength, _, value, conf, text, box, q, src = found[0]
+    return value, round(conf, 2), text, box, q, src
 
 
 
@@ -428,7 +610,7 @@ def unlabelled_date(boxes: list[Box], id_box: Box | None):
             continue
         neighbours = [o for o in boxes if o is not b and o.page == b.page and (
             (_same_line(o, b) and o.x1 <= b.x0 + 2) or (0 <= b.y0 - o.y1 <= b.height * 1.5 and abs(o.x0 - b.x0) < 40))]
-        if any(re.search(r"(?i)\b(due|delivery|ship|order|paid|period|expir)", o.text) for o in neighbours):
+        if any(_OTHER_DATE.search(norm(o.text)) for o in neighbours):
             continue
         if id_box is not None and id_box.page == b.page:
             distance = abs(b.y0 - id_box.y0) + abs(b.x0 - id_box.x0) * 0.5
@@ -481,8 +663,14 @@ def find_vendor(boxes: list[Box], company: str | None, ex: Extraction):
     if explicit and company and similar(explicit[0], company) > 0.85:
         explicit = None
     if explicit and not looks_like_person(explicit[0]) and not any(
-            similar(explicit[0], b.text) > 0.9 for b in boxes if b is not explicit[3] and b.page == 0):
+            similar(explicit[0], b.text) > 0.9 for b in boxes
+            if b is not explicit[3] and b is not explicit[5] and b.page == 0):
         return explicit[0], explicit[1], explicit[2]
+
+    # 1b. A "Seller" heading with the details listed under it (often as "Name: ...").
+    listed = _seller_section(boxes)
+    if listed and not (company and similar(listed.text, company) > 0.85):
+        return listed.text.strip(" ,"), 0.9, listed.text
 
     # 2. The business name at the top: big, high up, not a label, not the customer, not an address.
     first_page = [b for b in boxes if b.page == 0] or boxes
@@ -493,41 +681,113 @@ def find_vendor(boxes: list[Box], company: str | None, ex: Extraction):
     span = max(bottom - top, 1)
     sizes = sorted(b.size for b in first_page if b.size) or [0]
     body_size = sizes[len(sizes) // 2] or 1
-    contact_text = " ".join(norm(b.text) for b in first_page if _CONTACT.search(b.text))
-    candidates = []
+    contact_text = " ".join(norm(b.text) for b in first_page if _CONTACT.search(b.text)).replace(" ", "")
+    everything = [_squash(b.text) for b in boxes]
+    candidates = []            # (score, name, box)
     for b in first_page:
-        if id(b) in customer_boxes or not looks_like_name(b.text) or _is_any_label(b):
-            continue
-        if company and similar(b.text, company) > 0.85:
-            continue
         rel = (b.y0 - top) / span
-        if rel > 0.45:
+        if id(b) in customer_boxes or rel > 0.45:
             continue
-        score = (1 - rel) * 2
+        name = b.text.strip(" ,")
+        bonus = 0.0
+        # A sender line above the address window: "Name - Street 1 - 12345 Town".
+        parts = [x.strip() for x in re.split(r"\s+[-–—]\s+|\s*[|·•]\s*", b.text) if x.strip()]
+        titled = _TITLE_AFTER_NAME.match(b.text.strip())
+        if len(parts) >= 3 and looks_like_name(parts[0]) and any(_ADDRESS.search(x) for x in parts[1:]):
+            name, bonus = parts[0], 2.5
+        elif titled and looks_like_name(titled.group(1)):
+            name = titled.group(1).strip()        # "Amazon Web Services Invoice": the name, then the title
+        elif not looks_like_name(b.text) or _is_any_label(b):
+            continue
+        elif _OTHER_DATE.search(norm(b.text)) or re.search(r"(?i)datum\b|\bdate\b", b.text):
+            continue
+        elif sum(1 for o in first_page if o is not b and _same_line(b, o) and len(o.text) < 25) >= 3 \
+                and (not b.size or b.size < body_size * 1.2):
+            continue               # one heading in a row of column headings
+        elif _is_key(b, first_page):
+            continue               # "Währung   : EUR": the left half of a pair, not a name
+        if company and similar(name, company) > 0.85:
+            continue
+        score = (1 - rel) * 2 + bonus
         if b.size:
             score += min(b.size / body_size, 2.5)
-        tokens = [w for w in norm(b.text).split() if len(w) > 2 and w not in ("inc", "llc", "ltd", "the", "and", "corp")]
-        if tokens and any(t in contact_text.replace(" ", "") for t in tokens):
+        tokens = [w for w in norm(name).split() if len(w) > 2 and w not in ("inc", "llc", "ltd", "the", "and", "corp")]
+        if tokens and any(t in contact_text for t in tokens):
             score += 1.5           # the name also appears in its email address or website
-        candidates.append((score, b))
+        if has_legal_form(name):
+            score += 1.0           # "... GmbH", "... B.V.", "... SARL": a company, not a heading
+        key = _squash(name)
+        if len(key) >= 4:          # printed again elsewhere (the footer, the payment details)
+            score += min(sum(key in other for other in everything) - 1, 2) * 0.8
+        candidates.append((score, name, b))
     if explicit:
         explicit_box = explicit[3]
-        candidates = [c for c in candidates if c[1] is not explicit_box]
-        same = [c for c in candidates if similar(c[1].text, explicit[0]) > 0.9]
+        candidates = [c for c in candidates if c[2] is not explicit_box]
+        same = [c for c in candidates if similar(c[1], explicit[0]) > 0.9]
         if same:   # the name at the top and the payee agree: as sure as it gets
-            return same[0][1].text.strip(" ,"), 0.95, same[0][1].text
+            return same[0][1], 0.95, same[0][2].text
+        if explicit[1] >= 0.85 and not looks_like_person(explicit[0]) and explicit[5] is not explicit[3]:
+            return explicit[0], explicit[1], explicit[2]      # "Verkäufer:" with the name under it
     if not candidates:
         return (explicit[0], explicit[1], explicit[2]) if explicit else None
     candidates.sort(key=lambda c: -c[0])
-    score, b = candidates[0]
+    score, name, b = candidates[0]
     runner_up = candidates[1][0] if len(candidates) > 1 else 0
     confidence = 0.55 + min(0.3, (score - runner_up) / 6)
     if explicit:
         # Checks are payable to a person; the business name is at the top. The business is the
         # vendor, but paying an individual is worth a second look.
-        ex.warnings.append(f"Payment is to be made to \"{explicit[0]}\", not to {b.text.strip()}. "
+        ex.warnings.append(f"Payment is to be made to \"{explicit[0]}\", not to {name}. "
                            "Check that the vendor really asks for that.")
-    return b.text.strip(" ,"), round(confidence, 2), b.text
+    return name, round(confidence, 2), b.text
+
+
+_TITLE_AFTER_NAME = re.compile(r"(?i)^(.{3,60}?\S)\s+(?:tax invoice|invoice|rechnung|facture|factuur|factura|fattura)$")
+_SELLER_HEADINGS = {_plain(norm(label.rstrip(":"))) for label, _ in lang.LABELS["payable_to"]} | {
+    "seller", "vendor", "supplier", "from", "issuer", "sender"}
+_NAME_KEYS = {"name", "firma", "firmenname", "nom", "raison sociale", "naam", "bedrijfsnaam", "nombre",
+              "razon social", "nome", "ragione sociale", "denominazione", "company", "company name"}
+
+
+def _seller_section(boxes: list[Box]) -> Box | None:
+    """The seller's name from a section headed "Verkäufer" / "Seller" / "Fournisseur": the value
+    of a "Name:" line in it, or else the first line in it that reads like a name."""
+    for head in sorted(boxes, key=lambda b: (b.page, b.y0)):
+        if _plain(norm(head.text)) not in _SELLER_HEADINGS:
+            continue
+        below = sorted((b for b in boxes if b.page == head.page and head.y1 - 1 <= b.y0 <= head.y1 + head.height * 14
+                        and b.x0 >= head.x0 - head.height), key=lambda b: (b.y0, b.x0))
+        first_name = None
+        for b in below:
+            m = match_label(b.text, "customer")
+            if (m and m[0] >= 2) or (_plain(norm(b.text)) in _SELLER_HEADINGS):
+                break              # the next section (the buyer) starts here
+            key = _plain(norm(b.text.split(":")[0]))
+            if key in _NAME_KEYS:
+                after = b.text.split(":", 1)[1].strip() if ":" in b.text else ""
+                if after and looks_like_name(after):
+                    return Box(after, b.x0, b.y0, b.x1, b.y1, b.page, b.size)
+                right = sorted((o for o in boxes if o is not b and _same_line(b, o) and o.x0 >= b.x1 - 2),
+                               key=lambda o: o.x0)
+                if right and looks_like_name(right[0].text.lstrip(": ")):
+                    o = right[0]
+                    return Box(o.text.lstrip(": "), o.x0, o.y0, o.x1, o.y1, o.page, o.size)
+            if first_name is None and abs(b.x0 - head.x0) < head.height * 2 and looks_like_name(b.text) \
+                    and not _is_any_label(b) and not _is_key(b, boxes):
+                first_name = b
+        if first_name is not None:
+            return first_name
+    return None
+
+
+def _is_key(box: Box, boxes: list[Box]) -> bool:
+    """Is this the left half of a "key : value" pair (the next thing on its line starts with a colon)?"""
+    right = [o for o in boxes if o is not box and _same_line(box, o) and o.x0 >= box.x1 - 1]
+    return bool(right) and min(right, key=lambda o: o.x0).text.lstrip().startswith(":")
+
+
+def _squash(text: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", norm(text))
 
 
 # ------------------------------------------------------------------ line items
@@ -538,7 +798,9 @@ def line_items_total(boxes: list[Box], subtotal_box: Box | None, total_box: Box 
                                                    "extended price", "net amount", "price total", "amount usd",
                                                    "amount $", "line amount", "value")]
     end_box = subtotal_box or total_box
-    for header in sorted(headers, key=lambda b: (b.page, b.y0)):
+    # Left to right, a table reads quantity ... price ... line total: of two candidate headings
+    # in one row ("Amount" for the quantity, "Total" for the line total) the right-hand one counts.
+    for header in sorted(headers, key=lambda b: (b.page, round(b.y0 / 4), -b.x0)):
         if end_box is not None and (header.page, header.y0) >= (end_box.page, end_box.y0):
             continue
         row = [b for b in boxes if _same_line(header, b) and b is not header]
@@ -580,14 +842,18 @@ def find_fields(boxes: list[Box], company: str | None = None, method: str = "") 
     if is_credit_note(boxes):
         ex.kind = "credit"
     token = _CREDIT_NOTE.set(ex.kind == "credit")
+    order = _DAY_FIRST.set(date_order_hint(boxes))
     try:
         return _find_fields(ex, boxes, company)
     finally:
         _CREDIT_NOTE.reset(token)
+        _DAY_FIRST.reset(order)
 
 
-_CREDIT_TITLE = re.compile(r"(?i)^\s*(tax |vat )?(credit (note|memo|memorandum|invoice)|creditnote|gutschrift|avoir|"
-                           r"nota de cr[eé]dito|creditnota)\b")
+_CREDIT_TITLE = re.compile(r"(?i)^\s*(tax |vat )?(credit (note|memo|memorandum|invoice)|creditnote|avoir|"
+                           r"gutschrift(?!sverfahren| \(selbst)|rechnungskorrektur|stornorechnung|note de cr[eé]dit|"
+                           r"facture d'avoir|nota de cr[eé]dito|factura rectificativa|nota di credito|creditnota|"
+                           r"creditfactuur)\b")
 
 
 def is_credit_note(boxes: list[Box]) -> bool:
@@ -631,9 +897,32 @@ def _find_fields(ex: Extraction, boxes: list[Box], company: str | None) -> Extra
         hit = subtotal if kind == "subtotal" else best(boxes, kind, prefer_low=True)
         if hit:
             ex.totals[kind] = hit[0]
+    printed = set()
+    for box in boxes:                   # every total printed on the page, not only the one chosen
+        m = match_label(box.text, "amount")
+        value = find_value(boxes, box, "amount", m[1])[0] if m and m[0] >= 2 else None
+        if value is not None and total and abs(value - total[0]) > 0.005:
+            printed.add(value)
+    if total and printed and "subtotal" in ex.totals and not _BALANCE_LABEL.search(norm(total[3].text)):
+        # The page's own arithmetic picks the total: if subtotal + tax equals one of the other
+        # printed totals and not the one chosen, the chosen one was something else (a line, a
+        # carried-over figure). A label that says "to pay" / "balance due" is left alone: that
+        # is what remains after a part payment.
+        parts = {k: v for k, v in ex.totals.items() if k not in ("printed_totals", "tax_unread")}
+        fitting = [v for v in printed if totals_issue(v, parts) is None and abs(
+            v - (parts["subtotal"] + parts.get("tax", 0) + parts.get("shipping", 0) - parts.get("discount", 0))) <= 0.015]
+        if fitting and totals_issue(total[0], parts) is not None and parts.get("tax"):
+            printed.add(total[0])
+            printed.discard(fitting[0])
+            ex.fields["amount"], ex.confidence["amount"] = fitting[0], 0.9
+            ex.source["amount"] = f"{fitting[0]:,.2f} (subtotal + tax)"
+    if printed:
+        ex.totals["printed_totals"] = sorted(printed)
     lines = line_items_total(boxes, subtotal[3] if subtotal else None, total[3] if total else None)
     if lines is not None:
         ex.totals["lines"] = lines
+    if "tax" not in ex.totals and any(re.search(r"(?i)\b(vat|tax|mwst|ust|tva|btw|iva|gst)\b", b.text) for b in boxes):
+        ex.totals["tax_unread"] = True      # tax is mentioned, but its amount wasn't found
     if "amount" not in ex.fields and "subtotal" in ex.totals:
         ex.fields["amount"] = round(ex.totals["subtotal"] + ex.totals.get("tax", 0) + ex.totals.get("shipping", 0)
                                     - ex.totals.get("discount", 0), 2)
@@ -660,6 +949,8 @@ def _find_fields(ex: Extraction, boxes: list[Box], company: str | None) -> Extra
     return ex
 
 
+_BALANCE_LABEL = re.compile(r"\b(due|balance|to pay|please pay|payable|a payer|zu zahlen|zahlbetrag|zahlbar|"
+                            r"te betalen|a pagar|da pagare|a pagare|solde|reste)\b")
 LABEL_NAMES = {"id": "Invoice number", "vendor": "Vendor", "date": "Invoice date", "amount": "Total amount",
                "bank_account": "Bank account"}
 
@@ -671,20 +962,35 @@ def totals_issue(amount: float | None, totals: dict) -> str | None:
     and subtotal + tax + shipping (- discount) equals the total. Several readings are
     allowed (discount already taken off, or not; deposit already paid, or not), so only a
     real inconsistency is reported.
+
+    A wrong warning here becomes a wrong flag on the invoice, so the check stays silent
+    whenever the parts it would need were not read reliably: a "tax" bigger than any tax
+    rate allows, no tax line found at all, or a total elsewhere on the page that does add
+    up (the amount read is then a balance after a part payment).
     """
     sub, lines = totals.get("subtotal"), totals.get("lines")
-    if sub is not None and lines is not None and abs(lines - sub) > 0.015 and lines > 0:
-        disc = totals.get("discount", 0)
-        if abs(lines - disc - sub) > 0.015:
-            return f"The line items add up to {lines:,.2f}, but the subtotal says {sub:,.2f}."
     if amount is None or sub is None:
         return None
-    extras = totals.get("tax", 0) + totals.get("shipping", 0)
+    tax = totals.get("tax", 0)
+    if sub <= 0 or tax > sub * 0.35 + 0.01:
+        return None                     # that isn't this invoice's tax: nothing to check against
+    extras = tax + totals.get("shipping", 0)
     disc, paid = totals.get("discount", 0), totals.get("paid", 0)
     readings = {sub + extras, sub + extras - disc, sub + extras - paid, sub + extras - disc - paid,
                 sub, sub - disc}
-    if any(abs(r - amount) <= 0.015 for r in readings):
+
+    def fits(value) -> bool:
+        return any(abs(r - value) <= 0.015 for r in readings)
+
+    printed = [v for v in totals.get("printed_totals", ()) if fits(v)]
+    if fits(amount) or (printed and amount <= max(printed) + 0.015):
+        if lines is not None and abs(lines - sub) > 0.015 and lines > 0 and abs(lines - disc - sub) > 0.015:
+            return f"The line items add up to {lines:,.2f}, but the subtotal says {sub:,.2f}."
         return None
+    if "tax" not in totals and "shipping" not in totals and amount > sub:
+        rate = (amount - sub) / sub * 100
+        if 2 <= rate <= 27 and (totals.get("tax_unread") or abs(rate - round(rate * 2) / 2) <= 0.05):
+            return None                 # the difference is a tax (20%, 7.5%...) whose line wasn't read
     detail = f"subtotal {sub:,.2f}"
     if totals.get("tax"):
         detail += f" + tax {totals['tax']:,.2f}"
@@ -770,7 +1076,12 @@ def _merge_words(words: list[dict], page: int) -> list[Box]:
         current = [line[0]]
         for w in line[1:]:
             size = max(max(float(x.get("size") or 10) for x in current), float(w.get("size") or 10), 4)
-            if w["x0"] - current[-1]["x1"] <= size * 0.6:
+            gap = w["x0"] - current[-1]["x1"]
+            if abs(gap) < size * 0.08:
+                # No gap at all: one word that the PDF stores in two pieces ("4" + "71102").
+                current[-1] = {**current[-1], "text": current[-1]["text"] + w["text"], "x1": w["x1"],
+                               "bottom": max(current[-1]["bottom"], w["bottom"])}
+            elif gap <= size * 0.75:    # a space is 0.25-0.6 of the font size (widest in typewriter fonts)
                 current.append(w)
             else:
                 boxes.append(_box(current, page))
@@ -797,7 +1108,10 @@ def boxes_from_pdf(data: bytes, ocr: bool = True) -> tuple[list[Box], str]:
                 raise FileProblem(f"This PDF has {len(pdf.pages)} pages. Upload one invoice per file "
                                   f"(at most {MAX_PAGES} pages).")
             for i, page in enumerate(pdf.pages):
-                words = page.extract_words(extra_attrs=["size"], keep_blank_chars=False, use_text_flow=False)
+                # x_tolerance: how close two letters must be to count as one word. The default (3
+                # points) glues the words of small or tightly set text together.
+                words = page.extract_words(extra_attrs=["size"], keep_blank_chars=False, use_text_flow=False,
+                                           x_tolerance=1.5)
                 if sum(len(w["text"]) for w in words) < MIN_PDF_TEXT:
                     scanned.append(i)
                     if ocr and ocr_available():
