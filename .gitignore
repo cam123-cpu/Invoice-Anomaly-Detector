@@ -21,3 +21,4 @@ dist/
 # Production secrets and backups (docker-compose.prod.yml)
 deploy/secrets/
 backups/
+.python-path

@@ -101,8 +101,12 @@ def payment_decision(item: dict | None) -> str:
         return "pay"
     status = item.get("status", "open")
     if status == "dismissed":
-        return "pay"
-    if status == "confirmed":
+        decision = "pay"
+    elif status == "confirmed":
         action = item.get("action") or suggested_action(item.get("rules", []))
-        return action if action in ACTIONS else "hold"
-    return "review"
+        decision = action if action in ACTIONS else "hold"
+    else:
+        return "review"
+    if decision == "pay" and item.get("needs_approval") and not item.get("approved_by"):
+        return "review"        # released by one person; a second must agree (controls.py)
+    return decision

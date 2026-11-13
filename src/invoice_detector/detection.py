@@ -22,6 +22,7 @@ class Invoice:
     totals_issue: str | None = None  # read from the invoice document: its own arithmetic doesn't add up
     kind: str = "invoice"            # "invoice", or "credit" for a credit note (amount stays positive)
     reference: str | None = None     # on a credit note: the invoice number it says it applies to
+    paid: str | None = None          # date it was marked paid, if it has been
 
 
 @dataclass(frozen=True)
@@ -120,15 +121,19 @@ def _robust_log_z(amount: float, log_amounts: list[float]) -> float:
 # ---------------------------------------------------------------- rules
 def find_duplicates(invoices: list[Invoice]) -> list[Anomaly]:
     """Same vendor + amount + date as an earlier invoice."""
-    seen: dict[tuple, str] = {}
+    seen: dict[tuple, Invoice] = {}
     out = []
     for inv in sorted(invoices, key=lambda i: (i.date, i.id)):
         key = (inv.vendor, inv.amount, inv.date)
         if key in seen:
-            out.append(Anomaly(inv.id, "duplicate", "high", f"duplicate of {seen[key]}"))
+            out.append(Anomaly(inv.id, "duplicate", "high", f"duplicate of {seen[key].id}{_paid_note(seen[key])}"))
         else:
-            seen[key] = inv.id
+            seen[key] = inv
     return out
+
+
+def _paid_note(inv: Invoice) -> str:
+    return f", which was already paid on {inv.paid}" if inv.paid else ""
 
 
 def find_near_duplicates(invoices: list[Invoice], cfg: DetectionConfig = DEFAULT_CONFIG) -> list[Anomaly]:
@@ -143,7 +148,7 @@ def find_near_duplicates(invoices: list[Invoice], cfg: DetectionConfig = DEFAULT
             gap = (_day(cur) - _day(prev)).days
             if 0 < gap <= cfg.near_duplicate_days:
                 out.append(Anomaly(cur.id, "near_duplicate", "medium",
-                                   f"same vendor and amount as {prev.id}, {gap} day(s) later"))
+                                   f"same vendor and amount as {prev.id}, {gap} day(s) later{_paid_note(prev)}"))
     return out
 
 
@@ -479,11 +484,21 @@ def find_credit_issues(invoices: list[Invoice], matched: dict[str, str]) -> list
     - duplicate_credit: the same credit recorded twice (it would be deducted twice)."""
     out = []
     links = credit_links(invoices)
+    by_id = {i.id: i for i in invoices}
     for credit_id, bill_id in matched.items():
-        out.append(Anomaly(bill_id, "credited_invoice", "high",
-                           f"cancelled by credit note {credit_id} (same vendor and amount)"))
-        out.append(Anomaly(credit_id, "matched_credit", "medium",
-                           f"cancels invoice {bill_id} (same vendor and amount)"))
+        paid = by_id[bill_id].paid
+        if paid:
+            # Too late to cancel: the money has gone. The credit is now money owed back.
+            out.append(Anomaly(bill_id, "credited_invoice", "high",
+                               f"paid on {paid}, then cancelled by credit note {credit_id}: a refund is due"))
+            out.append(Anomaly(credit_id, "matched_credit", "high",
+                               f"cancels invoice {bill_id}, which was already paid on {paid}: ask the vendor "
+                               "for a refund, or deduct it from their next payment"))
+        else:
+            out.append(Anomaly(bill_id, "credited_invoice", "high",
+                               f"cancelled by credit note {credit_id} (same vendor and amount)"))
+            out.append(Anomaly(credit_id, "matched_credit", "medium",
+                               f"cancels invoice {bill_id} (same vendor and amount)"))
     billed: dict[str, list[Invoice]] = defaultdict(list)
     for inv in invoices:
         if inv.kind == "invoice":
@@ -535,9 +550,15 @@ def find_reissues(invoices: list[Invoice], matched: dict[str, str], days: int = 
                     and inv.vendor == original.vendor and abs(inv.amount - original.amount) < 0.005
                     and 0 <= (_day(inv) - _day(original)).days <= days and inv.id != bill_id):
                 taken.add(inv.id)
-                out.append(Anomaly(inv.id, "reissued_invoice", "low",
-                                   f"same vendor and amount as invoice {bill_id}, which credit note {credit_id} "
-                                   "cancels: pay once that credit is confirmed with the vendor"))
+                if original.paid:
+                    out.append(Anomaly(inv.id, "reissued_invoice", "high",
+                                       f"same vendor and amount as invoice {bill_id}, which was already PAID on "
+                                       f"{original.paid} and then cancelled by credit note {credit_id}: paying this "
+                                       "pays twice unless the vendor refunds the original"))
+                else:
+                    out.append(Anomaly(inv.id, "reissued_invoice", "low",
+                                       f"same vendor and amount as invoice {bill_id}, which credit note {credit_id} "
+                                       "cancels: pay once that credit is confirmed with the vendor"))
                 break
     return out
 

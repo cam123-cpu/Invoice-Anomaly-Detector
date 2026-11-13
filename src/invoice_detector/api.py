@@ -20,8 +20,9 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from .config import Settings
 from .db import Conflict, Database
-from .detection import (DEFAULT_CONFIG, RULE_WEIGHT, Anomaly, detect, learned_weights,
+from .detection import (DEFAULT_CONFIG, RULE_WEIGHT, Anomaly, credit_links, detect, learned_weights,
                         review_queue)
+from .controls import ControlError, check_approver, check_reviewer, needs_second_approval
 from .decisions import fix_steps, payment_decision, suggested_action
 from .excel_out import XLSX, annotate, payment_file, review_report
 from .explain import explain
@@ -148,6 +149,11 @@ class ReviewIn(StrictModel):
     # What happens to the payment. Leave out to use the suggestion (e.g. "do_not_pay" for a duplicate).
     action: Literal["pay", "hold", "do_not_pay"] | None = None
     note: str | None = Field(default=None, max_length=500)
+
+
+class PaymentsIn(StrictModel):
+    invoice_ids: list[str] = Field(min_length=1, max_length=500)
+    reference: str | None = Field(default=None, max_length=120)   # e.g. the bank batch number
 
 
 class FileIn(StrictModel):
@@ -652,7 +658,7 @@ def create_app(settings: Settings | None = None, db: Database | None = None,
         On hold, Do not pay, with totals. The corrected batch to hand to whoever pays."""
         org = user["org"]
         company = db.get_org(org)["name"]
-        data = payment_file(db.all_invoices(org), queue_items(org), company)
+        data = payment_file(db.all_invoices(org), queue_items(org), company, credit_links(db.detection_inputs(org)))
         db.audit(org, user["sub"], "report_exported", "payment file")
         slug = re.sub(r"[^A-Za-z0-9]+", "-", company).strip("-").lower() or "company"
         return attachment(data, f"payment-file-{slug}.xlsx", XLSX)
@@ -784,14 +790,25 @@ def create_app(settings: Settings | None = None, db: Database | None = None,
         """Ranked flags with review status, payment decision and next steps."""
         ranked = review_queue([Anomaly(**a) for a in db.list_anomalies(org, 5000)], weights_for(org))
         reviews = db.review_details(org)
+        invoices = {i["id"]: i for i in db.all_invoices(org)}
+        threshold = db.get_org(org)["approval_threshold"]
+        reviewers = db.count_reviewers(org)
         for item in ranked:
             review = reviews.get(item["invoice_id"], {})
+            inv = invoices.get(item["invoice_id"], {})
             item["status"] = review.get("verdict", "open")
             item["action"] = review.get("action")
             item["note"] = review.get("note")
             item["reviewer"] = review.get("reviewer")
+            item["approved_by"] = review.get("approved_by")
+            item["added_by"] = inv.get("created_by")
+            item["paid_at"] = inv.get("paid_at")
+            item["needs_approval"] = item["status"] != "open" and needs_second_approval(
+                abs(inv.get("amount") or 0), inv.get("kind", "invoice"), threshold, item["status"], item["action"],
+                reviewers)
             item["suggested_action"] = suggested_action(item["rules"])
             item["decision"] = payment_decision(item)
+            item["awaiting_approval"] = item["needs_approval"] and not item["approved_by"]
             item["fixes"] = fix_steps(item["rules"])
         return ranked
 
@@ -833,12 +850,66 @@ def create_app(settings: Settings | None = None, db: Database | None = None,
                user: dict = Depends(require("admin", "accountant"))) -> dict:
         """Mark a flagged invoice as a real problem (confirmed) or a false alarm (dismissed).
         These decisions tune the rule weights for your company."""
+        org = user["org"]
+        facts = db.invoice_facts(org, invoice_id)
+        if facts is None:
+            raise HTTPException(404, "No flags on that invoice")
         try:
-            action = db.set_review(user["org"], invoice_id, body.verdict, user["sub"], body.action, body.note)
+            check_reviewer(facts["created_by"], user["sub"], db.count_reviewers(org))
+            action = db.set_review(org, invoice_id, body.verdict, user["sub"], body.action, body.note)
+        except ControlError as exc:
+            raise HTTPException(exc.status, exc.message) from None
         except KeyError:
             raise HTTPException(404, "No flags on that invoice") from None
-        db.audit(user["org"], user["sub"], "invoice_reviewed", f"{invoice_id}: {body.verdict}, {action}")
-        return {"invoice_id": invoice_id, "status": body.verdict, "action": action, "decision": action}
+        db.audit(org, user["sub"], "invoice_reviewed", f"{invoice_id}: {body.verdict}, {action}")
+        item = next((i for i in full_queue(org) if i["invoice_id"] == invoice_id), {})
+        return {"invoice_id": invoice_id, "status": body.verdict, "action": action,
+                "decision": item.get("decision", action), "awaiting_approval": item.get("awaiting_approval", False)}
+
+    @app.post("/approve/{invoice_id:path}")
+    def approve(invoice_id: str, user: dict = Depends(require("admin", "accountant"))) -> dict:
+        """The second sign-off for releasing a large flagged invoice: someone other than the
+        reviewer and whoever added it."""
+        org = user["org"]
+        item = next((i for i in full_queue(org) if i["invoice_id"] == invoice_id), None)
+        if item is None or not item["needs_approval"]:
+            raise HTTPException(409, "That invoice isn't waiting for a second approval.")
+        if item["approved_by"]:
+            raise HTTPException(409, f"Already approved by {item['approved_by']}.")
+        try:
+            check_approver(user["sub"], item["reviewer"], item["added_by"])
+        except ControlError as exc:
+            raise HTTPException(exc.status, exc.message) from None
+        db.approve_review(org, invoice_id, user["sub"])
+        db.audit(org, user["sub"], "payment_approved", f"{invoice_id}: second approval (reviewed by {item['reviewer']})")
+        return {"invoice_id": invoice_id, "approved_by": user["sub"], "decision": "pay"}
+
+    @app.post("/payments")
+    def mark_paid(body: PaymentsIn, user: dict = Depends(require("admin", "accountant"))) -> dict:
+        """Record that invoices were paid (or credit notes applied). Only invoices whose decision
+        is Pay can be marked; paid invoices leave the payment file."""
+        org = user["org"]
+        decisions = {i["invoice_id"]: i["decision"] for i in full_queue(org)}
+        known = {i["id"] for i in db.all_invoices(org)}
+        missing = [i for i in body.invoice_ids if i not in known]
+        if missing:
+            raise HTTPException(404, f"Not on file: {', '.join(missing[:5])}")
+        blocked = [i for i in body.invoice_ids if decisions.get(i, "pay") != "pay"]
+        if blocked:
+            raise HTTPException(409, "Not ready to pay (review, hold or do not pay): " + ", ".join(blocked[:10]))
+        marked = db.mark_paid(org, list(dict.fromkeys(body.invoice_ids)), user["sub"], body.reference)
+        if marked:
+            db.audit(org, user["sub"], "invoices_paid",
+                     f"{len(marked)} marked paid" + (f" ({body.reference.strip()[:60]})" if body.reference else ""))
+        return {"marked": marked, "already_paid": [i for i in body.invoice_ids if i not in marked]}
+
+    @app.delete("/payments/{invoice_id:path}")
+    def unmark_paid(invoice_id: str, user: dict = Depends(require("admin"))) -> dict:
+        """Undo a payment recorded by mistake (admins only; audited)."""
+        if not db.unmark_paid(user["org"], invoice_id):
+            raise HTTPException(404, "That invoice isn't marked paid.")
+        db.audit(user["org"], user["sub"], "payment_undone", invoice_id)
+        return {"invoice_id": invoice_id, "paid": False}
 
     @app.get("/metrics")
     def metrics(user: dict = Depends(current_user)) -> dict:

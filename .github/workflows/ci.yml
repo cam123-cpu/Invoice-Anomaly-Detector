@@ -41,6 +41,25 @@ jobs:
       - name: OCR tests really ran (Linux)
         if: runner.os == 'Linux'
         run: pytest -q tests/test_documents.py -k Ocr -rs | tee ocr.txt && ! grep -q "skipped" ocr.txt
+      # The scripts people double-click on Windows: install into a fresh .venv, set up, start,
+      # and answer. Windows PowerShell 5.1, as on a standard laptop.
+      - name: Windows setup.ps1 and start.ps1 work
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          powershell -ExecutionPolicy Bypass -File .\setup.ps1 -Yes
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          if (-not (Test-Path .\.python-path)) { throw "setup.ps1 did not finish" }
+          $job = Start-Job -ScriptBlock { param($d) Set-Location $d; powershell -ExecutionPolicy Bypass -File .\start.ps1 -NoBrowser } -ArgumentList (Get-Location).Path
+          $ok = $false
+          foreach ($i in 1..60) {
+            Start-Sleep 2
+            try { $r = Invoke-WebRequest http://127.0.0.1:8000/health -UseBasicParsing; if ($r.StatusCode -eq 200) { $ok = $true; break } } catch {}
+          }
+          Receive-Job $job | Select-Object -Last 20
+          Stop-Job $job
+          if (-not $ok) { throw "the app did not answer on port 8000" }
+          Write-Host "setup.ps1 and start.ps1: OK"
       - name: Model quality report
         run: python -m invoice_detector.cli evaluate
       - name: Document reading report

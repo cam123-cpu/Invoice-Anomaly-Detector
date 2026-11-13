@@ -334,6 +334,83 @@ class ApiTests(DbTestCase):
 
 
 @unittest.skipUnless(HAVE_API_DEPS, "fastapi/httpx not installed")
+class ControlsApiTests(DbTestCase):
+    """Separation of duties, second approval and payments, through the API."""
+
+    login, auth, invoice = ApiTests.login, ApiTests.auth, ApiTests.invoice
+
+    def setUp(self):
+        super().setUp()
+        from fastapi.testclient import TestClient
+        from invoice_detector.api import create_app
+
+        self.client = forget_cookies(TestClient(create_app(make_settings(), db=self.app)))
+        self.app.create_user(self.a, "alice", PW_A, "admin")
+        self.app.create_user(self.a, "audit1", "auditor-password-123", "auditor")
+        self.app.create_user(self.a, "erin", "erin-password-1234", "accountant")
+        self.app.create_user(self.a, "carol", "carol-password-1234", "accountant")
+        self.alice, self.erin = self.auth("alice", PW_A), self.auth("erin", "erin-password-1234")
+        self.carol = self.auth("carol", "carol-password-1234")
+        for inv_id in ("D1", "D2"):      # alice adds a duplicate pair over the 10,000 threshold
+            self.client.post("/invoices", json=self.invoice(inv_id, amount=25_000.0), headers=self.alice)
+        self.client.post("/invoices", json=self.invoice("SMALL", amount=50.0, date="2026-01-09"), headers=self.alice)
+        self.client.post("/detect", headers=self.alice)
+
+    def queue(self):
+        return {i["invoice_id"]: i for i in self.client.get("/review-queue", headers=self.alice).json()}
+
+    def test_whoever_added_an_invoice_cannot_release_it(self):
+        r = self.client.post("/review/D2", json={"verdict": "dismissed"}, headers=self.alice)
+        self.assertEqual(r.status_code, 403)
+        self.assertIn("someone else", r.json()["detail"])
+        self.assertEqual(self.queue()["D2"]["status"], "open")
+
+    def test_a_large_release_needs_a_second_person(self):
+        r = self.client.post("/review/D2", json={"verdict": "dismissed"}, headers=self.erin).json()
+        self.assertEqual((r["decision"], r["awaiting_approval"]), ("review", True))
+        for who in (self.erin, self.alice):           # the reviewer, and whoever added it
+            self.assertEqual(self.client.post("/approve/D2", headers=who).status_code, 403)
+        self.assertEqual(self.client.post("/approve/D2", headers=self.auth("audit1", "auditor-password-123")).status_code, 403)
+        ok = self.client.post("/approve/D2", headers=self.carol)
+        self.assertEqual((ok.status_code, ok.json()["decision"]), (200, "pay"))
+        self.assertEqual(self.client.post("/approve/D2", headers=self.carol).status_code, 409)
+        self.assertEqual((self.queue()["D2"]["decision"], self.queue()["D2"]["approved_by"]), ("pay", "carol"))
+        # a new review needs a new approval
+        self.client.post("/review/D2", json={"verdict": "dismissed", "note": "again"}, headers=self.erin)
+        self.assertEqual(self.queue()["D2"]["decision"], "review")
+        # holding it needs nobody else
+        r = self.client.post("/review/D2", json={"verdict": "confirmed", "action": "hold"}, headers=self.erin).json()
+        self.assertEqual((r["decision"], r["awaiting_approval"]), ("hold", False))
+        self.assertEqual(self.client.post("/approve/D2", headers=self.carol).status_code, 409)
+        actions = [e["action"] for e in self.client.get("/audit", headers=self.alice).json()]
+        self.assertIn("payment_approved", actions)
+
+    def test_only_ready_invoices_can_be_marked_paid_and_only_admins_undo(self):
+        blocked = self.client.post("/payments", json={"invoice_ids": ["D2"]}, headers=self.erin)
+        self.assertEqual(blocked.status_code, 409)                      # flagged, not reviewed
+        self.assertEqual(self.client.post("/payments", json={"invoice_ids": ["NOPE"]}, headers=self.erin).status_code, 404)
+        self.assertEqual(self.client.post("/payments", json={"invoice_ids": ["SMALL"]},
+                                          headers=self.auth("audit1", "auditor-password-123")).status_code, 403)
+        r = self.client.post("/payments", json={"invoice_ids": ["SMALL", "D1"], "reference": "batch 12"},
+                             headers=self.erin).json()
+        self.assertEqual(sorted(r["marked"]), ["D1", "SMALL"])
+        self.assertEqual(self.client.post("/payments", json={"invoice_ids": ["SMALL"]}, headers=self.erin).json(),
+                         {"marked": [], "already_paid": ["SMALL"]})
+        listed = {i["id"]: i["paid_at"] for i in self.client.get("/invoices", headers=self.alice).json()}
+        self.assertTrue(listed["SMALL"] and listed["D1"])
+        self.assertIsNone(listed["D2"])
+        # the duplicate now says its original was already paid
+        self.client.post("/detect", headers=self.alice)
+        self.assertIn("already paid", " ".join(self.queue()["D2"]["details"]))
+        wb = load_workbook(io.BytesIO(self.client.get("/export/payment-file.xlsx", headers=self.alice).content))
+        self.assertEqual(sorted(wb["Already paid"].cell(r, 1).value for r in (2, 3)), ["D1", "SMALL"])
+        self.assertEqual(self.client.delete("/payments/SMALL", headers=self.erin).status_code, 403)
+        self.assertEqual(self.client.delete("/payments/SMALL", headers=self.alice).status_code, 200)
+        self.assertEqual(self.client.delete("/payments/SMALL", headers=self.alice).status_code, 404)
+        self.assertEqual(self.client.post("/payments", json={"invoice_ids": []}, headers=self.erin).status_code, 422)
+
+
+@unittest.skipUnless(HAVE_API_DEPS, "fastapi/httpx not installed")
 class SignInApiTests(DbTestCase):
     """The HTTP wiring of sign-in; the rules themselves are tested in test_accounts.py."""
 
