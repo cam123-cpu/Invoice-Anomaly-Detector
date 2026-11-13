@@ -315,6 +315,23 @@ class HostileDocumentTextTests(unittest.TestCase):
                 d.read_document("big.pdf", b"%PDF-1.7 ...", "X")
 
 
+class DistributedGuessingTests(base.AccountsTestCase):
+    def test_guesses_spread_over_many_addresses_still_lock_the_account(self):
+        """A botnet gets 5 guesses per address; the account-wide limit stops it at 20."""
+        from invoice_detector.accounts import AccountError
+        statuses = []
+        for i in range(25):
+            try:
+                self.acc.login("alice@acme.example", "wrong-password-000", f"198.51.100.{i}")
+            except AccountError as exc:
+                statuses.append(exc.status)
+        self.assertEqual(statuses[:20], [401] * 20)
+        self.assertEqual(set(statuses[20:]), {429})
+        with self.assertRaises(AccountError) as caught:              # even the right password waits
+            self.acc.login("alice@acme.example", base.PW, "203.0.113.9")
+        self.assertEqual(caught.exception.status, 429)
+
+
 class RateLimitStorageTests(base.AccountsTestCase):
     def test_the_table_does_not_reveal_who_was_tried(self):
         import hashlib

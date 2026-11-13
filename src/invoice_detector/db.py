@@ -578,14 +578,16 @@ class Database:
     # ----- payments -----
     def mark_paid(self, org_id: str, invoice_ids: list[str], paid_by: str, reference: str | None = None) -> list[str]:
         """Record payment of these invoices. Returns the ids newly marked (already paid ones are skipped)."""
+        # One statement per invoice that does nothing if it is already paid, so two people
+        # marking the same invoice at the same moment can't both succeed (or cause an error).
         marked = []
         with self._tx(org_id) as run:
-            for inv_id in invoice_ids:
-                if run("SELECT 1 FROM payments WHERE org_id = ? AND invoice_id = ?", (org_id, inv_id)):
-                    continue
-                run("INSERT INTO payments (org_id, invoice_id, paid_at, paid_by, reference) VALUES (?, ?, ?, ?, ?)",
-                    (org_id, inv_id, _now(), paid_by, (reference or "").strip()[:120] or None))
-                marked.append(inv_id)
+            for inv_id in dict.fromkeys(invoice_ids):
+                done = run("INSERT INTO payments (org_id, invoice_id, paid_at, paid_by, reference) "
+                           "VALUES (?, ?, ?, ?, ?) ON CONFLICT (org_id, invoice_id) DO NOTHING RETURNING invoice_id",
+                           (org_id, inv_id, _now(), paid_by, (reference or "").strip()[:120] or None))
+                if done:
+                    marked.append(inv_id)
         return marked
 
     def unmark_paid(self, org_id: str, invoice_id: str) -> bool:
