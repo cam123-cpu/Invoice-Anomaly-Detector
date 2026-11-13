@@ -40,7 +40,18 @@ data, have an independent tester repeat it.
 | 16 | Low | **Learn which usernames were attacked** from a copy of the rate-limit table: keys were a plain hash of the username. | Keys are an HMAC with the server's index key. |
 | 17 | Low | **Teach the reader a misleading label** for a vendor (an insider correcting one invoice), so colleagues see a wrong pre-filled value. | Every value is still shown for checking, with a note when it was read from a learned label; the totals check still applies; each new lesson is in the activity log with who taught it. |
 
-Checked in this round and found sound: XML in e-invoices (DTDs and entities refused, 2 MB cap, 140,000-level nesting, 380,000 elements and 140,000 attributes each parse in under a second); a 100 MB attachment compressed into a small PDF (refused by pypdf's limit, the page is read instead); a credit note's reference (validated like an invoice number, shown as text, scoped to the company); lessons (signed in the draft, reduced to letters, isolated per company by row-level security).
+### Third round (payment controls, and a sweep of every route)
+
+| # | Severity | What an attacker could do | Fix |
+|---|---|---|---|
+| 18 | Medium | **Enter a fake invoice and wave it through yourself.** Anyone who could review could release an invoice they had added. | Separation of duties: whoever added an invoice can't release its flags, and a release at or above the approval threshold needs a second, different person (`controls.py`). |
+| 19 | Medium | **Guess a password from a botnet.** The sign-in limit counted per address + username: every address got five fresh guesses at the same account, so 1,000 addresses meant 5,000 guesses every 15 minutes. | A second limit counts wrong passwords for the account from everywhere: 20 in an hour locks it for 15 minutes. |
+| 20 | Low | **Crash request handling, or have input reflected back.** Fuzzing every route found 120 server errors: a body such as `1e309` (infinity) made the default validation answer, which echoed the input, impossible to encode. | Validation errors say where the problem is and never echo input; over-nested JSON is a 400; anything unexpected is logged and answered as JSON with no internals. The fuzz test runs on every push. |
+| 21 | Low | **Make a payment run fail** by marking the same invoice paid twice at the same moment (a database error on PostgreSQL). | Marking paid is one insert that does nothing if the invoice is already paid. |
+
+Checked in this round and found sound: every route's sign-in and role requirement (listed and compared with what each does); CSRF protection on the new DELETE route; formula injection through the new payment-file text (cells are always text); another company's invoice in `/approve` or `/payments` (not found).
+
+Checked in the second round and found sound: XML in e-invoices (DTDs and entities refused, 2 MB cap, 140,000-level nesting, 380,000 elements and 140,000 attributes each parse in under a second); a 100 MB attachment compressed into a small PDF (refused by pypdf's limit, the page is read instead); a credit note's reference (validated like an invoice number, shown as text, scoped to the company); lessons (signed in the draft, reduced to letters, isolated per company by row-level security).
 
 ## Checked and found sound
 
@@ -65,6 +76,8 @@ These were attacked and held, so nothing was changed:
 - A company admin can tell that a username is taken by another company (usernames are global).
 - Signing out ends all of that person's sessions, not just one device.
 - A credit note confirmed by a reviewer releases its re-issued invoice only by the reviewer's judgement: the app can't check with the vendor itself.
+- Separation of duties assumes people have one account each. An admin can create a second account, disable the other reviewers, or raise the approval threshold; each of these is in the activity log, which is where an auditor should look. Companies that need more should have a second admin review that log.
+- The account-wide sign-in limit means someone who knows a username can keep it locked by guessing wrong 20 times an hour. It locks for 15 minutes, single sign-on is unaffected, and an admin sees the failed attempts in the log.
 
 ## Re-running it
 

@@ -23,12 +23,15 @@ sorts every invoice into Ready to pay, Review first, On hold and Do not pay.
 | `duplicate` | 0.80 | Same vendor + amount + date as an earlier invoice |
 | `bank_account_change` | 0.80 | Established vendor, first payment to a new bank account |
 | `shared_bank_account` | 0.70 | One bank account paid to several vendors |
+| `duplicate_number` | 0.70 | The vendor's invoice number seen before in another spelling (`INV-1001` / `INV1001`), with a new date or amount |
 | `amount_outlier` | 0.55–0.75 | Far above the vendor's own history (robust z-score on log amounts) |
 | `totals_mismatch` | 0.45 | The invoice's own line items, subtotal, tax and total don't agree (invoices read from documents) |
 | `credited_invoice` / `matched_credit` | 0.65 | An invoice and the credit note that cancels it in full (flagged as a pair) |
 | `duplicate_credit` | 0.50 | The same credit note recorded twice |
 | `unmatched_credit` | 0.45 | A credit note from a vendor with nothing (or less) billed, or naming an invoice that isn't on file, is another vendor's, or is already fully credited |
-| `reissued_invoice` | 0.35 | Same vendor and amount as an invoice a credit note cancelled: held until the credit is confirmed |
+| `reissued_invoice` | 0.35 | Same vendor and amount as an invoice a credit note cancelled: held until the credit is confirmed (high risk if the original was already paid) |
+| `future_date` | 0.40 | Dated more than 7 days after today |
+| `sequential_numbers` | 0.30 | The vendor's invoices to you are numbered with no gaps: you may be its only customer (a shell company sign). A company-wide internal numbering is recognised and ignored |
 | `split_invoice` | 0.50 | Several invoices in a few days, each under the approval threshold, together over it |
 | `near_duplicate` | 0.50 | Same vendor + amount a few days apart |
 | `similar_vendor_name` | 0.50 | Vendor name almost identical to another vendor's |
@@ -154,14 +157,15 @@ text inside an invoice is treated as data, never as instructions.
 python -m invoice_detector.cli evaluate
 ```
 
-On 10 synthetic datasets (2,583 invoices, 14 injected anomalies each), at a risk cut-off of 30:
+On 10 synthetic datasets (2,703 invoices, 17 planted cases each, covering every rule), at a
+risk cut-off of 30:
 
 | Metric | Result |
 |---|---|
-| Precision | 96.9% |
-| Recall | 87.9% |
-| Top-k hit rate | 97.1% |
-| Per-rule recall | 100% for all eleven rules |
+| Precision | 98.5% |
+| Recall | 92.9% |
+| Top-k hit rate | 98.6% |
+| Per-rule recall | 100% for all eighteen planted rules |
 
 The missed 12% are invoices whose only signal is a low-weight one (a round amount or a weekend
 date), which score below the cut-off by design.
@@ -169,6 +173,24 @@ date), which score below the cut-off by design.
 **These numbers are an upper bound.** The anomalies were injected by the same code base that
 detects them, and real invoices are messier. Measure on your own labelled data before trusting
 any figure here.
+
+## Payment controls
+
+The checks an auditor asks about first are built in (`controls.py`):
+
+- **Separation of duties.** Whoever added an invoice can't release its flags; someone else
+  reviews it. Applies whenever the company has two or more people who can review.
+- **Second approval.** Releasing a flagged invoice at or above the company's approval
+  threshold (Settings; 10,000 by default), by dismissing its flags or choosing "pay anyway",
+  needs a second person: not the reviewer and not whoever added it. Until then it stays in
+  *Review first*. Changing the review clears the approval.
+- **Paid status.** Invoices whose decision is *Pay* can be marked paid (one at a time on the
+  Invoices page, or in bulk with `POST /payments`). Paid invoices leave the payment file
+  (sheet *Already paid*). A duplicate or re-issue of a paid invoice says so, and a credit
+  note for a paid invoice becomes a refund due. Admins can undo a payment marked by mistake.
+- **Partial credits** are shown against the invoice they name: *Pay 800.00 after credit note
+  CN-1 (-100.00)*.
+- Every review, approval, payment, undo and settings change is in the activity log.
 
 ## Many companies, kept apart
 
@@ -253,16 +275,23 @@ on every push. SQLite, used for local runs, has the first two layers and the las
 
 ## Quick start
 
+**Windows, the easy way:** download the code (green *Code* button > *Download ZIP*, extract
+it), then right-click `setup.ps1` > *Run with PowerShell*, and afterwards `start.ps1` the same
+way. They run every tool as `python -m ...`, which works on laptops whose security policy
+blocks `pip.exe` or `uvicorn.exe`.
+
+**Any system, by hand:**
+
 ```bash
 python -m venv .venv
 source .venv/bin/activate            # Windows PowerShell: .venv\Scripts\Activate.ps1
-pip install -e ".[dev]"
+python -m pip install -e ".[dev]"
 
 python -m invoice_detector.cli init                       # creates .env with fresh secrets
 python -m invoice_detector.cli create-org "Acme Inc"
 python -m invoice_detector.cli create-user "Acme Inc" alice admin
 python -m invoice_detector.cli seed "Acme Inc"            # optional: synthetic invoices with planted anomalies
-uvicorn invoice_detector.api:create_app --factory --reload
+python -m uvicorn invoice_detector.api:create_app --factory --reload
 ```
 
 Reading photos and scans of invoices is optional: `pip install -e ".[ocr]"` plus the Tesseract
