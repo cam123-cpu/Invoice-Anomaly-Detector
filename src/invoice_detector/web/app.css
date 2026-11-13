@@ -329,3 +329,7 @@ tr.excluded .doc-notes ul, tr.doc-notes.excluded ul { background: var(--panel-2)
 
 .doc-ref { display: block; margin-top: 6px; width: 100%; max-width: 190px; font-size: 13px; }
 .doc-ref[hidden] { display: none; }
+
+.pill.paid { background: var(--green-soft); color: var(--green); font-weight: 600; }
+.c-pay { white-space: nowrap; }
+.c-pay .btn.link { margin-left: 6px; }

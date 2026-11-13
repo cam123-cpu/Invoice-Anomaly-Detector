@@ -30,7 +30,8 @@ const ACTIONS = {
   login: "Signed in", login_failed: "Failed sign-in", file_imported: "Imported a file",
   documents_imported: "Imported invoice documents", reader_taught: "Taught the document reader", ai_document_read: "Sent a document for AI reading",
   logout: "Signed out", access_removed: "Removed a person's access", access_restored: "Gave a person access back",
-  ai_summary: "Asked for an AI summary",
+  ai_summary: "Asked for an AI summary", payment_approved: "Gave a second approval", invoices_paid: "Marked invoices paid",
+  payment_undone: "Undid a payment",
   report_exported: "Downloaded a report", workbook_exported: "Downloaded a checked workbook",
   invoices_imported: "Imported invoices", detection_run: "Ran detection", invoice_reviewed: "Reviewed an invoice",
   bank_account_viewed: "Viewed a bank account", user_created: "Added a user", settings_changed: "Changed settings",
@@ -623,10 +624,16 @@ async function dashboardView() {
       h("td", { class: "meaning muted" }, DECISIONS[d][1])))),
     h("tfoot", {}, h("tr", {}, h("td", {}, "Total"), h("td", { class: "num" }, whole.format(totalCount)),
       h("td", { class: "num" }, fmtAmount(totalAmount)), h("td", { class: "meaning" })))));
+  const paidInfo = s.paid && s.paid.count ? `${whole.format(s.paid.count)} invoice${s.paid.count === 1 ? "" : "s"} ` +
+    `(${fmtAmount(s.paid.amount)}) already marked paid, not counted above.` : "";
+  const approvalInfo = s.awaiting_approval ? `${whole.format(s.awaiting_approval)} released by one person ` +
+    `${s.awaiting_approval === 1 ? "is" : "are"} waiting for a second approval in the review queue.` : "";
+  const extraLine = paidInfo || approvalInfo ? h("p", { class: "muted small", id: "paid-line" },
+    [approvalInfo, paidInfo].filter(Boolean).join(" ")) : null;
   const payments = h("section", { class: "card payments" },
     h("div", { class: "section-head" }, h("h2", {}, "Payments"), h("span", { class: "spacer" }),
       downloadButton("Download payment file", "GET", "/export/payment-file.xlsx", undefined, "sm")),
-    stack, ledger, creditLine ? spacer(8) : null, creditLine);
+    stack, ledger, creditLine || extraLine ? spacer(8) : null, creditLine, extraLine);
   const maxRule = Math.max(1, ...Object.values(s.open_by_rule));
   const reasons = h("div", { class: "card" }, h("h2", {}, "Why open invoices were flagged"),
     Object.keys(s.open_by_rule).length
@@ -687,8 +694,31 @@ async function reviewView() {
   }
 
   function decisionPill(item) {
+    if (item.awaiting_approval) {
+      return h("span", { class: "pill d-review", title: `Released by ${item.reviewer}. Over the approval threshold, ` +
+        "so a second person must approve before it can be paid." }, "Needs 2nd approval");
+    }
     const [text, help] = DECISIONS[item.decision] || [item.decision, ""];
     return h("span", { class: "pill d-" + item.decision, title: help }, text);
+  }
+
+  function approveButton(item) {
+    // The second sign-off: never the reviewer, never whoever added the invoice.
+    if (!item.awaiting_approval || item.reviewer === session.username || item.added_by === session.username) return null;
+    const btn = h("button", { class: "btn sm primary", "aria-label": `Approve payment of ${item.invoice_id}`,
+      onclick: async (e) => {
+        e.stopPropagation();
+        btn.disabled = true;
+        try {
+          await api("POST", "/approve/" + encodeURIComponent(item.invoice_id));
+          item.awaiting_approval = false;
+          item.approved_by = session.username;
+          item.decision = "pay";
+          toast(`${item.invoice_id} approved for payment`);
+          drawRows();
+        } catch (err) { toast(err.message, true); btn.disabled = false; }
+      } }, "Approve");
+    return btn;
   }
 
   async function send(item, body, message) {
@@ -699,7 +729,10 @@ async function reviewView() {
     }
     item.status = body.verdict;
     item.action = r.action;
-    item.decision = body.verdict === "dismissed" ? "pay" : r.action;
+    item.decision = r.decision;
+    item.awaiting_approval = r.awaiting_approval;
+    item.reviewer = session.username;
+    item.approved_by = null;
     if (body.note !== undefined) item.note = body.note || null;
     openCount = counts.open;
     toast(message(item));
@@ -714,9 +747,9 @@ async function reviewView() {
       e.stopPropagation();
       e.currentTarget.disabled = true;
       try {
-        await send(item, { verdict, note: item.note || undefined }, (it) => verdict === "confirmed"
+        await send(item, { verdict, note: item.note || undefined }, (it) => (verdict === "confirmed"
           ? `${it.invoice_id} confirmed: ${DECISIONS[it.decision][0].toLowerCase()}`
-          : `${it.invoice_id} dismissed as a false alarm`);
+          : `${it.invoice_id} dismissed as a false alarm`) + (it.awaiting_approval ? ". A second person must approve it." : ""));
       } catch (err) {
         toast(err.message, true);
         e.currentTarget.disabled = false;
@@ -729,7 +762,7 @@ async function reviewView() {
         h("button", { class: "btn sm", onclick: decide("dismissed"), "aria-label": `Dismiss ${item.invoice_id} as a false alarm` }, "Dismiss"));
     }
     const other = item.status === "confirmed" ? "dismissed" : "confirmed";
-    return h("div", { class: "row" }, decisionPill(item),
+    return h("div", { class: "row" }, decisionPill(item), approveButton(item),
       h("button", { class: "btn link small", onclick: decide(other) }, other === "confirmed" ? "Confirm instead" : "Dismiss instead"));
   }
 
@@ -764,7 +797,11 @@ async function reviewView() {
           h("ul", { class: "fixes" }, (item.fixes || []).map((f) => h("li", {}, f))),
           item.status === "open" ? h("p", { class: "muted small" },
             `Confirming marks it “${DECISIONS[item.suggested_action][0]}”. You can change that afterwards.`) : null,
-          item.note && !(canEdit && item.status === "confirmed") ? h("p", { class: "small" }, h("strong", {}, "Note: "), item.note) : null)),
+          item.note && !(canEdit && item.status === "confirmed") ? h("p", { class: "small" }, h("strong", {}, "Note: "), item.note) : null,
+          item.reviewer ? h("p", { class: "muted small" }, `Reviewed by ${item.reviewer}` +
+            (item.approved_by ? `, approved by ${item.approved_by}` : item.awaiting_approval ? ", waiting for a second approval" : "") +
+            (item.added_by && item.added_by !== "seed" ? `. Added by ${item.added_by}.` : ".")) : null,
+          item.paid_at ? h("p", { class: "small" }, h("strong", {}, "Paid "), fmtDate(item.paid_at.slice(0, 10))) : null)),
       canEdit && item.status === "confirmed" ? decisionEditor(item) : null));
     const row = h("tr", { class: "clickable", tabindex: 0, "aria-expanded": "false",
       onclick: () => toggle(), onkeydown: (e) => { if (e.target === row && (e.key === "Enter" || e.key === " ")) { e.preventDefault(); toggle(); } } },
@@ -1240,12 +1277,37 @@ async function invoicesView() {
   let sort = "invoice_date";
   let query = "";
   const isAdmin = session.role === "admin";
+  const canEdit = CAN_EDIT.includes(session.role);
   const body = h("tbody");
   const note = h("p", { class: "muted small" });
   let rows = [];
   async function load() {
     rows = await api("GET", `/invoices?sort=${encodeURIComponent(sort)}&limit=500`);
     draw();
+  }
+  function statusCell(r) {
+    const cell = h("td", { class: "c-pay" });
+    const paidText = () => h("span", { class: "pill paid", title: `Marked paid ${fmtDate(r.paid_at)}` }, "Paid " + fmtDate(r.paid_at.slice(0, 10)));
+    if (r.paid_at) {
+      put(cell, paidText(), isAdmin ? h("button", { class: "btn link small", "aria-label": `Undo payment of ${r.id}`,
+        onclick: async () => {
+          try { await api("DELETE", "/payments/" + encodeURIComponent(r.id)); r.paid_at = null; draw(); toast(`${r.id}: payment undone`); }
+          catch (err) { toast(err.message, true); }
+        } }, "Undo") : null);
+      return cell;
+    }
+    const [text, help] = DECISIONS[r.decision] || [r.decision, ""];
+    put(cell, h("span", { class: "pill d-" + r.decision, title: help }, text),
+      canEdit && r.decision === "pay" ? h("button", { class: "btn link small", "aria-label": `Mark ${r.id} paid`,
+        onclick: async () => {
+          try {
+            await api("POST", "/payments", { invoice_ids: [r.id] });
+            r.paid_at = new Date().toISOString();
+            draw();
+            toast(`${r.id} marked paid`);
+          } catch (err) { toast(err.message, true); }
+        } }, "Mark paid") : null);
+    return cell;
   }
   function draw() {
     const q = query.toLowerCase();
@@ -1258,7 +1320,7 @@ async function invoicesView() {
         } catch (err) { toast(err.message, true); }
       } }, "Show") : h("span", { class: "muted small" }, "admins only"));
       return h("tr", {}, h("td", { class: "mono" }, r.id, kindTag(r.kind)), h("td", {}, r.vendor),
-        h("td", { class: "num" }, fmtAmount(r.amount)), h("td", {}, fmtDate(r.invoice_date)), bankCell);
+        h("td", { class: "num" }, fmtAmount(r.amount)), h("td", {}, fmtDate(r.invoice_date)), statusCell(r), bankCell);
     }));
     note.textContent = rows.length === 500 ? "Showing the first 500 invoices in this order." : `${whole.format(rows.length)} invoices.`;
   }
@@ -1273,7 +1335,7 @@ async function invoicesView() {
     spacer(12),
     h("div", { class: "table-wrap" }, h("table", {},
       h("thead", {}, h("tr", {}, h("th", {}, "Invoice"), h("th", {}, "Vendor"), h("th", { class: "num" }, "Amount"),
-        h("th", {}, "Date"), h("th", {}, "Bank account"))), body)),
+        h("th", {}, "Date"), h("th", {}, "Payment"), h("th", {}, "Bank account"))), body)),
     spacer(8), note);
 }
 
