@@ -390,7 +390,7 @@ class BrowserTest(unittest.TestCase):
         self.assertEqual(p.input_value("#map-amount"), "Gross amount (EUR)")
         p.click("button:text('Import invoices')")
         p.wait_for_selector(".kpi:has-text('Invoices added')")
-        self.assertEqual(p.inner_text(".kpi:has-text('Invoices added') .value"), "265")
+        self.assertEqual(p.inner_text(".kpi:has-text('Invoices added') .value"), "272")
         self.assertEqual(p.inner_text(".kpi:has-text('Of which credit notes') .value"), "3")
         p.click("a:text('Open review queue')")
         p.wait_for_selector("td.mono:text('RE-2026-0251')")

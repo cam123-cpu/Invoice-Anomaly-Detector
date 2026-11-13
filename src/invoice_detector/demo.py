@@ -20,6 +20,7 @@ VENDORS = [
 ]
 START = date(2026, 1, 5)  # a Monday
 DAYS = 270
+DEMO_END = (START + timedelta(days=DAYS)).isoformat()   # "today" when scoring the demo
 
 
 def _weekday(d: date) -> date:
@@ -36,11 +37,11 @@ def generate_demo(seed: int = 0):
     injected: dict[str, set] = {}
     banks = {name: f"ACCT{idx:02d}{rng.randrange(10**10):010d}" for idx, (name, *_) in enumerate(VENDORS)}
 
-    def add(vendor, amount, when, bank, rules=None, kind="invoice"):
+    def add(vendor, amount, when, bank, rules=None, kind="invoice", inv_id=None):
         amount = round(amount, 2)
         if rules is None and amount % 1000 == 0:
             amount += 0.37  # keep the clean data free of accidental round amounts
-        inv_id = f"{'CN' if kind == 'credit' else 'INV'}-{len(rows) + 1:04d}"
+        inv_id = inv_id or f"{'CN' if kind == 'credit' else 'INV'}-{len(rows) + 1:04d}"
         rows.append({"id": inv_id, "vendor": vendor, "amount": amount,
                      "date": when.isoformat(), "bank_account": bank, "kind": kind})
         if rules:
@@ -114,5 +115,17 @@ def generate_demo(seed: int = 0):
     add("Wayne Office", 38.20, on("Wayne Office", 5), None, kind="credit")
     # 14. a credit note from a company that has never billed anything
     add("Soylent Partners", 2600.00, on("Initech LLC", 2), None, {"unmatched_credit"}, kind="credit")
+    # 15. an invoice sent again three weeks later with its number typed differently and the
+    #     amount nudged, so it isn't an exact or near duplicate
+    src = pick("Wayne Office")
+    add(src["vendor"], src["amount"] + 12.50, _weekday(date.fromisoformat(src["date"]) + timedelta(days=21)),
+        src["bank_account"], {"duplicate_number"}, inv_id=src["id"].replace("-", ""))
+    # 16. a vendor whose invoices to us are numbered without gaps (nobody else is billed)
+    first = START + timedelta(days=60)
+    for k in range(5):
+        add("Pinnacle Advisory", 1180.00 + 37.15 * k, _weekday(first + timedelta(days=30 * k)), "ACCT93" + "1" * 10,
+            {"sequential_numbers"} if k == 4 else None, inv_id=f"PA-{2041 + k}")
+    # 17. dated in the future (relative to the end of the demo period)
+    add("Initech LLC", 2875.40, START + timedelta(days=DAYS + 45), banks["Initech LLC"], {"future_date"})
 
     return rows, injected

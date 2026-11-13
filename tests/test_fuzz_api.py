@@ -62,8 +62,19 @@ class NoServerErrorsTests(DbTestCase):
                         crashes.append(f"{r.status_code} {method} {url[:80]} body={str(body)[:40]}")
                     elif r.status_code >= 400 and "json" not in r.headers.get("content-type", ""):
                         crashes.append(f"non-JSON {r.status_code} {method} {url[:80]}")
-        self.assertEqual(crashes[:20], [], f"{len(crashes)} bad answers")
+        kinds = sorted({c.split(" body=")[0] + " " + c.split(" body=")[-1][:12] for c in crashes})
+        self.assertEqual(kinds[:60], [], f"{len(crashes)} bad answers, {len(kinds)} kinds")
 
+
+    def test_rejected_input_is_not_echoed(self):
+        r = self.client.post("/invoices", json={"id": "OK-1", "vendor": "<script>steal()</script>", "amount": "lots",
+                                                "date": "2026-01-01"}, headers=self.headers)
+        self.assertEqual(r.status_code, 422)
+        self.assertNotIn("steal()", r.text)
+        self.assertNotIn("lots", r.text)
+        self.assertEqual(r.json()["detail"][0]["loc"][-1], "amount")
+        r = self.client.post("/login", content=b"1e309", headers={"content-type": "application/json"})
+        self.assertEqual(r.status_code, 422)
 
 if __name__ == "__main__":
     unittest.main()

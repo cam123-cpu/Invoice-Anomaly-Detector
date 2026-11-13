@@ -59,6 +59,12 @@ RULE_FIX = {
                          "Ask the vendor which invoice this credit relates to before deducting it. A credit "
                          "with nothing behind it can be used to hide a missing payment."),
     "duplicate_credit": ("do_not_pay", "Apply only one of the two identical credit notes."),
+    "duplicate_number": ("do_not_pay", "The vendor already sent an invoice with this number. Pay only one: check "
+                                       "whether this is a reminder or a corrected copy of the first."),
+    "future_date": ("hold", "Check the date with the vendor: an invoice from the future is a typo, or an attempt "
+                            "to change when payment falls due."),
+    "sequential_numbers": ("hold", "Check that this vendor is a real, independent business (company register, VAT "
+                                   "number, address) before paying: it seems to bill nobody but you."),
     "reissued_invoice": ("hold",
                          "This looks like the corrected copy of a cancelled invoice. Pay it once the credit note "
                          "is confirmed with the vendor (by phone, not by replying to the email): if the original "

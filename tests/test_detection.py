@@ -1,7 +1,7 @@
 import unittest
 
 from invoice_detector.demo import generate_demo
-from invoice_detector.detection import (DetectionConfig, Invoice, detect, find_amount_outliers,
+from invoice_detector.detection import (DEFAULT_CONFIG, DetectionConfig, Invoice, detect, find_amount_outliers,
                                         find_bank_account_changes, find_ml_outliers,
                                         find_near_duplicates, find_similar_vendor_names,
                                         find_split_invoices, learned_weights, match_credits, review_queue,
@@ -18,7 +18,10 @@ class DemoDataTests(unittest.TestCase):
     def setUpClass(cls):
         rows, cls.injected = generate_demo(seed=0)
         cls.invoices = to_invoices(rows)
-        cls.found = detect(cls.invoices)
+        from dataclasses import replace
+
+        from invoice_detector.demo import DEMO_END
+        cls.found = detect(cls.invoices, replace(DEFAULT_CONFIG, today=DEMO_END))
         cls.fired = {}
         for a in cls.found:
             cls.fired.setdefault(a.invoice_id, set()).add(a.rule)
@@ -238,3 +241,48 @@ class CreditNoteTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class NumberingAndDateTests(unittest.TestCase):
+    def rules(self, invoices, **cfg):
+        from dataclasses import replace
+        config = replace(DEFAULT_CONFIG, use_ml=False, today="2026-06-30", **cfg)
+        out = {}
+        for a in detect(invoices, config):
+            out.setdefault(a.invoice_id, set()).add(a.rule)
+        return out
+
+    def test_the_same_number_written_differently(self):
+        from invoice_detector.detection import _number_key
+        self.assertEqual(_number_key("INV-0042")[0], _number_key("inv 42")[0])
+        self.assertEqual(_number_key("INV42")[0], _number_key("42")[0])
+        self.assertNotEqual(_number_key("1001-A")[0], _number_key("1001")[0])
+        found = self.rules([inv("INV-1001", "V", 500.0, "2026-03-02"), inv("INV1001", "V", 512.5, "2026-03-23"),
+                            inv("INV 1001", "Other", 500.0, "2026-03-24"), inv("7", "V", 10.0, "2026-03-25"),
+                            inv("A7", "V", 11.0, "2026-03-26")])
+        self.assertEqual(found.get("INV1001"), {"duplicate_number"})
+        self.assertNotIn("INV 1001", found)                          # another vendor's number
+        self.assertNotIn("A7", found)                                # too short to mean anything
+
+    def test_numbers_with_no_gaps(self):
+        months = ["2026-01-05", "2026-02-04", "2026-03-04", "2026-04-06", "2026-05-06"]
+        captive = [inv(f"PA-{2041 + k}", "Pinnacle", 1180.0 + 37 * k, d) for k, d in enumerate(months)]
+        self.assertEqual(self.rules(captive)["PA-2045"], {"sequential_numbers"})
+        normal = [inv(f"PA-{2041 + 7 * k}", "Pinnacle", 1180.0 + 37 * k, d) for k, d in enumerate(months)]
+        self.assertNotIn("PA-2069", self.rules(normal))
+        self.assertEqual(self.rules(captive[:3]), {})                # too few to tell
+
+    def test_the_companys_own_numbering_is_ignored(self):
+        """INV-0001, INV-0002... given by the company's system across all vendors: a vendor's
+        invoices entered together are consecutive, which says nothing about the vendor."""
+        rows, n = [], 0
+        for vendor in ("A", "B", "C", "D"):
+            for k in range(8):
+                n += 1
+                rows.append(inv(f"INV-{n:04d}", vendor, 300.0 + 11 * k, f"2026-0{1 + k % 6}-0{2 + k % 3}"))
+        self.assertFalse(any("sequential_numbers" in r for r in self.rules(rows).values()))
+
+    def test_future_dates(self):
+        found = self.rules([inv("F1", "V", 100.0, "2026-07-20"), inv("F2", "V", 101.0, "2026-07-03")])
+        self.assertEqual(found.get("F1"), {"future_date"})
+        self.assertNotIn("F2", found)                                # within the 7-day allowance

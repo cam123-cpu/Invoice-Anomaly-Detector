@@ -6,6 +6,7 @@ Run:  uvicorn invoice_detector.api:create_app --factory
 """
 import base64
 import binascii
+import logging
 import re
 from dataclasses import replace
 from urllib.parse import quote
@@ -14,6 +15,7 @@ from importlib.resources import files
 from typing import Literal
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, RedirectResponse, Response
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, ConfigDict, Field
@@ -234,6 +236,24 @@ def create_app(settings: Settings | None = None, db: Database | None = None,
                   openapi_url="/openapi.json" if docs else None)
     app.add_middleware(BodyLimit)
     app.state.db, app.state.signer, app.state.accounts = db, signer, accounts
+
+    @app.exception_handler(RequestValidationError)
+    async def invalid_request(request: Request, exc: RequestValidationError) -> JSONResponse:
+        # Say where the problem is, never echo the input: echoing it repeats whatever an
+        # attacker sent, and some values (1e309 = infinity) can't even be written as JSON.
+        problems = [{"loc": [str(part)[:60] for part in e.get("loc", ())][:6], "msg": str(e.get("msg", ""))[:200],
+                     "type": str(e.get("type", ""))[:60]} for e in exc.errors()[:20]]
+        return JSONResponse({"detail": problems}, status_code=422)
+
+    @app.exception_handler(RecursionError)
+    async def too_deep(request: Request, exc: RecursionError) -> JSONResponse:
+        return JSONResponse({"detail": "The request is nested too deeply."}, status_code=400)
+
+    @app.exception_handler(Exception)
+    async def unexpected(request: Request, exc: Exception) -> JSONResponse:
+        # Logged in full on the server; the caller gets JSON with no internals.
+        logging.getLogger("invoice_detector").exception("Unexpected error on %s %s", request.method, request.url.path)
+        return JSONResponse({"detail": "Something went wrong on the server. It has been logged."}, status_code=500)
 
     def http_error(exc: AccountError) -> HTTPException:
         headers = {"X-Requires-2FA": "1"} if exc.requires_2fa else None

@@ -47,6 +47,9 @@ class DetectionConfig:
     use_ml: bool = True
     ml_min_rows: int = 50
     ml_sensitivity: float = 6.0           # lower = more ML flags
+    future_days: int = 7                  # an invoice dated further ahead than this is flagged
+    today: str | None = None              # ISO date to measure "future" from; None = the real today
+    sequential_run: int = 4               # this many gap-free invoice numbers = a captive vendor
 
 
 DEFAULT_CONFIG = DetectionConfig()
@@ -63,6 +66,9 @@ RULE_WEIGHT = {
     "matched_credit": 0.65,
     "unmatched_credit": 0.45,
     "duplicate_credit": 0.5,
+    "duplicate_number": 0.7,
+    "future_date": 0.4,
+    "sequential_numbers": 0.3,
     "reissued_invoice": 0.35,
     "split_invoice": 0.50,
     "near_duplicate": 0.50,
@@ -93,6 +99,9 @@ RULE_INFO = {
     "matched_credit": ("Cancels an invoice", "This credit note cancels a specific invoice in full"),
     "unmatched_credit": ("Credit with no matching invoices", "Credit note from a vendor with nothing, or less, billed"),
     "duplicate_credit": ("Duplicate credit note", "Same vendor, amount and date as another credit note"),
+    "duplicate_number": ("Same invoice number", "The vendor already sent an invoice with this number, written slightly differently"),
+    "future_date": ("Future date", "Invoice is dated well after today"),
+    "sequential_numbers": ("No gaps in numbering", "This vendor's invoice numbers to you run without gaps: you may be their only customer"),
     "reissued_invoice": ("Replaces a cancelled invoice",
                          "Same vendor and amount as an invoice a credit note cancelled: pay it once the credit is confirmed"),
 }
@@ -563,6 +572,94 @@ def find_reissues(invoices: list[Invoice], matched: dict[str, str], days: int = 
     return out
 
 
+_NUMBER = re.compile(r"^([A-Z]*)0*(\d+)([A-Z0-9]*)$")
+
+
+def _number_key(inv_id: str) -> tuple[str, int | None]:
+    """An invoice number without its formatting: 'INV-0042', 'inv 42' and 'INV42' are the
+    same. Returns (key, the number in it, if any)."""
+    s = re.sub(r"[^A-Z0-9]", "", inv_id.upper())
+    m = _NUMBER.match(s)
+    if not m:
+        return s, None
+    return m.group(2) + m.group(3), int(m.group(2))
+
+
+def find_duplicate_numbers(invoices: list[Invoice]) -> list[Anomaly]:
+    """duplicate_number: the same vendor's invoice number seen twice in different spellings
+    ('INV-1001', 'INV1001', '1001'). Exact duplicates are caught elsewhere; this catches the
+    re-sent invoice with a new date or a changed amount, the commonest way duplicates are paid."""
+    seen: dict[tuple, Invoice] = {}
+    out = []
+    for inv in sorted(invoices, key=lambda i: (i.date, i.id)):
+        key, number = _number_key(inv.id)
+        if number is None or len(key) < 3:
+            continue           # too short to mean anything ("7", "A1")
+        first = seen.get((inv.vendor, key))
+        if first is None:
+            seen[(inv.vendor, key)] = inv
+            continue
+        same = "same amount" if abs(first.amount - inv.amount) < 0.005 else f"{first.amount:,.2f} then {inv.amount:,.2f}"
+        out.append(Anomaly(inv.id, "duplicate_number", "high",
+                           f"same invoice number as {first.id} from this vendor ({same}){_paid_note(first)}"))
+    return out
+
+
+def find_sequential_numbers(invoices: list[Invoice], cfg: DetectionConfig = DEFAULT_CONFIG) -> list[Anomaly]:
+    """sequential_numbers: a vendor whose invoices to you are numbered 1041, 1042, 1043, 1044:
+    nobody else received an invoice in between, so you may be its only customer. Typical of
+    a shell company set up to be paid. Flagged once, on the latest invoice of the run."""
+    internal = _internal_prefix(invoices)
+    by_vendor: dict[str, list[Invoice]] = defaultdict(list)
+    for inv in invoices:
+        if internal is None or _prefix(inv.id) != internal:
+            by_vendor[inv.vendor].append(inv)
+    out = []
+    for vendor, group in by_vendor.items():
+        numbered = [(inv, _number_key(inv.id)[1]) for inv in sorted(group, key=lambda i: (i.date, i.id))]
+        numbered = [(inv, n) for inv, n in numbered if n is not None and n >= 100]   # "1", "2": too short to tell
+        run = 1
+        for (prev, a), (cur, b) in zip(numbered, numbered[1:]):
+            run = run + 1 if b == a + 1 else 1
+        if run >= cfg.sequential_run and len(numbered) == run or run >= cfg.sequential_run + 2:
+            last, n = numbered[-1]
+            out.append(Anomaly(last.id, "sequential_numbers", "low",
+                               f"the last {run} invoices from {vendor} are numbered {n - run + 1} to {n} with no gaps"))
+    return out
+
+
+def _prefix(inv_id: str) -> str:
+    m = _NUMBER.match(re.sub(r"[^A-Z0-9]", "", inv_id.upper()))
+    return m.group(1) if m else ""
+
+
+def _internal_prefix(invoices: list[Invoice]) -> str | None:
+    """If most invoice numbers form one dense sequence across all vendors (INV-0001,
+    INV-0002...), they were numbered by the company's own system, not by the vendors, and
+    say nothing about who else a vendor bills. Returns that sequence's prefix, else None."""
+    if len(invoices) < 20:
+        return None
+    counts = Counter(_prefix(i.id) for i in invoices)
+    prefix, n = counts.most_common(1)[0]
+    if n < len(invoices) / 2:
+        return None
+    numbers = [k for i in invoices if _prefix(i.id) == prefix and (k := _number_key(i.id)[1]) is not None]
+    vendors = {i.vendor for i in invoices if _prefix(i.id) == prefix}
+    if len(vendors) >= 3 and numbers and max(numbers) - min(numbers) + 1 <= 1.5 * len(numbers):
+        return prefix
+    return None
+
+
+def find_future_dates(invoices: list[Invoice], cfg: DetectionConfig = DEFAULT_CONFIG) -> list[Anomaly]:
+    today = Date.fromisoformat(cfg.today) if cfg.today else Date.today()
+    out = []
+    for inv in invoices:
+        ahead = (_day(inv) - today).days
+        if ahead > cfg.future_days:
+            out.append(Anomaly(inv.id, "future_date", "medium", f"dated {inv.date}, {ahead} days from today"))
+    return out
+
+
 # ---------------------------------------------------------------- combine
 def detect(invoices: list[Invoice], cfg: DetectionConfig = DEFAULT_CONFIG) -> list[Anomaly]:
     # Credit notes are not purchases. The checks that learn what is normal for a vendor
@@ -576,6 +673,9 @@ def detect(invoices: list[Invoice], cfg: DetectionConfig = DEFAULT_CONFIG) -> li
     live = [i for i in bills if i.id not in cancelled]
     found = [
         *find_duplicates(live),
+        *find_duplicate_numbers(live),
+        *find_sequential_numbers(bills, cfg),
+        *find_future_dates(invoices, cfg),
         *find_reissues(bills, matched),
         *find_near_duplicates(live, cfg),
         *find_amount_outliers(bills, cfg),

@@ -21,6 +21,9 @@ const RULES = {
   matched_credit: ["Cancels an invoice", "This credit note cancels a specific invoice in full", "mid"],
   unmatched_credit: ["Credit with no matching invoices", "Credit note from a vendor with nothing, or less, billed", "mid"],
   duplicate_credit: ["Duplicate credit note", "Same vendor, amount and date as another credit note", "mid"],
+  duplicate_number: ["Same invoice number", "The vendor already sent an invoice with this number", "high"],
+  future_date: ["Future date", "Dated well after today", "mid"],
+  sequential_numbers: ["No gaps in numbering", "This vendor's invoice numbers run without gaps: you may be its only customer", "low"],
   reissued_invoice: ["Replaces a cancelled invoice", "Same vendor and amount as an invoice a credit note cancelled", "low"],
 };
 
