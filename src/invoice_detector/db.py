@@ -404,7 +404,9 @@ class Database:
             raise ValueError("Invalid sort column")
         limit = max(1, min(int(limit), 500))
         with self._tx(org_id) as run:  # bank details are never returned here
-            return run(f"SELECT id, vendor, {SIGNED_AMOUNT}, invoice_date FROM invoices "
+            return run(f"SELECT id, vendor, {SIGNED_AMOUNT}, invoice_date, "
+                       "(SELECT p.paid_at FROM payments p WHERE p.org_id = invoices.org_id "
+                       " AND p.invoice_id = invoices.id) AS paid_at FROM invoices "
                        f"WHERE org_id = ? ORDER BY {sort}, id LIMIT ?", (org_id, limit))
 
     def get_bank_account(self, org_id: str, inv_id: str) -> str | None:
@@ -417,11 +419,13 @@ class Database:
 
     def detection_inputs(self, org_id: str) -> list[Invoice]:
         with self._tx(org_id) as run:
-            rows = run("SELECT i.id, i.vendor, i.amount, i.invoice_date, i.bank_idx, d.totals_issue, i.kind, i.reference "
-                       "FROM invoices i LEFT JOIN documents d ON d.org_id = i.org_id AND d.invoice_id = i.id "
+            rows = run("SELECT i.id, i.vendor, i.amount, i.invoice_date, i.bank_idx, d.totals_issue, i.kind, i.reference, "
+                       "p.paid_at FROM invoices i "
+                       "LEFT JOIN documents d ON d.org_id = i.org_id AND d.invoice_id = i.id "
+                       "LEFT JOIN payments p ON p.org_id = i.org_id AND p.invoice_id = i.id "
                        "WHERE i.org_id = ?", (org_id,))
         return [Invoice(r["id"], r["vendor"], r["amount"], r["invoice_date"], r["bank_idx"], r["totals_issue"],
-                        r["kind"], r["reference"]) for r in rows]
+                        r["kind"], r["reference"], (r["paid_at"] or "")[:10] or None) for r in rows]
 
     # ----- invoice documents -----
     def document_by_hash(self, org_id: str, sha256: str) -> dict | None:
@@ -534,27 +538,75 @@ class Database:
                 action = "pay"
             elif action is None:
                 action = suggested_action(rules)
+            # A new review clears any second approval: it was given to the old decision.
             run("INSERT INTO reviews (org_id, invoice_id, verdict, action, note, rules, reviewer, reviewed_at) "
                 "VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
                 "ON CONFLICT (org_id, invoice_id) DO UPDATE SET verdict = excluded.verdict, "
                 "action = excluded.action, note = excluded.note, rules = excluded.rules, "
-                "reviewer = excluded.reviewer, reviewed_at = excluded.reviewed_at",
+                "reviewer = excluded.reviewer, reviewed_at = excluded.reviewed_at, "
+                "approved_by = NULL, approved_at = NULL",
                 (org_id, invoice_id, verdict, action, (note or "").strip()[:500] or None,
                  ",".join(rules), reviewer, _now()))
         return action
 
     def review_details(self, org_id: str) -> dict[str, dict]:
-        """{invoice id: {verdict, action, note, reviewer, reviewed_at}} for this company."""
+        """{invoice id: {verdict, action, note, reviewer, reviewed_at, approved_by, approved_at}}."""
         with self._tx(org_id) as run:
-            rows = run("SELECT invoice_id, verdict, action, note, reviewer, reviewed_at FROM reviews "
-                       "WHERE org_id = ?", (org_id,))
+            rows = run("SELECT invoice_id, verdict, action, note, reviewer, reviewed_at, approved_by, approved_at "
+                       "FROM reviews WHERE org_id = ?", (org_id,))
+        return {r.pop("invoice_id"): r for r in rows}
+
+    def approve_review(self, org_id: str, invoice_id: str, approver: str) -> None:
+        with self._tx(org_id) as run:
+            run("UPDATE reviews SET approved_by = ?, approved_at = ? WHERE org_id = ? AND invoice_id = ?",
+                (approver, _now(), org_id, invoice_id))
+
+    def invoice_facts(self, org_id: str, invoice_id: str) -> dict | None:
+        """What the controls need: amount (positive), kind, who added it, whether it's paid."""
+        with self._tx(org_id) as run:
+            rows = run("SELECT i.amount, i.kind, i.created_by, p.paid_at FROM invoices i "
+                       "LEFT JOIN payments p ON p.org_id = i.org_id AND p.invoice_id = i.id "
+                       "WHERE i.org_id = ? AND i.id = ?", (org_id, invoice_id))
+        return rows[0] if rows else None
+
+    def count_reviewers(self, org_id: str) -> int:
+        with self._tx(org_id) as run:
+            rows = run("SELECT COUNT(*) AS n FROM users WHERE org_id = ? AND disabled = 0 "
+                       "AND role IN ('admin', 'accountant')", (org_id,))
+        return int(rows[0]["n"])
+
+    # ----- payments -----
+    def mark_paid(self, org_id: str, invoice_ids: list[str], paid_by: str, reference: str | None = None) -> list[str]:
+        """Record payment of these invoices. Returns the ids newly marked (already paid ones are skipped)."""
+        marked = []
+        with self._tx(org_id) as run:
+            for inv_id in invoice_ids:
+                if run("SELECT 1 FROM payments WHERE org_id = ? AND invoice_id = ?", (org_id, inv_id)):
+                    continue
+                run("INSERT INTO payments (org_id, invoice_id, paid_at, paid_by, reference) VALUES (?, ?, ?, ?, ?)",
+                    (org_id, inv_id, _now(), paid_by, (reference or "").strip()[:120] or None))
+                marked.append(inv_id)
+        return marked
+
+    def unmark_paid(self, org_id: str, invoice_id: str) -> bool:
+        with self._tx(org_id) as run:
+            found = run("SELECT 1 FROM payments WHERE org_id = ? AND invoice_id = ?", (org_id, invoice_id))
+            if found:
+                run("DELETE FROM payments WHERE org_id = ? AND invoice_id = ?", (org_id, invoice_id))
+        return bool(found)
+
+    def payments(self, org_id: str) -> dict[str, dict]:
+        """{invoice id: {paid_at, paid_by, reference}}"""
+        with self._tx(org_id) as run:
+            rows = run("SELECT invoice_id, paid_at, paid_by, reference FROM payments WHERE org_id = ?", (org_id,))
         return {r.pop("invoice_id"): r for r in rows}
 
     def all_invoices(self, org_id: str) -> list[dict]:
-        """Every invoice of this company (no bank data), oldest first."""
+        """Every invoice of this company (no bank data), oldest first, with paid_at if paid."""
         with self._tx(org_id) as run:
-            return run(f"SELECT id, vendor, {SIGNED_AMOUNT}, invoice_date FROM invoices WHERE org_id = ? "
-                       "ORDER BY invoice_date, id", (org_id,))
+            return run(f"SELECT i.id, i.vendor, {_qualified(SIGNED_AMOUNT)}, i.invoice_date, i.created_by, p.paid_at "
+                       "FROM invoices i LEFT JOIN payments p ON p.org_id = i.org_id AND p.invoice_id = i.id "
+                       "WHERE i.org_id = ? ORDER BY i.invoice_date, i.id", (org_id,))
 
     def list_reviews(self, org_id: str) -> dict[str, str]:
         with self._tx(org_id) as run:
@@ -582,6 +634,12 @@ class Database:
         with self._tx(org_id) as run:
             return run("SELECT at, username, action, detail FROM audit_log WHERE org_id = ? "
                        "ORDER BY id DESC LIMIT ?", (org_id, limit))
+
+
+def _qualified(columns: str) -> str:
+    """SIGNED_AMOUNT with the invoices table named, for queries that join other tables."""
+    return (columns.replace("kind = 'credit'", "i.kind = 'credit'").replace("-amount", "-i.amount")
+            .replace("ELSE amount", "ELSE i.amount").replace("AS amount, kind, reference", "AS amount, i.kind, i.reference"))
 
 
 def _reference(kind: str | None, reference) -> str | None:

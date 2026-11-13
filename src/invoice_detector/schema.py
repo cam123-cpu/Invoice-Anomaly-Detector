@@ -58,6 +58,8 @@ CREATE TABLE IF NOT EXISTS reviews (
   rules TEXT NOT NULL,
   reviewer TEXT NOT NULL,
   reviewed_at TEXT NOT NULL,
+  approved_by TEXT,                -- second sign-off when releasing a large flagged invoice
+  approved_at TEXT,
   PRIMARY KEY (org_id, invoice_id),
   FOREIGN KEY (org_id, invoice_id) REFERENCES invoices(org_id, id)
 );
@@ -81,6 +83,17 @@ CREATE TABLE IF NOT EXISTS documents (
 -- rather than in each server's memory, so every server shares one count: five wrong
 -- passwords are five, whichever servers they landed on. Keys are hashes: no usernames or
 -- addresses are stored.
+-- Payments made (or credit notes applied). A fact about an invoice, recorded beside it:
+-- the invoice row itself is never edited. Undoing a mistaken entry deletes it (audited).
+CREATE TABLE IF NOT EXISTS payments (
+  org_id TEXT NOT NULL,
+  invoice_id TEXT NOT NULL,
+  paid_at TEXT NOT NULL,
+  paid_by TEXT NOT NULL,
+  reference TEXT CHECK (reference IS NULL OR length(reference) <= 120),
+  PRIMARY KEY (org_id, invoice_id),
+  FOREIGN KEY (org_id, invoice_id) REFERENCES invoices(org_id, id)
+);
 -- What reviewers taught the document reader: for this vendor, this field is printed next
 -- to this label. hits: a person corrected a field to the value beside it; misses: a value
 -- read from it was corrected away. Used while hits > misses.
@@ -134,6 +147,8 @@ ADDED_COLUMNS = [
     ("users", "disabled", "INTEGER NOT NULL DEFAULT 0"),
     ("invoices", "kind", "TEXT NOT NULL DEFAULT 'invoice'"),
     ("invoices", "reference", "TEXT"),
+    ("reviews", "approved_by", "TEXT"),
+    ("reviews", "approved_at", "TEXT"),
 ]
 
 # Idempotent: safe to run on every deploy.
@@ -165,13 +180,15 @@ GRANT EXECUTE ON FUNCTION app_org_id() TO invoice_app;
 
 -- Least privilege: the app cannot create companies, cannot edit or delete invoices,
 -- and cannot change or delete audit records.
-REVOKE ALL ON orgs, users, invoices, anomalies, reviews, audit_log, meta, documents, rate_limits, reading_hints
+REVOKE ALL ON orgs, users, invoices, anomalies, reviews, audit_log, meta, documents, rate_limits, reading_hints,
+  payments
   FROM PUBLIC, invoice_app;
 GRANT SELECT ON orgs TO invoice_app;
 GRANT UPDATE (approval_threshold, require_2fa, ai_extraction) ON orgs TO invoice_app;
 GRANT SELECT, INSERT ON documents TO invoice_app;  -- a record of what was imported: never edited
 GRANT SELECT, INSERT, UPDATE, DELETE ON rate_limits TO invoice_app;
 GRANT SELECT, INSERT, UPDATE ON reading_hints TO invoice_app;
+GRANT SELECT, INSERT, DELETE ON payments TO invoice_app;
 GRANT SELECT, INSERT ON users TO invoice_app;
 GRANT UPDATE (password_hash, totp_secret, totp_enabled, totp_last_step, recovery_codes, session_epoch, disabled)
   ON users TO invoice_app;
@@ -189,6 +206,7 @@ ALTER TABLE reviews   ENABLE ROW LEVEL SECURITY;
 ALTER TABLE audit_log ENABLE ROW LEVEL SECURITY;
 ALTER TABLE documents ENABLE ROW LEVEL SECURITY;
 ALTER TABLE reading_hints ENABLE ROW LEVEL SECURITY;
+ALTER TABLE payments ENABLE ROW LEVEL SECURITY;
 -- With RLS on, a row is visible or writable only if a policy allows it. With no
 -- company set, app_org_id() is NULL, nothing matches, and every table looks empty.
 
@@ -209,6 +227,9 @@ CREATE POLICY tenant_isolation ON reviews
   USING (org_id = app_org_id()) WITH CHECK (org_id = app_org_id());
 DROP POLICY IF EXISTS tenant_isolation ON documents;
 CREATE POLICY tenant_isolation ON documents
+  USING (org_id = app_org_id()) WITH CHECK (org_id = app_org_id());
+DROP POLICY IF EXISTS tenant_isolation ON payments;
+CREATE POLICY tenant_isolation ON payments
   USING (org_id = app_org_id()) WITH CHECK (org_id = app_org_id());
 DROP POLICY IF EXISTS tenant_isolation ON reading_hints;
 CREATE POLICY tenant_isolation ON reading_hints

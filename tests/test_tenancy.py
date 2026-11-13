@@ -33,6 +33,7 @@ class TenantSeedMixin:
                                                   "method": "PDF text", "totals_issue": f"{who}-issue"}], who)
             # both taught the reader about the same vendor, differently
             self.app.learn_reading(org, "acme", "amount", "total" if who == "alice" else "balance due", True)
+            self.app.mark_paid(org, ["INV-1"], who)
 
 
 class TenantIsolationTests(TenantSeedMixin, DbTestCase):
@@ -157,6 +158,7 @@ class PostgresRowLevelSecurityTests(TenantSeedMixin, DbTestCase):
             "INSERT INTO documents (org_id, sha256, filename, method, invoice_id, uploaded_by, uploaded_at) "
             "VALUES (%s, 'x', 'x', 'x', 'INV-2', 'x', 'now')",
             "INSERT INTO reading_hints (org_id, vendor, field, label, hits) VALUES (%s, 'acme', 'amount', 'x', 99)",
+            "INSERT INTO payments (org_id, invoice_id, paid_at, paid_by) VALUES (%s, 'INV-1', 'now', 'x')",
         ]
         for statement in statements:
             with self.assertRaises(self.denied, msg=statement):

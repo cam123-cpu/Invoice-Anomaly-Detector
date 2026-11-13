@@ -16,7 +16,7 @@ INDEX_KEY = secrets.token_bytes(32)
 ADMIN_URL = os.environ.get("TEST_DATABASE_ADMIN_URL")
 APP_URL = os.environ.get("TEST_DATABASE_URL")
 USING_POSTGRES = bool(ADMIN_URL and APP_URL)
-TABLES = ("orgs", "users", "invoices", "anomalies", "reviews", "audit_log", "documents", "reading_hints")  # per-company tables
+TABLES = ("orgs", "users", "invoices", "anomalies", "reviews", "audit_log", "documents", "reading_hints", "payments")  # per-company tables
 
 
 def make_settings(api_key=None):

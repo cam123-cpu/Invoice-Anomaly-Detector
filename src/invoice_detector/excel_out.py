@@ -217,13 +217,26 @@ def review_report(items: list[dict], company: str, summary: dict) -> bytes:
     return _save(wb)
 
 
-def payment_file(invoices: list[dict], queue: dict[str, dict], company: str) -> bytes:
+def payment_file(invoices: list[dict], queue: dict[str, dict], company: str,
+                 links: dict[str, tuple] | None = None) -> bytes:
     """The corrected payment batch: every invoice sorted into Ready to pay, Review first,
-    On hold and Do not pay, with totals. invoices: id, vendor, amount, invoice_date."""
+    On hold and Do not pay, with totals; invoices already paid on a sheet of their own.
+    invoices: id, vendor, amount, invoice_date (paid_at, kind optional).
+    links: {credit id: (invoice id, status)} from detection.credit_links, so a partial credit
+    is shown against the invoice it reduces."""
     groups: dict[str, list[tuple[dict, dict | None]]] = {d: [] for d in ("pay", "review", "hold", "do_not_pay")}
+    paid = [inv for inv in invoices if inv.get("paid_at")]
     for inv in invoices:
+        if inv.get("paid_at"):
+            continue
         item = queue.get(inv["id"])
         groups[decision_of(item)].append((inv, item))
+    ready = {inv["id"] for inv, _ in groups["pay"]}
+    by_id = {inv["id"]: inv for inv in invoices}
+    applied: dict[str, list[tuple[str, float]]] = {}      # invoice id -> [(credit id, amount)]
+    for credit_id, (bill_id, status) in (links or {}).items():
+        if status == "partial" and credit_id in ready and bill_id in ready:
+            applied.setdefault(bill_id, []).append((credit_id, -by_id[credit_id]["amount"]))
     totals = {d: round(sum(inv["amount"] for inv, _ in rows), 2) for d, rows in groups.items()}
 
     wb = Workbook()
@@ -246,7 +259,7 @@ def payment_file(invoices: list[dict], queue: dict[str, dict], company: str) -> 
         put(summary, r, 3, totals[d]).number_format = "#,##0.00"
         put(summary, r, 4, meaning[d], alignment=WRAP)
     put(summary, 9, 1, "Total", font=BOLD)
-    put(summary, 9, 2, len(invoices), font=BOLD)
+    put(summary, 9, 2, len(invoices) - len(paid), font=BOLD)
     put(summary, 9, 3, round(sum(totals.values()), 2), font=BOLD).number_format = "#,##0.00"
     put(summary, 11, 1, "Note", font=BOLD)
     put(summary, 11, 4, "Invoices are not changed. This file sorts them by what should happen to the payment. "
@@ -265,11 +278,20 @@ def payment_file(invoices: list[dict], queue: dict[str, dict], company: str) -> 
         headers = ["Invoice", "Type", "Vendor", "Date", "Amount", "Risk", "Flags", "What to do", "Reviewer note"]
         _header_row(ws, 1, headers, widths=[16, 12, 28, 12, 14, 8, 30, 70, 30])
         for r, (inv, item) in enumerate(rows, start=2):
+            todo = " ".join(item.get("fixes") or fix_steps(item["rules"])) if item and d != "pay" else None
+            if item and item.get("awaiting_approval"):
+                todo = f"Reviewed by {item.get('reviewer')}: needs a second person to approve in the app. " + (todo or "")
+            if d == "pay" and inv["id"] in applied:
+                credit = round(sum(a for _, a in applied[inv["id"]]), 2)
+                names = ", ".join(c for c, _ in applied[inv["id"]])
+                todo = f"Pay {inv['amount'] - credit:,.2f} after credit note {names} (-{credit:,.2f})."
+            if d == "pay" and inv.get("kind") == "credit" and (links or {}).get(inv["id"], (None, ""))[1] == "partial":
+                todo = f"Deduct from invoice {links[inv['id']][0]}."
             values = [inv["id"], "Credit note" if inv.get("kind") == "credit" else "Invoice", inv["vendor"],
                       inv["invoice_date"], inv["amount"],
                       item["risk"] if item else None,
                       ", ".join(label(x) for x in item["rules"]) if item else None,
-                      " ".join(item.get("fixes") or fix_steps(item["rules"])) if item and d != "pay" else None,
+                      todo,
                       item.get("note") if item else None]
             for c, value in enumerate(values, start=1):
                 put(ws, r, c, value, alignment=WRAP)
@@ -281,6 +303,19 @@ def payment_file(invoices: list[dict], queue: dict[str, dict], company: str) -> 
         ws.freeze_panes = "A2"
         if rows:
             ws.auto_filter.ref = f"A1:I{len(rows) + 1}"
+    if paid:
+        ws = wb.create_sheet("Already paid")
+        _header_row(ws, 1, ["Invoice", "Type", "Vendor", "Date", "Amount", "Paid"], widths=[16, 12, 28, 12, 14, 20])
+        for r, inv in enumerate(paid, start=2):
+            for c, value in enumerate([inv["id"], "Credit note" if inv.get("kind") == "credit" else "Invoice",
+                                       inv["vendor"], inv["invoice_date"], inv["amount"], inv["paid_at"][:10]],
+                                      start=1):
+                put(ws, r, c, value)
+            ws.cell(row=r, column=5).number_format = "#,##0.00"
+        put(summary, 10, 1, "Already paid", font=BOLD)
+        put(summary, 10, 2, len(paid))
+        put(summary, 10, 3, round(sum(i["amount"] for i in paid), 2)).number_format = "#,##0.00"
+        put(summary, 10, 4, "Marked paid in the app; not part of this payment run.", alignment=WRAP)
     return _save(wb)
 
 
