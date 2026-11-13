@@ -8,6 +8,9 @@ Commands are shown for Windows PowerShell. On macOS or Linux, activate the envir
 
 ---
 
+> **Windows shortcut:** right-click `setup.ps1` > *Run with PowerShell*, then `start.ps1`.
+> They do steps 1-4 below for you and work on laptops that block `pip.exe`.
+
 ## Part 1: run it on your computer
 
 ### 1. Get the code and install it
@@ -22,7 +25,7 @@ cd invoice-app\Invoice-Anomaly-Detector-main
 
 py -3.13 -m venv .venv
 .venv\Scripts\Activate.ps1
-pip install -e ".[dev]"
+python -m pip install -e ".[dev]"
 pytest
 ```
 
@@ -49,7 +52,7 @@ adds 258 made-up invoices with 14 planted problems.
 ### 3. Start the app
 
 ```powershell
-uvicorn invoice_detector.api:create_app --factory --reload
+python -m uvicorn invoice_detector.api:create_app --factory --reload
 ```
 
 Wait for `Uvicorn running on http://127.0.0.1:8000`, then open **http://127.0.0.1:8000** in your
@@ -169,6 +172,22 @@ count for less from then on.
 
 **Run detection** at the top of the queue re-checks everything, for example after you change the
 approval threshold in Settings.
+
+### 7b. Second approval and separation of duties
+
+Once your company has two or more admins or accountants (step 9), two rules apply:
+
+- You can't review an invoice you added yourself; a colleague does it.
+- Releasing a flagged invoice of 10,000 or more (change the amount in **Settings**) needs a
+  second person. After the first review it shows **Needs 2nd approval**; a colleague who
+  neither reviewed nor added it clicks **Approve**.
+
+### 7c. Mark invoices paid
+
+On **Invoices**, the *Payment* column shows each invoice's decision. When it says **Pay**,
+**Mark paid** records the payment. Paid invoices drop out of the payment file (they're listed
+on its *Already paid* sheet), and if the same invoice arrives again, the flag says the first
+one was already paid. An admin can **Undo** a payment marked by mistake.
 
 ### 8. Get the corrected payment list
 

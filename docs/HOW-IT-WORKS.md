@@ -1265,6 +1265,35 @@ it negated for display (`CASE WHEN kind = 'credit' THEN -amount ...`), so sums a
 5. The checks that learn what is normal for a vendor (amount outliers, splits, new-vendor,
    the Isolation Forest) see invoices only.
 
+### 7.y Payment controls: `controls.py`
+
+Three checks, kept out of the web layer so they read like the policy they implement:
+
+1. `check_reviewer(added_by, reviewer, reviewers)`: the person who added an invoice
+   (`invoices.created_by`) can't review it, when the company has two or more active admins
+   or accountants (`count_reviewers`). A company of one can't separate anything.
+2. `needs_second_approval(...)`: a review that releases payment (dismissed, or confirmed with
+   action *pay*) of an invoice at or above `orgs.approval_threshold` needs a second person.
+   `payment_decision()` keeps it at *review* until `reviews.approved_by` is set by
+   `POST /approve/{id}`, which `check_approver` refuses to the reviewer and to whoever added
+   it. `set_review` clears `approved_by`: an approval belongs to one decision.
+3. Payments live in their own table (`payments`, insert/delete only), because invoices are
+   never edited. `POST /payments` accepts only invoices whose decision is *pay*; the insert is
+   `ON CONFLICT DO NOTHING RETURNING`, so concurrent marks can't both win or fail. Detection
+   reads `paid_at` (`Invoice.paid`) to say a duplicate's original was paid, to turn a credit for
+   a paid invoice into a refund due, and to make a re-issue of a paid invoice high risk.
+
+### 7.z Three more rules
+
+- `duplicate_number`: `_number_key()` strips formatting (`INV-0042`, `inv 42`, `INV42` → `42`);
+  the same key twice from one vendor is the same invoice sent again.
+- `sequential_numbers`: a vendor's last invoices numbered with no gaps (all of them, at least
+  4; or the last 6). `_internal_prefix()` recognises when most numbers form one dense sequence
+  across vendors (the company's own numbering) and skips them, which removed 44 false flags
+  on the demo data.
+- `future_date`: dated more than `future_days` after `cfg.today` (the real date in the app;
+  the end of the demo period in `evaluate`, so scores don't change with the calendar).
+
 ## 8. The security model
 
 | Threat | Defence | Where |
