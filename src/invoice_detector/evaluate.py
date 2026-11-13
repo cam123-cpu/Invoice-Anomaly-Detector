@@ -13,6 +13,9 @@ labelled data before trusting any number here.
 from collections import defaultdict
 
 from .demo import generate_demo
+from dataclasses import replace
+
+from .demo import DEMO_END
 from .detection import DEFAULT_CONFIG, DetectionConfig, Invoice, detect, risk_scores
 
 
@@ -32,7 +35,9 @@ def evaluate(seeds=range(10), min_risk: int = 30, cfg: DetectionConfig = DEFAULT
 
     for seed in seeds:
         rows, injected = generate_demo(seed)
-        found = detect(to_invoices(rows), cfg)
+        # "today" is the end of the demo period, so the result doesn't depend on when it runs
+        run_cfg = cfg if cfg.today else replace(cfg, today=DEMO_END)
+        found = detect(to_invoices(rows), run_cfg)
         risks = risk_scores(found)
         invoices_total += len(rows)
 
