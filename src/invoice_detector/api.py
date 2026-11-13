@@ -681,9 +681,13 @@ def create_app(settings: Settings | None = None, db: Database | None = None,
     def list_invoices(sort: str = "invoice_date", limit: int = 50,
                       user: dict = Depends(current_user)) -> list[dict]:
         try:
-            return db.list_invoices(user["org"], sort, limit)
+            rows = db.list_invoices(user["org"], sort, limit)
         except ValueError:
             raise HTTPException(422, "Invalid sort column") from None
+        decisions = {i["invoice_id"]: i["decision"] for i in full_queue(user["org"])}
+        for row in rows:
+            row["decision"] = decisions.get(row["id"], "pay")
+        return rows
 
     @app.post("/import/preview")
     def import_preview(body: FileIn, user: dict = Depends(require("admin", "accountant"))) -> dict:
@@ -827,7 +831,12 @@ def create_app(settings: Settings | None = None, db: Database | None = None,
         money = {d: 0.0 for d in ("pay", "review", "hold", "do_not_pay")}
         counts = dict.fromkeys(money, 0)
         credits = {"count": 0, "amount": 0.0, "to_apply": 0.0}
+        paid = {"count": 0, "amount": 0.0}
         for inv in db.all_invoices(org):
+            if inv["paid_at"]:
+                paid["count"] += 1
+                paid["amount"] += inv["amount"]
+                continue       # done: not part of what is still to be decided or paid
             decision = decisions.get(inv["id"], "pay")
             money[decision] += inv["amount"]   # a credit note's amount is negative: totals are net
             counts[decision] += 1
@@ -839,6 +848,8 @@ def create_app(settings: Settings | None = None, db: Database | None = None,
         credits = {k: round(v, 2) for k, v in credits.items()}
         return {"company": db.get_org(org)["name"], "invoices": db.count_invoices(org),
                 "flagged": len(queue), **by_status, "credit_notes": credits,
+                "paid": {"count": paid["count"], "amount": round(paid["amount"], 2)},
+                "awaiting_approval": sum(bool(i.get("awaiting_approval")) for i in queue),
                 "decisions": counts, "amounts": {k: round(v, 2) for k, v in money.items()},
                 "high_risk_open": sum(i["status"] == "open" and i["risk"] >= 70 for i in queue),
                 "open_by_rule": dict(sorted(open_rules.items(), key=lambda kv: -kv[1])),

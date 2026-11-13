@@ -357,7 +357,8 @@ class ControlsApiTests(DbTestCase):
         self.client.post("/detect", headers=self.alice)
 
     def queue(self):
-        return {i["invoice_id"]: i for i in self.client.get("/review-queue", headers=self.alice).json()}
+        return {i["invoice_id"]: i for i in self.client.get("/review-queue?include_dismissed=true&limit=500",
+                                                             headers=self.alice).json()}
 
     def test_whoever_added_an_invoice_cannot_release_it(self):
         r = self.client.post("/review/D2", json={"verdict": "dismissed"}, headers=self.alice)
@@ -391,6 +392,9 @@ class ControlsApiTests(DbTestCase):
         self.assertEqual(self.client.post("/payments", json={"invoice_ids": ["NOPE"]}, headers=self.erin).status_code, 404)
         self.assertEqual(self.client.post("/payments", json={"invoice_ids": ["SMALL"]},
                                           headers=self.auth("audit1", "auditor-password-123")).status_code, 403)
+        if "D1" in self.queue():          # D1 is flagged too (large, new vendor): release it properly first
+            self.client.post("/review/D1", json={"verdict": "dismissed"}, headers=self.erin)
+            self.assertEqual(self.client.post("/approve/D1", headers=self.carol).status_code, 200)
         r = self.client.post("/payments", json={"invoice_ids": ["SMALL", "D1"], "reference": "batch 12"},
                              headers=self.erin).json()
         self.assertEqual(sorted(r["marked"]), ["D1", "SMALL"])

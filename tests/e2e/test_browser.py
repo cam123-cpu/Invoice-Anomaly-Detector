@@ -541,6 +541,48 @@ class BrowserTest(unittest.TestCase):
         p.wait_for_selector("h1:text('Dashboard')")
         self.assertEqual(self.errors, [])
 
+    def test_second_approval_and_payment(self):
+        """Separation of duties in the browser: erin releases a large flagged invoice, she
+        can't approve her own release, alice approves it, and it is marked paid."""
+        p = self.page
+        self.login("erin@acme.example")
+        p.click("nav a[href='#/review']")
+        p.click("button:text('Run detection')")
+        p.wait_for_selector("tbody tr.clickable")
+        big = p.evaluate("""async () => {
+            const r = await fetch('/review-queue', {headers: {'X-Requested-With': 'fetch'}});
+            const q = await r.json();
+            return q.find((i) => i.status === 'open' && i.amount >= 10000 && i.kind !== 'credit'
+                              && !['INV-0249', 'INV-0255'].includes(i.invoice_id)).invoice_id;
+        }""")
+        p.fill("input.search", big)
+        p.click(f"button[aria-label='Dismiss {big} as a false alarm']")
+        p.wait_for_selector(f"text={big} dismissed as a false alarm. A second person must approve it.")
+        p.click(".tabs button:text('False alarms')")
+        p.wait_for_selector(f"tr.clickable:has(td.mono:text-is('{big}')) .pill:text('Needs 2nd approval')")
+        self.assertEqual(p.locator(f"button[aria-label='Approve payment of {big}']").count(), 0)   # not her own release
+        self.shot("20-awaiting-approval")
+
+        self.context.clear_cookies()
+        self.login("alice")
+        p.click("nav a[href='#/review']")
+        p.click(".tabs button:text('False alarms')")
+        p.fill("input.search", big)
+        p.click(f"button[aria-label='Approve payment of {big}']")
+        p.wait_for_selector(f"text={big} approved for payment")
+        p.click("nav a[href='#/invoices']")
+        p.wait_for_selector("h1:text('Invoices')")
+        p.fill("input[aria-label='Search invoices']", big)
+        p.wait_for_function("document.querySelectorAll('main tbody tr').length === 1")
+        p.click(f"button[aria-label='Mark {big} paid']")
+        p.wait_for_selector(f"text={big} marked paid")
+        self.assertIn("Paid", p.inner_text(f"tr:has(td.mono:text-is('{big}')) .c-pay"))
+        self.shot("21-invoice-paid")
+        log = p.evaluate("""async () => (await (await fetch('/audit', {headers: {'X-Requested-With': 'fetch'}})).json())
+                                          .map((e) => e.action)""")
+        self.assertIn("payment_approved", log)
+        self.assertIn("invoices_paid", log)
+
     def test_security_headers(self):
         with urllib.request.urlopen(self.base + "/") as resp:
             csp = resp.headers.get("Content-Security-Policy", "")
