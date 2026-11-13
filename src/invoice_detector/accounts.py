@@ -53,6 +53,8 @@ class Accounts:
         # Counts are kept in the database, so every server shares them.
         self.login_limiter = db.limiter("login")                          # 5 wrong passwords per address + username
         self.address_limiter = db.limiter("address", max_attempts=30)     # 30 per address, any usernames (bots)
+        # 20 wrong passwords for one account in an hour, from anywhere: locked 15 minutes for all.
+        self.account_limiter = db.limiter("login-account", max_attempts=20, window=3600, lockout=900)
         self.code_limiter = db.limiter("code")
         self.reset_limiter = db.limiter("reset")                          # reset emails per address
         self.reset_account_limiter = db.limiter("reset-account", max_attempts=3, window=3600, lockout=3600)
@@ -98,12 +100,16 @@ class Accounts:
         key = f"{ip}:{username.lower()}"
         self._check_rate(self.address_limiter, ip)
         self._check_rate(self.login_limiter, key)
+        # Per address alone, a botnet gets five fresh guesses from every address it has. This
+        # second limit counts wrong passwords for the account from everywhere.
+        self._check_rate(self.account_limiter, username.lower())
         user = self.db.auth_lookup(username)
         usable = user is not None and user["password_hash"] != SSO_ONLY and not user["disabled"]
         ok = verify_password(password, user["password_hash"] if usable else DUMMY_HASH)
         if not (usable and ok):
             self.login_limiter.record_failure(key)
             self.address_limiter.record_failure(ip)
+            self.account_limiter.record_failure(username.lower())
             if user:
                 self.db.audit(user["org_id"], user["username"], "login_failed", f"from {ip}")
             raise AccountError(401, "Wrong username or password.")
