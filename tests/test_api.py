@@ -347,6 +347,24 @@ class ApiTests(DbTestCase):
         wb = load_workbook(io.BytesIO(self.client.get("/export/payment-file.xlsx", headers=admin).content))
         self.assertEqual(wb["Do not pay"].cell(2, 1).value, "D2")
 
+    def test_a_new_flag_reopens_a_dismissed_invoice(self):
+        from invoice_detector.detection import Anomaly
+        admin = self.auth("alice", PW_A)
+        batch = [self.invoice("D1", amount=500.0), self.invoice("D2", amount=500.0)]
+        self.client.post("/invoices/bulk", json=batch, headers=admin)
+        self.client.post("/detect", headers=admin)
+        self.client.post("/review/D2", json={"verdict": "dismissed"}, headers=admin)
+        listed = {row["id"]: row["decision"] for row in self.client.get("/invoices", headers=admin).json()}
+        self.assertEqual(listed["D2"], "pay")  # the same duplicate, already dismissed
+        self.app.save_flags(self.a, [Anomaly("D2", "bank_account_change", "high", "account changed")])
+        listed = {row["id"]: row["decision"] for row in self.client.get("/invoices", headers=admin).json()}
+        self.assertEqual(listed["D2"], "review")
+        paid = self.client.post("/payments", json={"invoice_ids": ["D2"]}, headers=admin)
+        self.assertEqual(paid.status_code, 409)
+        queue = {q["invoice_id"]: q for q in self.client.get("/review-queue", headers=admin).json()}
+        self.assertEqual(queue["D2"]["status"], "open")
+        self.assertIn("open again", queue["D2"]["details"][-1])
+
 
 @unittest.skipUnless(HAVE_API_DEPS, "fastapi/httpx not installed")
 class ControlsApiTests(DbTestCase):

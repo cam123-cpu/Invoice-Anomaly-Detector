@@ -450,8 +450,9 @@ def credit_links(invoices: list[Invoice]) -> dict[str, tuple[str | None, str]]:
     """What each credit note that names an invoice says about it: {credit id: (invoice id, status)}.
 
     status: "full" (cancels it), "partial" (reduces it), "missing" (no such invoice on file),
-    "other_vendor" (that invoice is another vendor's), "exceeds" (the credits for it add up
-    to more than the invoice). Credits that name no invoice aren't in the result."""
+        "other_vendor" (that invoice is another vendor's), "exceeds" (the credits for it add up
+    to more than the invoice), "ambiguous" (more than one of that vendor's invoices normalizes
+    to the reference, so none of them is linked). Credits that name no invoice aren't in the result."""
     by_number: dict[str, list[Invoice]] = defaultdict(list)
     for inv in invoices:
         if inv.kind == "invoice":
@@ -466,6 +467,8 @@ def credit_links(invoices: list[Invoice]) -> dict[str, tuple[str | None, str]]:
             links[credit.id] = (None, "missing")
         elif not same_vendor:
             links[credit.id] = (found[0].id, "other_vendor")
+        elif len(same_vendor) > 1:
+            links[credit.id] = (None, "ambiguous")
         else:
             bill = same_vendor[0]
             credited[bill.id] += _cents(credit.amount)
@@ -552,6 +555,17 @@ def find_credit_issues(invoices: list[Invoice], matched: dict[str, str]) -> list
         if credit.id in matched:
             continue
         link = links.get(credit.id)
+        if link and link[1] == "ambiguous":
+            out.append(Anomaly(credit.id, "unmatched_credit", "medium",
+                               f"refers to {credit.reference}, which matches more than one invoice "
+                               "from this vendor"))
+            for bill in invoices:
+                if (bill.kind == "invoice" and _vendor_key(bill.vendor) == _vendor_key(credit.vendor)
+                        and _ref_key(bill.id) == _ref_key(credit.reference)):
+                    out.append(Anomaly(bill.id, "unmatched_credit", "medium",
+                                       f"credit note {credit.id} names a number that also matches "
+                                       "another invoice, so this one is not cancelled"))
+            continue
         if link and link[1] != "partial":
             bill_id, status = link
             detail = {"missing": f"refers to invoice {credit.reference}, which isn't on file",
