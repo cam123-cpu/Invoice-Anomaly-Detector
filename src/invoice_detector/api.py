@@ -767,7 +767,7 @@ def create_app(settings: Settings | None = None, db: Database | None = None,
         if body.run_detection and added:
             detection = run_detection_for(user)
             new_ids = {inv["id"] for inv in result.invoices} - set(existing)
-            detection["flagged_from_file"] = len({a["invoice_id"] for a in db.list_anomalies(user["org"], 5000)
+            detection["flagged_from_file"] = len({a["invoice_id"] for a in db.list_anomalies(user["org"], None)
                                                   if a["invoice_id"] in new_ids})
         stored = set(existing)
         return {"added": added, "already_stored": len(existing), "blank_rows": result.blank_rows,
@@ -812,7 +812,7 @@ def create_app(settings: Settings | None = None, db: Database | None = None,
 
     def full_queue(org: str) -> list[dict]:
         """Ranked flags with review status, payment decision and next steps."""
-        ranked = review_queue([Anomaly(**a) for a in db.list_anomalies(org, 5000)], weights_for(org))
+        ranked = review_queue([Anomaly(**a) for a in db.list_anomalies(org, None)], weights_for(org))
         reviews = db.review_details(org)
         invoices = {i["id"]: i for i in db.all_invoices(org)}
         threshold = db.get_org(org)["approval_threshold"]

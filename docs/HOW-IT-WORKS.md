@@ -1103,7 +1103,7 @@ magic numbers scattered through the code, and the approval threshold is overridd
 
 | Rule | How it works | Data structure / technique | Weight |
 |---|---|---|---|
-| `duplicate` | Same vendor + amount + date as an earlier invoice | Hash map keyed by the tuple `(vendor, amount, date)`; one pass after sorting by date | 0.80 |
+| `duplicate` | Same vendor (case and spacing ignored) + amount to the cent + date as an earlier invoice | Hash map keyed by `(vendor key, cents, date)`; one pass after sorting by date | 0.80 |
 | `bank_account_change` | Established vendor (3+ invoices) paid to an account it has never used | Per-vendor `Counter` of blind indexes, walked in date order | 0.80 |
 | `shared_bank_account` | One account used by two or more vendors; flags the minority vendor | Nested `defaultdict`: account → vendor → invoices | 0.70 |
 | `amount_outlier` | Far above this vendor's history | Robust z-score on log amounts (below) | 0.55, or 0.75 if extreme |
@@ -1201,15 +1201,15 @@ When reviewers confirm or dismiss flags, `learned_weights` adjusts each rule's w
 company:
 
 ```
-new weight = base weight × (confirmed + 5) / (confirmed + dismissed + 5)
+new weight = min(0.95, max(floor, base × (2 × confirmed + 5) / (confirmed + dismissed + 5)))
 ```
 
-- With no reviews, the factor is 5/5 = 1, and nothing changes.
-- A rule dismissed 40 times and never confirmed: factor 5/45 ≈ 0.11, so it fades.
-- The **+5** is a **prior** (a pseudo-count, like assuming 5 confirmations before seeing data). It
-  stops one or two reviews from swinging the weight wildly. This is the same idea as
-  **Laplace / Bayesian smoothing**.
-- A floor of 0.05 means a rule is never silenced completely.
+- With no reviews, the factor is 1, and nothing changes.
+- Confirmed as often as dismissed: the factor is 1, and the weight stays.
+- A rule confirmed far more often than it is dismissed rises, up to 0.95.
+- A rule dismissed 40 times and never confirmed fades. Weekend and round-amount rules fall
+  to 0.05. Duplicate, bank-account and full-credit rules stop at half their starting weight.
+- The **+5** is a **prior**. It stops one or two reviews from swinging the weight wildly.
 
 Weights are **recomputed from stored decisions every time**, never edited in place. The reviews
 table is the single source of truth, so the system can always explain *why* a weight is what it
@@ -1219,11 +1219,11 @@ is.
 
 `evaluate.py` runs everything on 10 synthetic datasets with known planted anomalies and reports:
 
-- **Precision:** of the invoices flagged (risk ≥ 30), how many were really planted? **96.9%**
-- **Recall:** of the planted invoices, how many were flagged? **87.9%** (the misses are invoices
+- **Precision:** of the invoices flagged (risk ≥ 30), how many were really planted? **96.6%**
+- **Recall:** of the planted invoices, how many were flagged? **93.3%** (the misses are invoices
   whose only signal is a weak one, such as a round amount, which score below 30 by design)
 - **Top-k hit rate:** if you review only as many invoices as were planted, taken from the top of
-  the queue, how many are real? **97.1%**
+  the queue, how many are real? **96.7%**
 - **Per-rule recall:** 100% for every kind of planted problem.
 
 There is a **trade-off** between precision and recall: lower the cut-off and you catch more but

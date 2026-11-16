@@ -2,7 +2,7 @@ import unittest
 
 from invoice_detector.demo import generate_demo
 from invoice_detector.detection import (DEFAULT_CONFIG, DetectionConfig, Invoice, detect, find_amount_outliers,
-                                        find_bank_account_changes, find_ml_outliers,
+                                        find_bank_account_changes, find_duplicates, find_ml_outliers,
                                         find_near_duplicates, find_similar_vendor_names,
                                         find_split_invoices, learned_weights, match_credits, review_queue,
                                         risk_scores, RULE_WEIGHT)
@@ -99,10 +99,49 @@ class RuleTests(unittest.TestCase):
         noisy = learned_weights({"weekend_invoice": (0, 40), "duplicate": (30, 0), "made_up": (1, 1)})
         self.assertLessEqual(noisy["weekend_invoice"], RULE_WEIGHT["weekend_invoice"] / 2)
         self.assertGreaterEqual(noisy["weekend_invoice"], 0.05)  # never silenced completely
-        self.assertEqual(noisy["duplicate"], RULE_WEIGHT["duplicate"])  # confirmations keep it
+        self.assertEqual(noisy["duplicate"], 0.95)  # consistent confirms raise it, up to the cap
         self.assertNotIn("made_up", noisy)
         few = learned_weights({"near_duplicate": (0, 1)})  # one dismissal barely moves it
         self.assertGreater(few["near_duplicate"], RULE_WEIGHT["near_duplicate"] * 0.8)
+        tied = learned_weights({"duplicate": (20, 20)})  # a coin flip stays at the base weight
+        self.assertEqual(tied["duplicate"], RULE_WEIGHT["duplicate"])
+        silenced = learned_weights({"duplicate": (0, 500)})
+        self.assertGreaterEqual(silenced["duplicate"], 0.40)  # a policy rule cannot be switched off
+
+    def test_money_matches_in_cents_and_vendor_case_does_not_split_history(self):
+        dust = 100007 / 100 + 333 / 100          # 1003.4000000000001
+        exact = 100340 / 100                     # 1003.4
+        pair = [inv(1, amount=exact, date="2026-03-02"), inv(2, amount=dust, date="2026-03-02")]
+        self.assertEqual([a.invoice_id for a in find_duplicates(pair)], ["2"])
+        later = [inv(1, amount=exact, date="2026-03-02"), inv(2, amount=dust, date="2026-03-06")]
+        self.assertEqual([a.rule for a in find_near_duplicates(later)], ["near_duplicate"])
+        from invoice_detector.detection import find_round_amounts
+        self.assertEqual([a.invoice_id for a in find_round_amounts([inv(1, amount=(13 * 1000.1) - (13 * 0.1))])],
+                         ["1"])
+        self.assertEqual(find_round_amounts([inv(1, amount=13000.50), inv(2, amount=999.00)]), [])
+        case = [inv(1, vendor="Acme Supplies", amount=480.0, date="2026-01-06"),
+                inv(2, vendor="ACME  SUPPLIES", amount=480.0, date="2026-01-06")]
+        fired = {}
+        for a in detect(case):
+            fired.setdefault(a.invoice_id, set()).add(a.rule)
+        self.assertEqual(fired.get("2"), {"duplicate"})
+        self.assertNotIn("1", fired)
+        lookalike = case + [inv("x", vendor="Acme Suppiles", amount=495.60, date="2026-01-08")]
+        names = {a.invoice_id for a in find_similar_vendor_names(lookalike)}
+        self.assertEqual(names, {"x"})
+
+    def test_one_scheme_counts_once_in_the_risk_score(self):
+        from invoice_detector.detection import Anomaly
+        resubmit = [Anomaly("INV1001", "duplicate", "high", ""),
+                    Anomaly("INV1001", "duplicate_number", "high", "")]
+        self.assertEqual(risk_scores(resubmit)["INV1001"], 80)
+        both = resubmit + [Anomaly("INV1001", "round_amount", "low", "")]
+        self.assertGreater(risk_scores(both)["INV1001"], 80)
+        bank = [Anomaly("W", "bank_account_change", "high", ""),
+                Anomaly("W", "shared_bank_account", "high", "")]
+        self.assertEqual(risk_scores(bank)["W"], 80)
+        odd = [Anomaly("U", "amount_outlier", "high", ""), Anomaly("U", "ml_outlier", "medium", "")]
+        self.assertEqual(risk_scores(odd)["U"], 75)
 
     def test_learned_weights_reorder_the_queue(self):
         found = detect([inv(1, amount=5000.0, date="2026-01-05"), inv(2, amount=5000.0, date="2026-01-05"),

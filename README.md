@@ -46,9 +46,14 @@ signals add up, but they never outrank one strong signal. Thresholds live in `De
 (`src/invoice_detector/detection.py`); the approval threshold is a per-company setting.
 
 **Learning from reviewers:** when staff mark flagged invoices as confirmed or dismissed, each
-rule's weight for that company is multiplied by `(confirmed + 5) / (confirmed + dismissed + 5)`.
-Rules that keep raising false alarms fade, and `GET /metrics` reports the measured precision
-per rule. This re-weights the rules; it does not retrain the Isolation Forest.
+rule's weight for that company is multiplied by `(2 × confirmed + 5) / (confirmed + dismissed + 5)`,
+then capped at 0.95. A rule that is confirmed about as often as it is dismissed stays put, and
+a rule that keeps raising false alarms fades. Duplicate, bank-account and full-credit rules
+cannot fall below half their starting weight, so a noisy queue cannot switch those controls
+off. `GET /metrics` reports the measured precision per rule. This re-weights the rules; it
+does not retrain the Isolation Forest. One review is copied onto every rule that fired on
+that invoice, so a real duplicate confirmed next to a weekend date also counts as a weekend
+confirmation.
 
 ## Credit notes
 
@@ -162,17 +167,24 @@ risk cut-off of 30:
 
 | Metric | Result |
 |---|---|
-| Precision | 98.5% |
-| Recall | 92.9% |
-| Top-k hit rate | 98.6% |
+| Precision | 96.6% |
+| Recall | 93.3% |
+| Top-k hit rate | 96.7% |
 | Per-rule recall | 100% for all eighteen planted rules |
 
-The missed 12% are invoices whose only signal is a low-weight one (a round amount or a weekend
-date), which score below the cut-off by design.
+The misses are invoices whose only signal is a low-weight one (a round amount or a weekend
+date), which score below the cut-off by design. One scheme now counts once, so a bank-account
+change that is also a shared account scores 80 rather than 94, and the headline precision is
+a little lower than a version that double-counted those rules.
 
-**These numbers are an upper bound.** The anomalies were injected by the same code base that
-detects them, and real invoices are messier. Measure on your own labelled data before trusting
-any figure here.
+**These numbers are an upper bound, and a generous one.** The anomalies were injected by the
+same code that detects them. Clean rows are forced onto weekdays, and a round thousand in the
+clean data is nudged by 0.37 so it cannot flag. On one messy ledger of 31 invoices
+(`cli evaluate-adversarial`: a round retainer, a Saturday vendor, a weekly fixed fee, a second
+copy off by float dust, and the same vendor in two capitalizations) precision at the same
+cut-off is **37.5%**. The float-dust copy and the second capitalization are caught. The weekly
+fee is flagged as a near-duplicate, which is what pulls the precision down. Measure on your own
+labelled data before trusting either figure.
 
 ## Payment controls
 

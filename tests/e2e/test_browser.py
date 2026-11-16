@@ -196,8 +196,8 @@ class BrowserTest(unittest.TestCase):
         p.wait_for_selector("td.mono:text('INV-0249')")
         self.shot("03-review-queue")
         first_id = p.inner_text("tbody tr.clickable >> nth=0 >> td.mono")
-        self.assertEqual(first_id, "INV-0249")  # highest risk first
-        p.click("tbody tr.clickable >> nth=0")
+        self.assertEqual(first_id, "INV-0245")  # a duplicate; one scheme counts once
+        p.click("tr.clickable:has(td.mono:text-is('INV-0249'))")
         p.wait_for_selector("tr.details:not(.hidden) li")
         open_before = int(p.inner_text(".tabs button.on").split("(")[1].rstrip(")"))
         p.click("button[aria-label='Confirm INV-0249 is a problem']")
@@ -282,7 +282,7 @@ class BrowserTest(unittest.TestCase):
             p.click("button:text('Download Excel')")
         report = xlsx(dl.value.path())["Review queue"]
         self.assertEqual([c.value for c in report[1]][:3], ["Risk", "Invoice", "Vendor"])
-        self.assertEqual(report.cell(2, 2).value, "INV-0249")  # highest risk first
+        self.assertEqual(report.cell(2, 2).value, "INV-0245")  # highest risk first
         p.fill("input[type=search]", "Q1-")
         p.wait_for_selector("td.mono:text-is('Q1-005')")
         self.assertIn("Duplicate", p.inner_text("tr:has(td.mono:text-is('Q1-005'))"))

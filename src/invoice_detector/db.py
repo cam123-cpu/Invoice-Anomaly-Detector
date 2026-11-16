@@ -510,12 +510,20 @@ class Database:
                     "VALUES (?, ?, ?, ?, ?) ON CONFLICT DO NOTHING",
                     (org_id, a.invoice_id, a.rule, a.severity, a.detail))
 
-    def list_anomalies(self, org_id: str, limit: int = 200) -> list[dict]:
-        limit = max(1, min(int(limit), 5000))
+    def list_anomalies(self, org_id: str, limit: int | None = 200) -> list[dict]:
+        """Flags for this company, highest severity first.
+
+        The public list is capped. Pass limit=None for the review queue and the
+        payment file: a silent cap there drops flags and the missing invoices
+        look ready to pay."""
+        sql = ("SELECT invoice_id, rule, severity, detail FROM anomalies WHERE org_id = ? "
+               "ORDER BY CASE severity WHEN 'high' THEN 0 WHEN 'medium' THEN 1 ELSE 2 END, "
+               "invoice_id, rule")
         with self._tx(org_id) as run:
-            return run("SELECT invoice_id, rule, severity, detail FROM anomalies WHERE org_id = ? "
-                       "ORDER BY CASE severity WHEN 'high' THEN 0 WHEN 'medium' THEN 1 ELSE 2 END, "
-                       "invoice_id, rule LIMIT ?", (org_id, limit))
+            if limit is None:
+                return run(sql, (org_id,))
+            limit = max(1, min(int(limit), 5000))
+            return run(sql + " LIMIT ?", (org_id, limit))
 
     # ----- reviewer feedback -----
     def set_review(self, org_id: str, invoice_id: str, verdict: str, reviewer: str,
