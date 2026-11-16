@@ -124,6 +124,10 @@ class ApiTests(DbTestCase):
         self.client.post("/review/INV-3", json={"verdict": "dismissed"}, headers=admin)
         self.assertEqual(self.client.post("/review/INV-3", json={"verdict": "maybe"}, headers=admin).status_code, 422)
         self.assertEqual(self.client.post("/review/NOPE", json={"verdict": "confirmed"}, headers=admin).status_code, 404)
+        # "because" must name a flag that fired on that invoice, in the rule-name format
+        for because in ("not_a_rule_that_fired", "Robert'); DROP", "x" * 41):
+            r = self.client.post("/review/INV-3", json={"verdict": "dismissed", "because": because}, headers=admin)
+            self.assertEqual(r.status_code, 422, because)
 
         queue = self.client.get("/review-queue", headers=admin).json()
         self.assertEqual([(q["invoice_id"], q["status"]) for q in queue], [("INV-2", "confirmed")])

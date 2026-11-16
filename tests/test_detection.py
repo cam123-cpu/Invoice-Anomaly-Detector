@@ -338,3 +338,37 @@ class NumberingAndDateTests(unittest.TestCase):
         found = self.rules([inv("F1", "V", 100.0, "2026-07-20"), inv("F2", "V", 101.0, "2026-07-03")])
         self.assertEqual(found.get("F1"), {"future_date"})
         self.assertNotIn("F2", found)                                # within the 7-day allowance
+
+
+class ReopeningTests(unittest.TestCase):
+    def test_only_a_new_serious_flag_reopens_a_review(self):
+        from invoice_detector.decisions import reopened_by
+        self.assertEqual(reopened_by({"amount_outlier"}, {"amount_outlier", "duplicate"}), {"duplicate"})
+        self.assertEqual(reopened_by({"duplicate", "weekend_invoice"}, {"duplicate"}), set())     # one went away
+        self.assertEqual(reopened_by({"amount_outlier"}, {"amount_outlier", "ml_outlier"}), set())  # model refits
+        self.assertEqual(reopened_by({"bank_account_change"}, {"weekend_invoice", "round_amount"}), set())
+        self.assertEqual(reopened_by(set(), {"bank_account_change"}), {"bank_account_change"})
+
+
+class VendorRoutineTests(unittest.TestCase):
+    def test_a_weekly_fee_is_not_a_near_duplicate_but_an_extra_copy_is(self):
+        from invoice_detector.detection import find_near_duplicates
+        weekly = [inv(f"RT-{k}", "RetainCo", 1500.0, f"2026-01-{5 + 7 * k:02d}") for k in range(4)]
+        self.assertEqual(find_near_duplicates(weekly), [])
+        extra = weekly + [inv("RT-X", "RetainCo", 1500.0, "2026-01-21")]          # two days after the 19th
+        self.assertEqual([a.invoice_id for a in find_near_duplicates(extra)], ["RT-X"])
+        # Three weekly invoices aren't a schedule yet: a new weekly vendor is flagged until its
+        # fourth invoice shows the pattern.
+        self.assertEqual([a.invoice_id for a in find_near_duplicates(weekly[:3])], ["RT-1", "RT-2"])
+
+    def test_round_and_weekend_are_quiet_only_for_vendors_who_always_do_it(self):
+        from invoice_detector.detection import find_round_amounts, find_weekend_invoices
+        roundco = [inv(f"R{k}", "RoundCo", 5000.0, f"2026-0{k + 1}-05") for k in range(5)]
+        once = [inv(f"O{k}", "Other", 410.0 + k, f"2026-0{k + 1}-06") for k in range(4)] + \
+            [inv("O9", "Other", 7000.0, "2026-06-08")]
+        self.assertEqual([a.invoice_id for a in find_round_amounts(roundco + once)], ["O9"])
+        saturdays = [inv(f"S{k}", "SatCo", 640.0 + k, d) for k, d in enumerate(
+            ["2026-01-10", "2026-01-24", "2026-02-07", "2026-02-21"])]
+        weekday = [inv(f"W{k}", "WeekCo", 300.0 + k, f"2026-01-{5 + k:02d}") for k in range(4)] + \
+            [inv("W9", "WeekCo", 305.0, "2026-01-17")]
+        self.assertEqual([a.invoice_id for a in find_weekend_invoices(saturdays + weekday)], ["W9"])

@@ -750,7 +750,7 @@ async function reviewView() {
       e.stopPropagation();
       e.currentTarget.disabled = true;
       try {
-        await send(item, { verdict, note: item.note || undefined }, (it) => (verdict === "confirmed"
+        await send(item, { verdict, note: item.note || undefined, because: about && about.value ? about.value : undefined }, (it) => (verdict === "confirmed"
           ? `${it.invoice_id} confirmed: ${DECISIONS[it.decision][0].toLowerCase()}`
           : `${it.invoice_id} dismissed as a false alarm`) + (it.awaiting_approval ? ". A second person must approve it." : ""));
       } catch (err) {
@@ -758,8 +758,13 @@ async function reviewView() {
         e.currentTarget.disabled = false;
       }
     };
+    // With several flags, say which one the decision is about, so learning adjusts that rule only.
+    const about = item.status === "open" && (item.rules || []).length > 1
+      ? h("select", { class: "small", "aria-label": `Which flag the decision on ${item.invoice_id} is about`, onclick: (e) => e.stopPropagation() },
+        h("option", { value: "" }, "About: strongest flag"), ...item.rules.map((r) => h("option", { value: r }, "About: " + ruleLabel(r))))
+      : null;
     if (item.status === "open") {
-      return h("div", { class: "row" },
+      return h("div", { class: "row" }, about,
         h("button", { class: "btn sm danger", onclick: decide("confirmed"), "aria-label": `Confirm ${item.invoice_id} is a problem`,
           title: `Confirming marks it: ${DECISIONS[item.suggested_action][0]}` }, "Confirm"),
         h("button", { class: "btn sm", onclick: decide("dismissed"), "aria-label": `Dismiss ${item.invoice_id} as a false alarm` }, "Dismiss"));

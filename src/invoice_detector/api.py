@@ -25,7 +25,7 @@ from .db import Conflict, Database
 from .detection import (DEFAULT_CONFIG, RULE_WEIGHT, Anomaly, credit_links, detect, learned_weights,
                         review_queue)
 from .controls import ControlError, check_approver, check_reviewer, needs_second_approval
-from .decisions import fix_steps, payment_decision, suggested_action
+from .decisions import fix_steps, payment_decision, reopened_by, suggested_action
 from .excel_out import XLSX, annotate, payment_file, review_report
 from .explain import explain
 from .importer import FIELDS, ID_PATTERN, FileProblem, convert, preview, read_table
@@ -151,6 +151,8 @@ class ReviewIn(StrictModel):
     # What happens to the payment. Leave out to use the suggestion (e.g. "do_not_pay" for a duplicate).
     action: Literal["pay", "hold", "do_not_pay"] | None = None
     note: str | None = Field(default=None, max_length=500)
+    # Which flag the decision is about (default: the strongest). Learning counts only this one.
+    because: str | None = Field(default=None, max_length=40, pattern=r"^[a-z_]+$")
 
 
 class PaymentsIn(StrictModel):
@@ -841,9 +843,10 @@ def create_app(settings: Settings | None = None, db: Database | None = None,
         for item in ranked:
             review = reviews.get(item["invoice_id"], {})
             stored = {r for r in (review.get("rules") or "").split(",") if r}
-            if review and stored != set(item.get("rules") or []):
+            new = reopened_by(stored, set(item.get("rules") or [])) if review else set()
+            if new:
                 item["details"] = list(item.get("details") or []) + [
-                    "The flags changed since this invoice was reviewed, so it is open again."]
+                    f"New since it was reviewed: {', '.join(sorted(new))}. It is open again."]
                 review = {}
             inv = invoices.get(item["invoice_id"], {})
             item["status"] = review.get("verdict", "open")
@@ -913,12 +916,15 @@ def create_app(settings: Settings | None = None, db: Database | None = None,
             raise HTTPException(404, "No flags on that invoice")
         try:
             check_reviewer(facts["created_by"], user["sub"], db.count_reviewers(org))
-            action = db.set_review(org, invoice_id, body.verdict, user["sub"], body.action, body.note)
+            action = db.set_review(org, invoice_id, body.verdict, user["sub"], body.action, body.note, body.because)
         except ControlError as exc:
             raise HTTPException(exc.status, exc.message) from None
         except KeyError:
             raise HTTPException(404, "No flags on that invoice") from None
-        db.audit(org, user["sub"], "invoice_reviewed", f"{invoice_id}: {body.verdict}, {action}")
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from None
+        db.audit(org, user["sub"], "invoice_reviewed", f"{invoice_id}: {body.verdict}, {action}"
+                 + (f" (about {body.because})" if body.because else ""))
         item = next((i for i in full_queue(org) if i["invoice_id"] == invoice_id), {})
         return {"invoice_id": invoice_id, "status": body.verdict, "action": action,
                 "decision": item.get("decision", action), "awaiting_approval": item.get("awaiting_approval", False)}

@@ -87,9 +87,9 @@ def format_report(result: dict) -> str:
     return "\n".join(lines)
 
 
-def _messy_row(inv_id, vendor, amount, when, rules=None):
+def _messy_row(inv_id, vendor, amount, when, rules=None, bank=None):
     return {"id": inv_id, "vendor": vendor, "amount": amount, "date": when,
-            "bank_account": "BANK-" + vendor[:12], "kind": "invoice", "rules": rules or set()}
+            "bank_account": bank or "BANK-" + vendor[:12], "kind": "invoice", "rules": rules or set()}
 
 
 def evaluate_adversarial(min_risk: int = 30) -> dict:
@@ -123,6 +123,14 @@ def evaluate_adversarial(min_risk: int = 30) -> dict:
     rows.append(_messy_row("AC-1", "Acme Supplies", 480.00, "2026-01-06"))
     rows.append(_messy_row("AC-2", "ACME  SUPPLIES", 480.00, "2026-01-06", {"duplicate"}))
     rows.append(_messy_row("AC-3", "Acme Suppiles", 495.60, "2026-01-08", {"similar_vendor_name"}))
+    # Traps for any fix that quiets the habits above. Each is a real problem hiding inside
+    # a vendor's routine, so suppressing "what this vendor usually does" must not hide it.
+    # An extra retainer two days after a regular one: off the vendor's weekly rhythm.
+    rows.append(_messy_row("RT-EXTRA", "RetainCo", 1500.00, "2026-02-04", {"near_duplicate"}))
+    # The round-number vendor, same bill twice on one day.
+    rows.append(_messy_row("RC-DUP", "RoundCo", 5000.00, "2026-03-02", {"duplicate"}))
+    # The Saturday vendor, suddenly paid to a different bank account.
+    rows.append(_messy_row("SC-BANK", "SatCo", 671.00, "2026-05-02", {"bank_account_change"}, bank="BANK-ELSEWHERE"))
 
     expected = {r["id"]: set(r["rules"]) for r in rows}
     found = detect(to_invoices(rows), replace(DEFAULT_CONFIG, today="2026-06-01", use_ml=False))

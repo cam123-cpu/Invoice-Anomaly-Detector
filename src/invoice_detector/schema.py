@@ -58,6 +58,7 @@ CREATE TABLE IF NOT EXISTS reviews (
   rules TEXT NOT NULL,
   reviewer TEXT NOT NULL,
   reviewed_at TEXT NOT NULL,
+  deciding_rule TEXT,              -- the rule the decision was about (what learning counts)
   approved_by TEXT,                -- second sign-off when releasing a large flagged invoice
   approved_at TEXT,
   PRIMARY KEY (org_id, invoice_id),
@@ -147,6 +148,7 @@ ADDED_COLUMNS = [
     ("users", "disabled", "INTEGER NOT NULL DEFAULT 0"),
     ("invoices", "kind", "TEXT NOT NULL DEFAULT 'invoice'"),
     ("invoices", "reference", "TEXT"),
+    ("reviews", "deciding_rule", "TEXT"),
     ("reviews", "approved_by", "TEXT"),
     ("reviews", "approved_at", "TEXT"),
 ]

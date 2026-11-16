@@ -169,11 +169,49 @@ def find_near_duplicates(invoices: list[Invoice], cfg: DetectionConfig = DEFAULT
         groups[(_vendor_key(inv.vendor), _cents(inv.amount))].append(inv)
     out = []
     for group in groups.values():
+        rhythm = _rhythm(group)
+        anchor = group[0]          # the last invoice that was on the vendor's schedule
         for prev, cur in zip(group, group[1:]):
+            if rhythm and abs((_day(cur) - _day(anchor)).days - rhythm) <= 1:
+                anchor = cur       # the weekly fee arriving when it always does
+                continue
             gap = (_day(cur) - _day(prev)).days
             if 0 < gap <= cfg.near_duplicate_days:
                 out.append(Anomaly(cur.id, "near_duplicate", "medium",
                                    f"same vendor and amount as {prev.id}, {gap} day(s) later{_paid_note(prev)}"))
+    return out
+
+
+def _rhythm(group: list[Invoice]) -> int | None:
+    """The interval, in days, at which a vendor bills the same amount, if it has one.
+
+    A weekly fee lands on a calendar grid: first date + 7, 14, 21... days (within a day).
+    If at least 4 invoices, and 60% of them, sit on one grid, that is the vendor's schedule.
+    Measured on the grid rather than between neighbours, so an extra copy sent off the
+    schedule doesn't hide the schedule, and is itself still a near duplicate."""
+    if len(group) < 4:
+        return None
+    start = _day(group[0])
+    offsets = [(_day(i) - start).days for i in group]
+    best, best_score, best_hits = None, 0.0, 0
+    for period in sorted({b - a for a, b in zip(offsets, offsets[1:]) if b - a >= 5}):   # +-1 day means nothing below weekly
+        misses = [min(o % period, period - o % period) for o in offsets]
+        hits = sum(1 for m in misses if m <= 1)
+        score = sum(1.0 if m == 0 else 0.5 for m in misses if m <= 1)      # on the day counts double
+        if score > best_score:
+            best, best_score, best_hits = period, score, hits
+    if best and best_hits >= 4 and best_hits >= 0.6 * len(group):
+        return best
+    return None
+
+
+def _habit(invoices: list[Invoice], test, min_count: int = 4, share: float = 0.6) -> set[str]:
+    """Vendors for whom something unusual in general is simply how they work: at least
+    `min_count` invoices, and `share` of them have it (round amounts, weekend dates)."""
+    out = set()
+    for key, group in _by_vendor(invoices).items():
+        if len(group) >= min_count and sum(1 for i in group if test(i)) >= share * len(group):
+            out.add(key)
     return out
 
 
@@ -361,9 +399,17 @@ def find_new_vendor_large(invoices: list[Invoice], cfg: DetectionConfig = DEFAUL
     return out
 
 
+def _is_round(inv: Invoice) -> bool:
+    cents = _cents(inv.amount)
+    return cents >= 100_000 and cents % 100_000 == 0
+
+
 def find_round_amounts(invoices: list[Invoice]) -> list[Anomaly]:
+    """A round thousand is a weak sign of a made-up amount, except from a vendor that always
+    bills round amounts (a fixed retainer): then it is just their price."""
+    usual = _habit(invoices, _is_round)
     return [Anomaly(i.id, "round_amount", "low", f"suspiciously round amount {i.amount:,.2f}")
-            for i in invoices if (cents := _cents(i.amount)) >= 100_000 and cents % 100_000 == 0]
+            for i in invoices if _is_round(i) and _vendor_key(i.vendor) not in usual]
 
 
 def find_totals_mismatch(invoices: list[Invoice]) -> list[Anomaly]:
@@ -374,8 +420,11 @@ def find_totals_mismatch(invoices: list[Invoice]) -> list[Anomaly]:
 
 
 def find_weekend_invoices(invoices: list[Invoice]) -> list[Anomaly]:
+    """A weekend date is a weak sign, except from a vendor that usually invoices then."""
+    weekend = lambda i: _day(i).weekday() >= 5   # noqa: E731
+    usual = _habit(invoices, weekend)
     return [Anomaly(i.id, "weekend_invoice", "low", f"dated on a weekend ({i.date})")
-            for i in invoices if _day(i).weekday() >= 5]
+            for i in invoices if weekend(i) and _vendor_key(i.vendor) not in usual]
 
 
 # ---------------------------------------------------------------- machine learning
@@ -450,7 +499,7 @@ def credit_links(invoices: list[Invoice]) -> dict[str, tuple[str | None, str]]:
     """What each credit note that names an invoice says about it: {credit id: (invoice id, status)}.
 
     status: "full" (cancels it), "partial" (reduces it), "missing" (no such invoice on file),
-        "other_vendor" (that invoice is another vendor's), "exceeds" (the credits for it add up
+    "other_vendor" (that invoice is another vendor's), "exceeds" (the credits for it add up
     to more than the invoice), "ambiguous" (more than one of that vendor's invoices normalizes
     to the reference, so none of them is linked). Credits that name no invoice aren't in the result."""
     by_number: dict[str, list[Invoice]] = defaultdict(list)

@@ -81,8 +81,14 @@ class DatabaseTests(DbTestCase):
         self.app.set_review(self.a, "A2", "confirmed", "alice")
         self.app.set_review(self.a, "A2", "dismissed", "alice")  # changing your mind overwrites
         self.assertEqual(self.app.list_reviews(self.a), {"A1": "confirmed", "A2": "dismissed"})
+        # A1's confirmation is about the duplicate (its strongest flag), not the round amount beside it
         self.assertEqual(self.app.feedback_counts(self.a),
-                         {"duplicate": (1, 0), "round_amount": (1, 1)})
+                         {"duplicate": (1, 0), "round_amount": (0, 1)})
+        # The reviewer can say which flag the decision is about
+        self.app.set_review(self.a, "A1", "dismissed", "alice", because="round_amount")
+        self.assertEqual(self.app.feedback_counts(self.a), {"round_amount": (0, 2)})
+        with self.assertRaises(ValueError):          # a flag that didn't fire on this invoice
+            self.app.set_review(self.a, "A2", "dismissed", "alice", because="duplicate")
         with self.assertRaises(KeyError):
             self.app.set_review(self.a, "not-flagged", "confirmed", "alice")
         with self.assertRaises(ValueError):

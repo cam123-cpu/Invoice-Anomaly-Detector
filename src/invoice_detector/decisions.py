@@ -98,6 +98,24 @@ def fix_steps(rules: list[str]) -> list[str]:
     return steps
 
 
+# Rules whose arrival alone doesn't reopen a reviewed invoice: the model refits on every
+# run, so its flag comes and goes without anything changing; weekend and round-amount are
+# too weak to undo a person's decision.
+_DOES_NOT_REOPEN = frozenset({"ml_outlier", "weekend_invoice", "round_amount"})
+
+
+def deciding_rule(rules: list[str]) -> str | None:
+    """The rule a review is about when the reviewer doesn't say: the strongest one that fired."""
+    from .detection import RULE_WEIGHT
+    return max(rules, key=lambda r: (RULE_WEIGHT.get(r, 0), r)) if rules else None
+
+
+def reopened_by(reviewed: set[str], current: set[str]) -> set[str]:
+    """The new reasons, if any, that undo an earlier review. A flag that went away never
+    reopens a decision; a new serious one (a duplicate, a bank change) always does."""
+    return set(current) - set(reviewed) - _DOES_NOT_REOPEN
+
+
 def payment_decision(item: dict | None) -> str:
     """Decision for one invoice, given its review-queue item (None if it has no flags).
 

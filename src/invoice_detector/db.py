@@ -22,7 +22,7 @@ from datetime import datetime, timezone
 from .config import Settings
 from .crypto import Vault
 from .detection import Anomaly, Invoice
-from .decisions import ACTIONS, suggested_action
+from .decisions import ACTIONS, deciding_rule, suggested_action
 from .schema import ADDED_COLUMNS, POSTGRES_SECURITY, POSTGRES_TABLES, SQLITE_SCHEMA
 from .security import RateLimitError, hash_password
 
@@ -527,7 +527,7 @@ class Database:
 
     # ----- reviewer feedback -----
     def set_review(self, org_id: str, invoice_id: str, verdict: str, reviewer: str,
-                   action: str | None = None, note: str | None = None) -> str:
+                   action: str | None = None, note: str | None = None, because: str | None = None) -> str:
         """Record a reviewer's decision, with a snapshot of the rules that fired, and the
         payment action that follows from it. Confirming without choosing an action applies
         the suggested one (e.g. 'do_not_pay' for a duplicate); dismissing means 'pay'.
@@ -546,15 +546,18 @@ class Database:
                 action = "pay"
             elif action is None:
                 action = suggested_action(rules)
+            if because is not None and because not in rules:
+                raise ValueError(f"{because} didn't flag this invoice")
+            deciding = because or deciding_rule(rules)
             # A new review clears any second approval: it was given to the old decision.
-            run("INSERT INTO reviews (org_id, invoice_id, verdict, action, note, rules, reviewer, reviewed_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
+            run("INSERT INTO reviews (org_id, invoice_id, verdict, action, note, rules, reviewer, reviewed_at, "
+                "deciding_rule) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) "
                 "ON CONFLICT (org_id, invoice_id) DO UPDATE SET verdict = excluded.verdict, "
                 "action = excluded.action, note = excluded.note, rules = excluded.rules, "
                 "reviewer = excluded.reviewer, reviewed_at = excluded.reviewed_at, "
-                "approved_by = NULL, approved_at = NULL",
+                "deciding_rule = excluded.deciding_rule, approved_by = NULL, approved_at = NULL",
                 (org_id, invoice_id, verdict, action, (note or "").strip()[:500] or None,
-                 ",".join(rules), reviewer, _now()))
+                 ",".join(rules), reviewer, _now(), deciding))
         return action
 
     def review_details(self, org_id: str) -> dict[str, dict]:
@@ -624,12 +627,18 @@ class Database:
         return {r["invoice_id"]: r["verdict"] for r in rows}
 
     def feedback_counts(self, org_id: str) -> dict[str, tuple[int, int]]:
-        """{rule: (confirmed, dismissed)} from this company's reviews."""
+        """{rule: (confirmed, dismissed)} from this company's reviews.
+
+        Each review counts once, for the rule it was about (deciding_rule), not for every
+        rule that happened to fire beside it: dismissing a real duplicate's weekend flag
+        mustn't teach the duplicate rule anything. Reviews from before deciding_rule
+        existed are counted for their strongest rule."""
         with self._tx(org_id) as run:
-            rows = run("SELECT verdict, rules FROM reviews WHERE org_id = ?", (org_id,))
+            rows = run("SELECT verdict, rules, deciding_rule FROM reviews WHERE org_id = ?", (org_id,))
         counts: dict[str, list[int]] = {}
         for r in rows:
-            for rule in r["rules"].split(","):
+            rule = r["deciding_rule"] or deciding_rule([x for x in r["rules"].split(",") if x])
+            if rule:
                 counts.setdefault(rule, [0, 0])[0 if r["verdict"] == "confirmed" else 1] += 1
         return {rule: (c, d) for rule, (c, d) in counts.items()}
 

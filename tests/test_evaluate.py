@@ -30,20 +30,23 @@ class AdversarialEvaluateTests(unittest.TestCase):
     def setUpClass(cls):
         cls.result = evaluate_adversarial()
 
-    def test_messy_ledger_is_not_the_synthetic_score(self):
-        """Round retainers, Saturday bills and a weekly fee are ordinary, and the
-        synthetic 98% figure never sees them. Precision here stays under the
-        synthetic quality bar on purpose."""
-        self.assertLess(self.result["precision"], 0.85)
-        false = self.result["false_flags_by_rule"]
-        self.assertIn("round_amount", false)
-        self.assertIn("weekend_invoice", false)
-        self.assertIn("near_duplicate", false)
-        fired = self.result["fired"]
+    def test_routine_is_quiet_and_every_trap_is_still_caught(self):
+        """Round retainers, Saturday bills and a weekly fee are how those vendors work, so
+        they are not flagged. Each hides a real problem too (a duplicate, an off-schedule
+        copy, a bank change), and those must still be caught: quieting a vendor's routine
+        must never hide what breaks it. This ledger is scored separately from the
+        synthetic benchmark; neither number stands in for the other."""
+        fired, false = self.result["fired"], self.result["false_flags_by_rule"]
+        for rule in ("round_amount", "weekend_invoice", "near_duplicate"):
+            self.assertNotIn(rule, false)
+        self.assertEqual(self.result["recall"], 1.0)
+        self.assertIn("near_duplicate", fired["RT-EXTRA"])
+        self.assertIn("duplicate", fired["RC-DUP"])
+        self.assertIn("bank_account_change", fired["SC-BANK"])
         self.assertIn("duplicate", fired["NS-2"])
         self.assertEqual(fired["AC-2"], ["duplicate"])
         self.assertEqual(fired["AC-3"], ["similar_vendor_name"])
-
+        self.assertGreaterEqual(self.result["precision"], 0.8)
 
 if __name__ == "__main__":
     unittest.main()
