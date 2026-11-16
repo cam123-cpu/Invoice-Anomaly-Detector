@@ -256,6 +256,15 @@ class CreditNoteTests(unittest.TestCase):
         self.assertNotIn("CN1", fired)
         self.assertEqual(fired["CN2"], {"unmatched_credit"})
         self.assertIn("more than the invoice", next(a.detail for a in detect(over) if a.invoice_id == "CN2"))
+        # two invoices that normalize to the same number: neither is cancelled
+        twin = [inv("INV-10", amount=100.0, date="2026-01-05"), inv("INV10", amount=250.0, date="2026-02-01"),
+                ref("CN1", 100.0, "INV-10")]
+        self.assertEqual(credit_links(twin)["CN1"], (None, "ambiguous"))
+        self.assertEqual(match_credits(twin), {})
+        fired = self.rules(twin)
+        self.assertIn("unmatched_credit", fired["CN1"])
+        self.assertIn("unmatched_credit", fired["INV-10"])
+        self.assertIn("unmatched_credit", fired["INV10"])
 
     def test_a_fake_credit_cannot_launder_a_duplicate(self):
         """Attack: an invoice already paid is copied, and a credit note "cancels" the original

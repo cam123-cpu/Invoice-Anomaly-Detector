@@ -1245,8 +1245,11 @@ it negated for display (`CASE WHEN kind = 'credit' THEN -amount ...`), so sums a
 1. `credit_links()` first takes credits at their word: one that names its invoice
    (`invoices.reference`, from e-invoice data, the page, an *Applies to* column or the review
    screen) is linked to it as **full** (same amount), **partial** (less; ordinary),
-   **missing** (no such invoice), **other_vendor** or **exceeds** (the credits for that invoice
-   now add up to more than it). Numbers are compared without punctuation or leading zeros.
+   **missing** (no such invoice), **other_vendor**, **exceeds** (the credits for that invoice
+   now add up to more than it), or **ambiguous** (more than one of that vendor's invoices
+   normalizes to the reference). An ambiguous credit is not applied to either invoice, and
+   each of those invoices is flagged so one of them cannot stay Ready to pay. Numbers are
+   compared without punctuation or leading zeros.
    Then `match_credits()` pairs each remaining credit with the invoice it cancels in full:
    same vendor, same amount to the cent, invoice dated on or before the credit and within a
    year. A dictionary keyed by (vendor, cents) makes this one pass; the most recent candidate
@@ -1274,6 +1277,7 @@ Three checks, kept out of the web layer so they read like the policy they implem
    or accountants (`count_reviewers`). A company of one can't separate anything.
 2. `needs_second_approval(...)`: a review that releases payment (dismissed, or confirmed with
    action *pay*) of an invoice at or above `orgs.approval_threshold` needs a second person.
+   A credit note is exempt from that second sign-off.
    `payment_decision()` keeps it at *review* until `reviews.approved_by` is set by
    `POST /approve/{id}`, which `check_approver` refuses to the reviewer and to whoever added
    it. `set_review` clears `approved_by`: an approval belongs to one decision.
@@ -1282,6 +1286,10 @@ Three checks, kept out of the web layer so they read like the policy they implem
    `ON CONFLICT DO NOTHING RETURNING`, so concurrent marks can't both win or fail. Detection
    reads `paid_at` (`Invoice.paid`) to say a duplicate's original was paid, to turn a credit for
    a paid invoice into a refund due, and to make a re-issue of a paid invoice high risk.
+
+A saved review applies only to the rules stored on it. When a later detection run fires a
+different set, the invoice is open again and its decision is *review* until someone reviews
+the new flags. A confirmed hold or do-not-pay still stands when the flags disappear entirely.
 
 ### 7.z Three more rules
 

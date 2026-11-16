@@ -69,6 +69,30 @@ These were attacked and held, so nothing was changed:
 - **Zip bombs, fake file types, oversized requests, decompression-bomb images:** refused.
 - **Client address spoofing** to dodge rate limits: the address comes from the connection, and forwarded headers are trusted only from the configured proxy.
 
+## Follow-up pass (16 Nov 2026)
+
+A second pass re-ran the attack, security, and fuzz tests (41 passed) and read the payment path again.
+
+Fixed in this change:
+
+- A dismissed or "pay" review used to stay in force after detection found a different problem, so a later duplicate or bank-account change stayed Ready to pay. A review now applies only to the rules saved with it. A different set is open again.
+- A credit note whose reference normalized to more than one invoice was linked to whichever row came back first, and the other invoice stayed payable. Neither invoice is linked, and each is flagged.
+- The payment file and mark-paid path already load every flag (`list_anomalies` with no limit). The public flag list stays capped. An open flag that is past the review screen's 500 rows is still not payable.
+
+Still open, and not changed in this pass:
+
+- A flagged credit note of any amount can be released by one reviewer. `needs_second_approval` returns false for `kind == "credit"`, and the tests lock that exemption in.
+- The generic single sign-on provider can accept `preferred_username` when `email_verified` is missing or false, because `OIDC_REQUIRE_VERIFIED_EMAIL` defaults off. Microsoft's directory sign-in name is a separate, deliberate claim order.
+- Turning on two-factor does not ask for the current password and does not end other sessions.
+- The annotated-workbook download parses the upload again inside the API process, and the zip check trusts the declared uncompressed size.
+- The document-parser boundary unpickles the child result in the API process.
+- Row-level security is not forced, so a connection as the table owner bypasses the company policies.
+- Sign-in limits can be overshot by one wave of parallel requests, because the check and the failure count are separate transactions.
+- The CLI can create a second casing of a username, and login then returns one of them. The API blocks that second casing.
+- An admin can replace an SSO-only account's password marker, which lets that person sign in with a password.
+- Mark-paid reads the decision, then inserts the payment in a later transaction. A detection run in between is not seen.
+- An e-invoice that is partly prepaid is stored for the grand total. The lower amount due is only a warning.
+
 ## Known limits that remain
 
 - Sign-in rate limits are kept in the database (keyed hashes, one atomic statement per attempt), so they hold across any number of app copies. An attacker can still lock a known username out for 15 minutes by guessing wrong five times; that is the trade the limiter makes.

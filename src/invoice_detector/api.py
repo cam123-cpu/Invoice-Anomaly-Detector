@@ -820,6 +820,8 @@ def create_app(settings: Settings | None = None, db: Database | None = None,
         # The reviewer's do-not-pay or hold was about the payment, and it stays in
         # force until someone changes it. A dismissal, or a confirm that said pay,
         # does not: those invoices are payable once nothing is flagging them.
+        # A review applies only to the rules saved with it. A new duplicate or a new
+        # bank change on a dismissed invoice is open again, and stays off Ready to pay.
         standing = {item["invoice_id"] for item in ranked}
         for inv_id, review in reviews.items():
             if inv_id in standing or review.get("verdict") != "confirmed":
@@ -838,6 +840,11 @@ def create_app(settings: Settings | None = None, db: Database | None = None,
         reviewers = db.count_reviewers(org)
         for item in ranked:
             review = reviews.get(item["invoice_id"], {})
+            stored = {r for r in (review.get("rules") or "").split(",") if r}
+            if review and stored != set(item.get("rules") or []):
+                item["details"] = list(item.get("details") or []) + [
+                    "The flags changed since this invoice was reviewed, so it is open again."]
+                review = {}
             inv = invoices.get(item["invoice_id"], {})
             item["status"] = review.get("verdict", "open")
             item["action"] = review.get("action")
