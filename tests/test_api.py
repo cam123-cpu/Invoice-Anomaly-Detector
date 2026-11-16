@@ -121,7 +121,7 @@ class ApiTests(DbTestCase):
         self.assertIn("INV-2", self.client.post("/explain", headers=admin).json()["explanation"])
 
         self.client.post("/review/INV-2", json={"verdict": "confirmed"}, headers=admin)
-        self.client.post("/review/INV-3", json={"verdict": "dismissed"}, headers=admin)
+        self.client.post("/review/INV-3", json={"verdict": "dismissed", "because": "round_amount"}, headers=admin)
         self.assertEqual(self.client.post("/review/INV-3", json={"verdict": "maybe"}, headers=admin).status_code, 422)
         self.assertEqual(self.client.post("/review/NOPE", json={"verdict": "confirmed"}, headers=admin).status_code, 404)
         # "because" must name a flag that fired on that invoice, in the rule-name format
