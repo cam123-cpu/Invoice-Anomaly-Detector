@@ -558,10 +558,10 @@ class Database:
         return action
 
     def review_details(self, org_id: str) -> dict[str, dict]:
-        """{invoice id: {verdict, action, note, reviewer, reviewed_at, approved_by, approved_at}}."""
+        """{invoice id: {verdict, action, note, rules, reviewer, reviewed_at, approved_by, approved_at}}."""
         with self._tx(org_id) as run:
-            rows = run("SELECT invoice_id, verdict, action, note, reviewer, reviewed_at, approved_by, approved_at "
-                       "FROM reviews WHERE org_id = ?", (org_id,))
+            rows = run("SELECT invoice_id, verdict, action, note, rules, reviewer, reviewed_at, "
+                       "approved_by, approved_at FROM reviews WHERE org_id = ?", (org_id,))
         return {r.pop("invoice_id"): r for r in rows}
 
     def approve_review(self, org_id: str, invoice_id: str, approver: str) -> None:

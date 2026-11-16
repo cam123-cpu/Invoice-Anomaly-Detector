@@ -99,12 +99,16 @@ class RuleTests(unittest.TestCase):
         noisy = learned_weights({"weekend_invoice": (0, 40), "duplicate": (30, 0), "made_up": (1, 1)})
         self.assertLessEqual(noisy["weekend_invoice"], RULE_WEIGHT["weekend_invoice"] / 2)
         self.assertGreaterEqual(noisy["weekend_invoice"], 0.05)  # never silenced completely
-        self.assertEqual(noisy["duplicate"], 0.95)  # consistent confirms raise it, up to the cap
+        self.assertEqual(noisy["duplicate"], RULE_WEIGHT["duplicate"])  # confirms keep it; they do not raise it
         self.assertNotIn("made_up", noisy)
         few = learned_weights({"near_duplicate": (0, 1)})  # one dismissal barely moves it
         self.assertGreater(few["near_duplicate"], RULE_WEIGHT["near_duplicate"] * 0.8)
-        tied = learned_weights({"duplicate": (20, 20)})  # a coin flip stays at the base weight
-        self.assertEqual(tied["duplicate"], RULE_WEIGHT["duplicate"])
+        # A rise was rejected: one click is copied onto every co-fired rule, so it
+        # would train weekend and round-amount off a real duplicate.
+        self.assertLess(learned_weights({"weekend_invoice": (30, 0)})["weekend_invoice"],
+                        RULE_WEIGHT["weekend_invoice"] + 0.001)
+        self.assertEqual(learned_weights({"weekend_invoice": (30, 0)})["weekend_invoice"],
+                         RULE_WEIGHT["weekend_invoice"])
         silenced = learned_weights({"duplicate": (0, 500)})
         self.assertGreaterEqual(silenced["duplicate"], 0.40)  # a policy rule cannot be switched off
 

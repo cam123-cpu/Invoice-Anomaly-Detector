@@ -330,7 +330,22 @@ class ApiTests(DbTestCase):
         actions = [e["detail"] for e in self.client.get("/audit", headers=admin).json() if e["action"] == "invoice_reviewed"]
         self.assertIn("D2: confirmed, do_not_pay", actions)
 
-
+    def test_a_decided_payment_stands_after_the_flag_is_gone(self):
+        admin = self.auth("alice", PW_A)
+        batch = [self.invoice("D1", amount=500.0), self.invoice("D2", amount=500.0)]
+        self.client.post("/invoices/bulk", json=batch, headers=admin)
+        self.client.post("/detect", headers=admin)
+        self.client.post("/review/D2", json={"verdict": "confirmed"}, headers=admin)
+        self.app.save_flags(self.a, [])  # a later run that no longer emits this flag
+        queue = {q["invoice_id"]: q for q in self.client.get("/review-queue", headers=admin).json()}
+        self.assertEqual(queue["D2"]["decision"], "do_not_pay")
+        self.assertIn("still stands", queue["D2"]["details"][0])
+        listed = {row["id"]: row["decision"] for row in self.client.get("/invoices", headers=admin).json()}
+        self.assertEqual(listed["D2"], "do_not_pay")
+        paid = self.client.post("/payments", json={"invoice_ids": ["D2"]}, headers=admin)
+        self.assertEqual(paid.status_code, 409)
+        wb = load_workbook(io.BytesIO(self.client.get("/export/payment-file.xlsx", headers=admin).content))
+        self.assertEqual(wb["Do not pay"].cell(2, 1).value, "D2")
 
 
 @unittest.skipUnless(HAVE_API_DEPS, "fastapi/httpx not installed")
