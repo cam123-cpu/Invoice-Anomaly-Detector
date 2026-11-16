@@ -735,6 +735,8 @@ _RULE_FAMILIES = (
 )
 # A noisy review queue must not be able to switch these off. The floor is half
 # the starting weight, which keeps a lone flag at or above the risk-30 cutoff.
+# Weights never rise above the hand-set base: one review is copied onto every
+# co-fired rule, so a rise would train the tag-along rules too.
 _POLICY_RULES = frozenset({
     "duplicate", "bank_account_change", "shared_bank_account",
     "duplicate_number", "credited_invoice", "matched_credit",
@@ -743,21 +745,23 @@ def learned_weights(feedback: dict[str, tuple[int, int]], prior: int = 5) -> dic
     """Adjust each rule's weight using a company's own review decisions.
 
     feedback is {rule: (confirmed, dismissed)}. The multiplier is
-    (2 * confirmed + prior) / (confirmed + dismissed + prior):
-    no reviews leaves the weight alone, a coin-flip of confirms and dismissals
-    stays put, a rule that is usually confirmed can rise (capped at 0.95), and
-    a rule that is usually dismissed fades. Policy rules (duplicates, bank
-    changes, full credits) stop at half their starting weight, so they cannot
-    be switched off. Other rules fade to 0.05, never to zero. `prior` is how
-    many reviews it takes before the counts dominate.
+    (confirmed + prior) / (confirmed + dismissed + prior), which is at most 1.
+    Confirmations keep a rule at its starting weight. They do not raise it:
+    one review is stored against every rule that fired on that invoice, so a
+    rise would strengthen the tag-along rules (a weekend date on a real
+    duplicate) as well as the rule that mattered. Dismissals fade a rule.
+    Policy rules (duplicates, bank changes, full credits) stop at half their
+    starting weight, so a noisy queue cannot switch them off. Other rules fade
+    to 0.05, never to zero. `prior` is how many reviews it takes before the
+    counts dominate.
     """
     weights = dict(RULE_WEIGHT)
     for rule, (confirmed, dismissed) in feedback.items():
         if rule not in weights:
             continue
-        factor = (2 * confirmed + prior) / (confirmed + dismissed + prior)
+        factor = (confirmed + prior) / (confirmed + dismissed + prior)
         floor = round(RULE_WEIGHT[rule] * 0.5, 3) if rule in _POLICY_RULES else 0.05
-        weights[rule] = round(min(0.95, max(floor, RULE_WEIGHT[rule] * factor)), 3)
+        weights[rule] = round(max(floor, RULE_WEIGHT[rule] * factor), 3)
     return weights
 
 

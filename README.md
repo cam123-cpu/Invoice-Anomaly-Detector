@@ -46,14 +46,15 @@ signals add up, but they never outrank one strong signal. Thresholds live in `De
 (`src/invoice_detector/detection.py`); the approval threshold is a per-company setting.
 
 **Learning from reviewers:** when staff mark flagged invoices as confirmed or dismissed, each
-rule's weight for that company is multiplied by `(2 × confirmed + 5) / (confirmed + dismissed + 5)`,
-then capped at 0.95. A rule that is confirmed about as often as it is dismissed stays put, and
-a rule that keeps raising false alarms fades. Duplicate, bank-account and full-credit rules
-cannot fall below half their starting weight, so a noisy queue cannot switch those controls
-off. `GET /metrics` reports the measured precision per rule. This re-weights the rules; it
-does not retrain the Isolation Forest. One review is copied onto every rule that fired on
-that invoice, so a real duplicate confirmed next to a weekend date also counts as a weekend
-confirmation.
+rule's weight for that company is multiplied by `(confirmed + 5) / (confirmed + dismissed + 5)`.
+That factor never exceeds 1, so confirmations keep a rule where it started and dismissals fade
+it. Weights do not rise: one review is copied onto every rule that fired, and a rise would
+treat the weekend date on a real duplicate as its own confirmed problem. Duplicate,
+bank-account and full-credit rules cannot fall below half their starting weight, so a noisy
+queue cannot switch those controls off. `GET /metrics` reports the measured precision per
+rule. This re-weights the rules; it does not retrain the Isolation Forest. A confirmed
+"do not pay" or "hold" stays in force even if a later detection run no longer flags that
+invoice.
 
 ## Credit notes
 

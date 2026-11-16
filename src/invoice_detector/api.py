@@ -815,6 +815,25 @@ def create_app(settings: Settings | None = None, db: Database | None = None,
         ranked = review_queue([Anomaly(**a) for a in db.list_anomalies(org, None)], weights_for(org))
         reviews = db.review_details(org)
         invoices = {i["id"]: i for i in db.all_invoices(org)}
+        # A later detection run deletes every flag and writes the new set. A duplicate
+        # comes back; an outlier, a sequence or a model flag can simply stop firing.
+        # The reviewer's do-not-pay or hold was about the payment, and it stays in
+        # force until someone changes it. A dismissal, or a confirm that said pay,
+        # does not: those invoices are payable once nothing is flagging them.
+        standing = {item["invoice_id"] for item in ranked}
+        for inv_id, review in reviews.items():
+            if inv_id in standing or review.get("verdict") != "confirmed":
+                continue
+            if review.get("action") not in ("hold", "do_not_pay"):
+                continue
+            inv = invoices.get(inv_id)
+            if not inv or inv.get("paid_at"):
+                continue
+            rules = [r for r in (review.get("rules") or "").split(",") if r]
+            ranked.append({
+                "invoice_id": inv_id, "risk": 0, "rules": rules,
+                "details": ["Detection no longer flags this invoice. The earlier decision still stands."],
+            })
         threshold = db.get_org(org)["approval_threshold"]
         reviewers = db.count_reviewers(org)
         for item in ranked:

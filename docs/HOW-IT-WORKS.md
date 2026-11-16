@@ -1201,12 +1201,12 @@ When reviewers confirm or dismiss flags, `learned_weights` adjusts each rule's w
 company:
 
 ```
-new weight = min(0.95, max(floor, base × (2 × confirmed + 5) / (confirmed + dismissed + 5)))
+new weight = max(floor, base × (confirmed + 5) / (confirmed + dismissed + 5))
 ```
 
 - With no reviews, the factor is 1, and nothing changes.
-- Confirmed as often as dismissed: the factor is 1, and the weight stays.
-- A rule confirmed far more often than it is dismissed rises, up to 0.95.
+- The factor is at most 1. Confirmations keep the starting weight. They do not raise it,
+  because one review is copied onto every rule that fired on that invoice.
 - A rule dismissed 40 times and never confirmed fades. Weekend and round-amount rules fall
   to 0.05. Duplicate, bank-account and full-credit rules stop at half their starting weight.
 - The **+5** is a **prior**. It stops one or two reviews from swinging the weight wildly.
