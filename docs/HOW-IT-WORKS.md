@@ -1205,11 +1205,23 @@ new weight = max(floor, base × (confirmed + 5) / (confirmed + dismissed + 5))
 ```
 
 - With no reviews, the factor is 1, and nothing changes.
-- The factor is at most 1. Confirmations keep the starting weight. They do not raise it,
-  because one review is copied onto every rule that fired on that invoice.
+- The factor is at most 1. Confirmations keep the starting weight; they do not raise it.
+- **Each review counts once, for one rule.** It is stored with the rule it was about
+  (`reviews.deciding_rule`): the flag the reviewer picked in the "About" selector, or else the
+  strongest flag on the invoice. Dismissing an invoice flagged both "duplicate" and "weekend"
+  no longer weakens the weekend rule. This makes the labels mean something per rule, which is
+  the precondition for ever letting a weight rise; that rise is deliberately not switched on.
 - A rule dismissed 40 times and never confirmed fades. Weekend and round-amount rules fall
   to 0.05. Duplicate, bank-account and full-credit rules stop at half their starting weight.
 - The **+5** is a **prior**. It stops one or two reviews from swinging the weight wildly.
+
+A reviewed invoice **reopens** only when a new, meaningful flag appears after the review (a
+flag that goes away, or Isolation Forest / round / weekend churn, does not reopen it). A
+standing "hold" or "do not pay" stays until someone changes it.
+
+**Vendor routines.** Round amounts and weekend dates are not flagged for a vendor that usually
+bills that way (at least 4 invoices, 60% of them). A vendor billing on a steady rhythm (e.g.
+every 7 days) is not a near-duplicate; a copy off that rhythm still is.
 
 Weights are **recomputed from stored decisions every time**, never edited in place. The reviews
 table is the single source of truth, so the system can always explain *why* a weight is what it

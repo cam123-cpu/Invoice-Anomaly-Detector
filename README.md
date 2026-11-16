@@ -180,11 +180,15 @@ a little lower than a version that double-counted those rules.
 
 **These numbers are an upper bound, and a generous one.** The anomalies were injected by the
 same code that detects them. Clean rows are forced onto weekdays, and a round thousand in the
-clean data is nudged by 0.37 so it cannot flag. On one messy ledger of 31 invoices
+clean data is nudged by 0.37 so it cannot flag. On one messy ledger of 34 invoices
 (`cli evaluate-adversarial`: a round retainer, a Saturday vendor, a weekly fixed fee, a second
-copy off by float dust, and the same vendor in two capitalizations) precision at the same
-cut-off is **37.5%**. The float-dust copy and the second capitalization are caught. The weekly
-fee is flagged as a near-duplicate, which is what pulls the precision down. Measure on your own
+copy off by float dust, the same vendor in two capitalizations, and a real problem hidden
+inside each routine: a duplicate retainer, an off-schedule extra fee, a bank change on a
+Saturday bill) precision at the same cut-off is **85.7%** and recall 100%. It was 37.5% before
+vendor routines were learned: a vendor that always bills round, on Saturdays or on a steady
+weekly rhythm is not flagged for doing so, but anything that breaks the routine still is. The
+ledger is tiny and was written by the same project, so treat it as a regression check, not a
+real-world score. Measure on your own
 labelled data before trusting either figure.
 
 ## Payment controls
