@@ -1,6 +1,6 @@
 import unittest
 
-from invoice_detector.evaluate import evaluate, format_report
+from invoice_detector.evaluate import evaluate, evaluate_adversarial, format_report
 
 
 class EvaluateTests(unittest.TestCase):
@@ -23,6 +23,26 @@ class EvaluateTests(unittest.TestCase):
         text = format_report(self.result)
         self.assertIn("Precision", text)
         self.assertIn("duplicate", text)
+
+
+class AdversarialEvaluateTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.result = evaluate_adversarial()
+
+    def test_messy_ledger_is_not_the_synthetic_score(self):
+        """Round retainers, Saturday bills and a weekly fee are ordinary, and the
+        synthetic 98% figure never sees them. Precision here stays under the
+        synthetic quality bar on purpose."""
+        self.assertLess(self.result["precision"], 0.85)
+        false = self.result["false_flags_by_rule"]
+        self.assertIn("round_amount", false)
+        self.assertIn("weekend_invoice", false)
+        self.assertIn("near_duplicate", false)
+        fired = self.result["fired"]
+        self.assertIn("duplicate", fired["NS-2"])
+        self.assertEqual(fired["AC-2"], ["duplicate"])
+        self.assertEqual(fired["AC-3"], ["similar_vendor_name"])
 
 
 if __name__ == "__main__":

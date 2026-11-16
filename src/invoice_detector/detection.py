@@ -111,10 +111,26 @@ def _day(inv: Invoice) -> Date:
     return Date.fromisoformat(inv.date)
 
 
+def _cents(amount: float) -> int:
+    """Money as integer cents. Float equality misses a second copy of the same bill
+    (1003.4 and 1003.4000000000001) and misses a round thousand that is one ulp off."""
+    return round(amount * 100)
+
+
+def _vendor_key(name: str) -> str:
+    """Same vendor for detection when the only difference is case or spacing.
+
+    Letter differences stay different on purpose: "Acme Suppiles" must still look
+    like a different vendor. Legal suffixes and punctuation are not stripped here;
+    that would hide a look-alike. Document intake folds those separately, and only
+    after a person can see the warning."""
+    return " ".join(name.split()).casefold()
+
+
 def _by_vendor(invoices: list[Invoice]) -> dict[str, list[Invoice]]:
     groups: dict[str, list[Invoice]] = defaultdict(list)
     for inv in sorted(invoices, key=lambda i: (i.date, i.id)):
-        groups[inv.vendor].append(inv)
+        groups[_vendor_key(inv.vendor)].append(inv)
     return groups
 
 
@@ -133,7 +149,7 @@ def find_duplicates(invoices: list[Invoice]) -> list[Anomaly]:
     seen: dict[tuple, Invoice] = {}
     out = []
     for inv in sorted(invoices, key=lambda i: (i.date, i.id)):
-        key = (inv.vendor, inv.amount, inv.date)
+        key = (_vendor_key(inv.vendor), _cents(inv.amount), inv.date)
         if key in seen:
             out.append(Anomaly(inv.id, "duplicate", "high", f"duplicate of {seen[key].id}{_paid_note(seen[key])}"))
         else:
@@ -150,7 +166,7 @@ def find_near_duplicates(invoices: list[Invoice], cfg: DetectionConfig = DEFAULT
     Monthly fixed-price subscriptions are further apart than the window, so they pass."""
     groups: dict[tuple, list[Invoice]] = defaultdict(list)
     for inv in sorted(invoices, key=lambda i: (i.date, i.id)):
-        groups[(inv.vendor, inv.amount)].append(inv)
+        groups[(_vendor_key(inv.vendor), _cents(inv.amount))].append(inv)
     out = []
     for group in groups.values():
         for prev, cur in zip(group, group[1:]):
@@ -202,7 +218,7 @@ def find_shared_bank_accounts(invoices: list[Invoice]) -> list[Anomaly]:
     by_bank: dict[str, dict[str, list[Invoice]]] = defaultdict(lambda: defaultdict(list))
     for inv in invoices:
         if inv.bank_idx:
-            by_bank[inv.bank_idx][inv.vendor].append(inv)
+            by_bank[inv.bank_idx][_vendor_key(inv.vendor)].append(inv)
     out = []
     for vendors in by_bank.values():
         if len(vendors) < 2:
@@ -301,9 +317,22 @@ def _name_pairs(names: list[str], norm: dict[str, str], threshold: float):
 
 def find_similar_vendor_names(invoices: list[Invoice], cfg: DetectionConfig = DEFAULT_CONFIG) -> list[Anomaly]:
     """A vendor whose name is almost, but not exactly, another vendor's name
-    (look-alike vendors, or typos that split one vendor's history in two)."""
-    groups = _by_vendor(invoices)
-    norm = {name: _normalize_name(name) for name in groups}
+    (look-alike vendors, or typos that split one vendor's history in two).
+
+    Spellings that share a vendor key (case and spacing only) are one vendor, so
+    they are not flagged here. The printed spelling is what the reviewer sees."""
+    raw: dict[str, list[Invoice]] = defaultdict(list)
+    for inv in invoices:
+        raw[inv.vendor].append(inv)
+    by_key: dict[str, list[str]] = defaultdict(list)
+    for name in raw:
+        by_key[_vendor_key(name)].append(name)
+    label: dict[str, str] = {}
+    groups: dict[str, list[Invoice]] = {}
+    for key, names in by_key.items():
+        label[key] = sorted(names, key=lambda n: (-len(raw[n]), n))[0]
+        groups[key] = [inv for n in names for inv in raw[n]]
+    norm = {key: _normalize_name(label[key]) for key in groups}
     out = []
     for a, b in sorted(_name_pairs(list(groups), norm, cfg.name_similarity)):
         if SequenceMatcher(None, norm[a], norm[b]).ratio() < cfg.name_similarity:
@@ -311,7 +340,7 @@ def find_similar_vendor_names(invoices: list[Invoice], cfg: DetectionConfig = DE
         minor, major = (a, b) if len(groups[a]) <= len(groups[b]) else (b, a)
         for inv in groups[minor]:
             out.append(Anomaly(inv.id, "similar_vendor_name", "medium",
-                               f"vendor '{minor}' looks like existing vendor '{major}'"))
+                               f"vendor '{inv.vendor}' looks like existing vendor '{label[major]}'"))
     return out
 
 
@@ -334,7 +363,7 @@ def find_new_vendor_large(invoices: list[Invoice], cfg: DetectionConfig = DEFAUL
 
 def find_round_amounts(invoices: list[Invoice]) -> list[Anomaly]:
     return [Anomaly(i.id, "round_amount", "low", f"suspiciously round amount {i.amount:,.2f}")
-            for i in invoices if i.amount >= 1000 and i.amount % 1000 == 0]
+            for i in invoices if (cents := _cents(i.amount)) >= 100_000 and cents % 100_000 == 0]
 
 
 def find_totals_mismatch(invoices: list[Invoice]) -> list[Anomaly]:
@@ -364,7 +393,7 @@ def ml_features(invoices: list[Invoice]) -> list[list[float]]:
     rows = []
     for inv in invoices:
         d = _day(inv)
-        z = _robust_log_z(inv.amount, logs[inv.vendor]) if len(logs[inv.vendor]) >= 3 else 0.0
+        z = _robust_log_z(inv.amount, logs[_vendor_key(inv.vendor)]) if len(logs[_vendor_key(inv.vendor)]) >= 3 else 0.0
         rows.append([
             math.log1p(inv.amount),
             max(-10.0, min(10.0, z)),
@@ -428,21 +457,21 @@ def credit_links(invoices: list[Invoice]) -> dict[str, tuple[str | None, str]]:
         if inv.kind == "invoice":
             by_number[_ref_key(inv.id)].append(inv)
     links: dict[str, tuple[str | None, str]] = {}
-    credited: dict[str, float] = defaultdict(float)
+    credited: dict[str, int] = defaultdict(int)
     for credit in sorted((i for i in invoices if i.kind == "credit" and _ref_key(i.reference)),
                          key=lambda i: (i.date, i.id)):
         found = by_number.get(_ref_key(credit.reference), [])
-        same_vendor = [b for b in found if b.vendor == credit.vendor]
+        same_vendor = [b for b in found if _vendor_key(b.vendor) == _vendor_key(credit.vendor)]
         if not found:
             links[credit.id] = (None, "missing")
         elif not same_vendor:
             links[credit.id] = (found[0].id, "other_vendor")
         else:
             bill = same_vendor[0]
-            credited[bill.id] += credit.amount
-            if credited[bill.id] > bill.amount + 0.005:
+            credited[bill.id] += _cents(credit.amount)
+            if credited[bill.id] > _cents(bill.amount):
                 links[credit.id] = (bill.id, "exceeds")
-            elif abs(credit.amount - bill.amount) < 0.005:
+            elif _cents(credit.amount) == _cents(bill.amount):
                 links[credit.id] = (bill.id, "full")
             else:
                 links[credit.id] = (bill.id, "partial")
@@ -465,13 +494,13 @@ def match_credits(invoices: list[Invoice]) -> dict[str, str]:
     bills: dict[tuple[str, int], list[Invoice]] = defaultdict(list)
     for inv in invoices:
         if inv.kind == "invoice":
-            bills[(inv.vendor, round(inv.amount * 100))].append(inv)
+            bills[(_vendor_key(inv.vendor), _cents(inv.amount))].append(inv)
     for group in bills.values():
         group.sort(key=lambda i: (i.date, i.id))
     for credit in sorted((i for i in invoices if i.kind == "credit"), key=lambda i: (i.date, i.id)):
         if credit.id in links:
             continue           # it named its invoice: don't guess another one
-        candidates = [b for b in bills.get((credit.vendor, round(credit.amount * 100)), ())
+        candidates = [b for b in bills.get((_vendor_key(credit.vendor), _cents(credit.amount)), ())
                       if b.id not in used and b.date <= credit.date
                       and (_day(credit) - _day(b)).days <= CREDIT_MATCH_DAYS]
         if candidates:
@@ -511,10 +540,10 @@ def find_credit_issues(invoices: list[Invoice], matched: dict[str, str]) -> list
     billed: dict[str, list[Invoice]] = defaultdict(list)
     for inv in invoices:
         if inv.kind == "invoice":
-            billed[inv.vendor].append(inv)
+            billed[_vendor_key(inv.vendor)].append(inv)
     seen: dict[tuple, str] = {}
     for credit in sorted((i for i in invoices if i.kind == "credit"), key=lambda i: (i.date, i.id)):
-        key = (credit.vendor, round(credit.amount * 100), credit.date)
+        key = (_vendor_key(credit.vendor), _cents(credit.amount), credit.date)
         if key in seen:
             out.append(Anomaly(credit.id, "duplicate_credit", "medium",
                                f"same vendor, amount and date as credit note {seen[key]}"))
@@ -532,11 +561,11 @@ def find_credit_issues(invoices: list[Invoice], matched: dict[str, str]) -> list
             continue
         if link:
             continue           # reduces the invoice it names, within its amount: ordinary
-        before = [b for b in billed.get(credit.vendor, ()) if b.date <= credit.date]
+        before = [b for b in billed.get(_vendor_key(credit.vendor), ()) if b.date <= credit.date]
         if not before:
             out.append(Anomaly(credit.id, "unmatched_credit", "medium",
                                f"credit note from '{credit.vendor}', which has no invoices on file before it"))
-        elif credit.amount > sum(b.amount for b in before) + 0.005:
+        elif _cents(credit.amount) > sum(_cents(b.amount) for b in before):
             out.append(Anomaly(credit.id, "unmatched_credit", "medium",
                                f"credit of {credit.amount:,.2f} is more than everything '{credit.vendor}' "
                                f"has billed ({sum(b.amount for b in before):,.2f})"))
@@ -556,7 +585,8 @@ def find_reissues(invoices: list[Invoice], matched: dict[str, str], days: int = 
         original = by_id[bill_id]
         for inv in sorted(invoices, key=lambda i: (i.date, i.id)):
             if (inv.kind == "invoice" and inv.id not in cancelled and inv.id not in taken
-                    and inv.vendor == original.vendor and abs(inv.amount - original.amount) < 0.005
+                    and _vendor_key(inv.vendor) == _vendor_key(original.vendor)
+                    and _cents(inv.amount) == _cents(original.amount)
                     and 0 <= (_day(inv) - _day(original)).days <= days and inv.id != bill_id):
                 taken.add(inv.id)
                 if original.paid:
@@ -595,11 +625,11 @@ def find_duplicate_numbers(invoices: list[Invoice]) -> list[Anomaly]:
         key, number = _number_key(inv.id)
         if number is None or len(key) < 3:
             continue           # too short to mean anything ("7", "A1")
-        first = seen.get((inv.vendor, key))
+        first = seen.get((_vendor_key(inv.vendor), key))
         if first is None:
-            seen[(inv.vendor, key)] = inv
+            seen[(_vendor_key(inv.vendor), key)] = inv
             continue
-        same = "same amount" if abs(first.amount - inv.amount) < 0.005 else f"{first.amount:,.2f} then {inv.amount:,.2f}"
+        same = "same amount" if _cents(first.amount) == _cents(inv.amount) else f"{first.amount:,.2f} then {inv.amount:,.2f}"
         out.append(Anomaly(inv.id, "duplicate_number", "high",
                            f"same invoice number as {first.id} from this vendor ({same}){_paid_note(first)}"))
     return out
@@ -613,9 +643,9 @@ def find_sequential_numbers(invoices: list[Invoice], cfg: DetectionConfig = DEFA
     by_vendor: dict[str, list[Invoice]] = defaultdict(list)
     for inv in invoices:
         if internal is None or _prefix(inv.id) != internal:
-            by_vendor[inv.vendor].append(inv)
+            by_vendor[_vendor_key(inv.vendor)].append(inv)
     out = []
-    for vendor, group in by_vendor.items():
+    for group in by_vendor.values():
         numbered = [(inv, _number_key(inv.id)[1]) for inv in sorted(group, key=lambda i: (i.date, i.id))]
         numbered = [(inv, n) for inv, n in numbered if n is not None and n >= 100]   # "1", "2": too short to tell
         run = 1
@@ -624,7 +654,7 @@ def find_sequential_numbers(invoices: list[Invoice], cfg: DetectionConfig = DEFA
         if run >= cfg.sequential_run and len(numbered) == run or run >= cfg.sequential_run + 2:
             last, n = numbered[-1]
             out.append(Anomaly(last.id, "sequential_numbers", "low",
-                               f"the last {run} invoices from {vendor} are numbered {n - run + 1} to {n} with no gaps"))
+                               f"the last {run} invoices from {last.vendor} are numbered {n - run + 1} to {n} with no gaps"))
     return out
 
 
@@ -695,34 +725,73 @@ def detect(invoices: list[Invoice], cfg: DetectionConfig = DEFAULT_CONFIG) -> li
     return sorted(found, key=lambda a: (SEVERITY_RANK[a.severity], a.invoice_id, a.rule))
 
 
+# Rules that are one fact wearing two names. risk_scores counts the strongest only,
+# so a single scheme cannot outrank a real duplicate by being described twice.
+# The queue still lists every rule that fired.
+_RULE_FAMILIES = (
+    frozenset({"duplicate", "duplicate_number", "near_duplicate"}),
+    frozenset({"bank_account_change", "shared_bank_account"}),
+    frozenset({"amount_outlier", "ml_outlier"}),
+)
+# A noisy review queue must not be able to switch these off. The floor is half
+# the starting weight, which keeps a lone flag at or above the risk-30 cutoff.
+_POLICY_RULES = frozenset({
+    "duplicate", "bank_account_change", "shared_bank_account",
+    "duplicate_number", "credited_invoice", "matched_credit",
+})
 def learned_weights(feedback: dict[str, tuple[int, int]], prior: int = 5) -> dict[str, float]:
     """Adjust each rule's weight using a company's own review decisions.
 
-    feedback is {rule: (confirmed, dismissed)}. A rule's weight is multiplied by
-    (confirmed + prior) / (confirmed + dismissed + prior): with no reviews nothing
-    changes, and a rule whose flags keep being dismissed fades (to a floor of 0.05,
-    so it is never silenced completely). `prior` is how many reviews it takes before
-    feedback starts to dominate.
+    feedback is {rule: (confirmed, dismissed)}. The multiplier is
+    (2 * confirmed + prior) / (confirmed + dismissed + prior):
+    no reviews leaves the weight alone, a coin-flip of confirms and dismissals
+    stays put, a rule that is usually confirmed can rise (capped at 0.95), and
+    a rule that is usually dismissed fades. Policy rules (duplicates, bank
+    changes, full credits) stop at half their starting weight, so they cannot
+    be switched off. Other rules fade to 0.05, never to zero. `prior` is how
+    many reviews it takes before the counts dominate.
     """
     weights = dict(RULE_WEIGHT)
     for rule, (confirmed, dismissed) in feedback.items():
-        if rule in weights:
-            factor = (confirmed + prior) / (confirmed + dismissed + prior)
-            weights[rule] = round(max(0.05, weights[rule] * factor), 3)
+        if rule not in weights:
+            continue
+        factor = (2 * confirmed + prior) / (confirmed + dismissed + prior)
+        floor = round(RULE_WEIGHT[rule] * 0.5, 3) if rule in _POLICY_RULES else 0.05
+        weights[rule] = round(min(0.95, max(floor, RULE_WEIGHT[rule] * factor)), 3)
     return weights
 
 
+def _weights_that_count(pairs: list[tuple[str, float]]) -> list[float]:
+    """One weight per independent fact. Rules in a family share a cause."""
+    counted: list[float] = []
+    consumed: set[str] = set()
+    for family in _RULE_FAMILIES:
+        members = [weight for rule, weight in pairs if rule in family]
+        if members:
+            counted.append(max(members))
+            consumed.update(rule for rule, _weight in pairs if rule in family)
+    counted.extend(weight for rule, weight in pairs if rule not in consumed)
+    return counted
+
+
 def risk_scores(anomalies: list[Anomaly], weights: dict[str, float] | None = None) -> dict[str, int]:
-    """Risk 0-100 per invoice. Signals combine as a noisy-OR: independent weak signals
-    add up, but no amount of weak signals outranks certainty. Highest first."""
+    """Risk 0-100 per invoice. Independent signals combine as a noisy-OR.
+    Rules that describe the same fact (a resubmit, a diverted payment, one
+    unusual amount) contribute their strongest weight only, so describing one
+    scheme twice cannot outrank a different scheme. Highest first."""
     weights = RULE_WEIGHT if weights is None else weights
-    miss: dict[str, float] = defaultdict(lambda: 1.0)
+    per_invoice: dict[str, list[tuple[str, float]]] = defaultdict(list)
     for a in anomalies:
         weight = weights.get(a.rule, 0.3)
         if a.rule == "amount_outlier" and a.severity == "high":
             weight = min(0.95, weight * 0.75 / RULE_WEIGHT["amount_outlier"])
-        miss[a.invoice_id] *= 1 - weight
-    scores = {inv_id: round(100 * (1 - m)) for inv_id, m in miss.items()}
+        per_invoice[a.invoice_id].append((a.rule, weight))
+    scores = {}
+    for inv_id, pairs in per_invoice.items():
+        miss = 1.0
+        for weight in _weights_that_count(pairs):
+            miss *= 1 - weight
+        scores[inv_id] = round(100 * (1 - miss))
     return dict(sorted(scores.items(), key=lambda kv: (-kv[1], kv[0])))
 
 

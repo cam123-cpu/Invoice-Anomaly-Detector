@@ -10,6 +10,7 @@
   python -m invoice_detector.cli import COMPANY FILE            # Excel (.xlsx) or CSV; columns detected automatically
   python -m invoice_detector.cli detect COMPANY                 # run detection, print the review queue
   python -m invoice_detector.cli evaluate                       # score the detector on synthetic data
+  python -m invoice_detector.cli evaluate-adversarial           # the same score on a messy ledger
   python -m invoice_detector.cli evaluate-documents [N]         # score invoice-document reading
   python -m invoice_detector.cli evaluate-documents --folder DIR  # ...on your own invoices (DIR/truth.csv)
   python -m invoice_detector.cli gen-keys                       # print fresh secrets (for a secrets manager)
@@ -28,7 +29,7 @@ from .config import Settings
 from .db import ROLES, Conflict, Database, KeyMismatch
 from .demo import generate_demo
 from .detection import DEFAULT_CONFIG, detect, learned_weights, review_queue
-from .evaluate import evaluate, format_report
+from .evaluate import evaluate, evaluate_adversarial, format_report
 from .importer import FileProblem, convert, preview, read_table
 
 
@@ -213,6 +214,8 @@ def main(argv: list[str]) -> int:
         print(_fresh_secrets(), end="")
     elif cmd == "evaluate" and not args:
         print(format_report(evaluate()))
+    elif cmd == "evaluate-adversarial" and not args:
+        print(format_report(evaluate_adversarial()))
     elif cmd == "evaluate-documents" and len(args) == 2 and args[0] == "--folder":
         from .doc_benchmark import format_report as format_reading, score_folder
         report = score_folder(args[1])
