@@ -98,8 +98,9 @@ $C create-org "Your Company"
 $C create-user "Your Company" you@yourcompany.com admin     # asks for a password
 ```
 
-Sign in at `https://invoices.yourcompany.com`, open **Your account** and turn on two-factor
-authentication. Then, in **Settings**, tick *Everyone must use two-factor authentication*
+Sign in at `https://invoices.yourcompany.com`. Admin accounts must use two-factor
+authentication in this setup (`ADMIN_REQUIRE_2FA=1`), so you are taken straight to setting
+it up; nothing else opens until it is on. Then, in **Settings**, tick *Everyone must use two-factor authentication*
 and add the rest of the team.
 
 ### Updating to a new version
@@ -110,6 +111,37 @@ docker compose -f docker-compose.prod.yml up -d --build app
 ```
 
 The app runs `migrate` on start; it only adds what is missing, so it is safe to run every time.
+
+### Automatic security updates
+
+```bash
+sudo deploy/auto-update.sh install
+```
+
+This sets up two things on the server:
+
+- **Daily:** the server's operating system installs its own security fixes
+  (`unattended-upgrades`, on Ubuntu/Debian).
+- **Weekly (Sunday night):** a backup, then fresh patched images for PostgreSQL and Caddy and
+  a rebuild of the app on the newest Python image, then a check that the app answers. If it
+  doesn't, the script says so and leaves the backup from just before.
+
+It never pulls new application code on its own. Fixes to the libraries the app uses arrive as
+Dependabot pull requests on GitHub; once one is merged, `git pull` and run
+`deploy/auto-update.sh` to apply it. HTTPS certificates are renewed by Caddy on their own.
+
+### Checking the live server from outside
+
+```bash
+python scripts/check_live.py https://invoices.yourcompany.com --login-limit
+```
+
+Run it from any computer after deploying and after updates. It only reads, never signs in, and
+checks the certificate and TLS version, the http→https redirect, HSTS and the other security
+headers, that `/docs`, `.env`, `.git` and the secrets aren't reachable, that every data page
+needs sign-in, that other sites' requests are refused, and (with `--login-limit`) that wrong
+passwords get locked out. Every line should say PASS. It is a first pass; before real money
+depends on it, have an independent firm run a penetration test against this server.
 
 ### Running several copies of the app
 
@@ -162,6 +194,7 @@ Steps, whichever cloud:
    SECRET_KEY, ENCRYPTION_KEYS, INDEX_KEY                                                     (secrets)
    PUBLIC_URL         = https://invoices.yourcompany.com
    FORCE_HTTPS        = 1
+   ADMIN_REQUIRE_2FA  = 1          # admins must use two-factor
    FORWARDED_ALLOW_IPS = *          # the platform's load balancer is the only way in
    API_DOCS           = 0          # no public /docs page
    ```
@@ -263,7 +296,8 @@ encrypted with it still exists (including in backups you might restore).
 
 Built in, nothing to configure. Each person turns it on in **Your account** with any
 authenticator app (Microsoft Authenticator, Google Authenticator, 1Password, Authy…) and gets
-ten one-time recovery codes. An admin can require it for the whole company in **Settings**;
+ten one-time recovery codes. Admins must use it in the production setup (`ADMIN_REQUIRE_2FA=1`); they can't switch it
+off. An admin can require it for the whole company in **Settings**;
 people without it are then sent to set it up before they can do anything else. If someone
 loses their phone and their recovery codes, an admin can turn their two-factor off
 (Settings → people → *Turn off two-factor*) so they can set it up again.
@@ -344,7 +378,10 @@ form can't be used to find out who has an account.
 - [ ] Site opens on `https://`, and `http://` redirects to it
 - [ ] Secrets stored in a secrets manager or `deploy/secrets/` (not `.env`), and **keys backed up in two places**
 - [ ] Data backups running, copied off the server, and **one restore tested**
-- [ ] Admin account has two-factor on; *Everyone must use two-factor* ticked
+- [ ] Admin account has two-factor on (forced in production); *Everyone must use two-factor* ticked
+- [ ] `sudo deploy/auto-update.sh install` run, and `systemctl list-timers invoice-update` shows the next run
+- [ ] `python scripts/check_live.py https://… --login-limit` shows every line PASS
+- [ ] Independent penetration test booked against the live server
 - [ ] SSO tested with one real account, or password-reset email tested
 - [ ] Each person added with their own account and the right role (admin / accountant / auditor)
 - [ ] Someone named as responsible for updates, renewing the SSO client secret, and checking backups

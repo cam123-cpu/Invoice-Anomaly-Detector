@@ -38,6 +38,7 @@ services:
       APP_DB_PASSWORD_FILE: /run/secrets/app_db_password
       PUBLIC_URL: https://${DOMAIN:?set DOMAIN, e.g. invoices.example.com}
       FORCE_HTTPS: "1"
+      ADMIN_REQUIRE_2FA: "1"     # admins must use two-factor
       FORWARDED_ALLOW_IPS: "*"   # the app is reachable only through Caddy on this network
       API_DOCS: "0"              # no public /docs page in production
       WEB_CONCURRENCY: ${WEB_CONCURRENCY:-1}   # worker processes inside each copy

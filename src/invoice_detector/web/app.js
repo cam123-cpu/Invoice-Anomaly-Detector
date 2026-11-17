@@ -497,7 +497,7 @@ async function securityView() {
                 put(twoFactor, recoveryCodesBox(r.recovery_codes, () => render()));
               } catch (ex) { show(ex); }
             } }, "Make new recovery codes"),
-            state.required_by_company ? h("span", { class: "muted small" }, "Your company requires two-factor, so it can't be turned off.")
+            state.required_by_company ? h("span", { class: "muted small" }, "Two-factor is required for your account, so it can't be turned off.")
               : h("button", { class: "btn danger", onclick: async () => {
                 try {
                   await api("POST", "/me/2fa/disable", { password: password ? password.value : null, code: code.value.trim() });
@@ -509,7 +509,7 @@ async function securityView() {
       return;
     }
     put(twoFactor, h("h2", {}, "Two-factor authentication"),
-      state.required_by_company ? h("div", { class: "note", role: "note" }, "Your company requires two-factor authentication. Set it up to continue using the app.") : null,
+      state.required_by_company ? h("div", { class: "note", role: "note" }, "Two-factor authentication is required for your account. Set it up to continue using the app.") : null,
       h("p", {}, "Protect your account with a code from an authenticator app (Microsoft Authenticator, Google Authenticator, 1Password, Authy and others) as well as your password."),
       err,
       h("button", { class: "btn primary", onclick: async () => {

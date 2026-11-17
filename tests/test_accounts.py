@@ -194,6 +194,24 @@ class TwoFactorTests(AccountsTestCase):
         self.assertEqual(cm.exception.status, 409)
         self.assertFalse(self.app.get_org(self.b)["require_2fa"])
 
+    def test_admins_must_use_it_in_production(self):
+        strict = Accounts(self.app, self.signer, replace(make_settings(), admin_require_2fa=True), sso_clients={})
+        admin = strict.login("alice@acme.example", PW, "1.2.3.4")["access_token"]
+        with self.assertRaises(AccountError) as cm:
+            strict.authenticate(admin)
+        self.assertEqual((cm.exception.status, cm.exception.requires_2fa), (403, True))
+        self.assertIn("Admin accounts", cm.exception.message)
+        user = strict.authenticate(admin, enforce_2fa=False)      # can still reach set-up
+        self.assertTrue(strict.two_factor_status(user)["required_by_company"])
+        secret, enabled = self.turn_on_2fa(user)
+        strong = strict.authenticate(enabled["access_token"])
+        with self.assertRaises(AccountError) as cm:               # and can't switch it back off
+            strict.disable_2fa(strong, PW, totp.code_at(secret, totp.current_step() + 1))
+        self.assertEqual(cm.exception.status, 409)
+        # an accountant isn't affected unless the company asks for it
+        bob = strict.login("bob", "bob-password-12345", "1.2.3.4")["access_token"]
+        self.assertEqual(strict.authenticate(bob)["sub"], "bob")
+
     def test_new_recovery_codes(self):
         user = self.sign_in()
         secret, first = self.turn_on_2fa(user)

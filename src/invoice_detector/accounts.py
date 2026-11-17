@@ -14,7 +14,9 @@ Sessions
   fingerprint of the password. Each request re-checks the user against the database, so
   changing a password or deleting a user ends their sessions at once.
 - A company can require two-factor: until a user sets it up, they can only reach the
-  account pages needed to do so.
+  account pages needed to do so. With ADMIN_REQUIRE_2FA=1 (on in the production setup) every
+  admin must use it, whatever the company setting: an admin account can create users and
+  release payments, so a stolen password alone must not be enough.
 """
 import hashlib
 import hmac
@@ -159,12 +161,16 @@ class Accounts:
             raise AccountError(401, "Your session has ended. Please sign in again.")
         org = self.db.get_org(data["org"])
         current = {"sub": user["username"], "role": user["role"], "org": data["org"], "mfa": data["mfa"],
-                   "two_factor": user["totp_enabled"], "require_2fa": org["require_2fa"],
+                   "two_factor": user["totp_enabled"],
+                   "require_2fa": org["require_2fa"] or self._admin_needs_2fa(user["role"]),
                    "sso_only": user["password_hash"] == SSO_ONLY}
-        if enforce_2fa and org["require_2fa"] and not data["mfa"]:
-            raise AccountError(403, "Your company requires two-factor authentication. Set it up to continue.",
-                               requires_2fa=True)
+        if enforce_2fa and current["require_2fa"] and not data["mfa"]:
+            who = "Admin accounts need" if not org["require_2fa"] else "Your company requires"
+            raise AccountError(403, f"{who} two-factor authentication. Set it up to continue.", requires_2fa=True)
         return current
+
+    def _admin_needs_2fa(self, role: str) -> bool:
+        return role == "admin" and bool(getattr(self.settings, "admin_require_2fa", False))
 
     # ------------------------------------------------------------ two-factor management
     def two_factor_status(self, user: dict) -> dict:
@@ -216,7 +222,7 @@ class Accounts:
 
     def disable_2fa(self, user: dict, password: str | None, code: str) -> dict:
         if user["require_2fa"]:
-            raise AccountError(409, "Your company requires two-factor authentication, so it can't be turned off.")
+            raise AccountError(409, "Two-factor authentication is required for this account, so it can't be turned off.")
         sec = self._confirm_identity(user, password, code)
         self.db.update_user_security(user["org"], user["sub"], totp_secret=None, totp_enabled=False,
                                      totp_last_step=None, recovery_codes=None)

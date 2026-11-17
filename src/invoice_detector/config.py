@@ -74,6 +74,7 @@ class Settings:
     # web address people use, e.g. https://invoices.example.com (links in emails, SSO redirects)
     public_url: str = "http://127.0.0.1:8000"
     force_https: bool = False            # redirect http to https and send HSTS
+    admin_require_2fa: bool = False      # every admin must use two-factor (on in production)
     smtp_host: str | None = None
     smtp_port: int = 587
     smtp_user: str | None = None
@@ -109,6 +110,7 @@ class Settings:
             anthropic_api_key=env("ANTHROPIC_API_KEY"),
             public_url=(env("PUBLIC_URL") or "http://127.0.0.1:8000").rstrip("/"),
             force_https=env("FORCE_HTTPS", "0") == "1",
+            admin_require_2fa=env("ADMIN_REQUIRE_2FA", "0") == "1",
             smtp_host=env("SMTP_HOST"),
             smtp_port=int(env("SMTP_PORT", "587")),
             smtp_user=env("SMTP_USER"),
