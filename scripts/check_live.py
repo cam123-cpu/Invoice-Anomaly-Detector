@@ -22,6 +22,7 @@ import sys
 import urllib.parse
 
 RESULTS: list[tuple[bool, str, str]] = []
+CAFILE: str | None = None     # a private certificate authority to trust (tests only)
 
 
 def check(ok: bool, name: str, detail: str = "") -> None:
@@ -31,7 +32,7 @@ def check(ok: bool, name: str, detail: str = "") -> None:
 def request(url: str, method: str = "GET", body: dict | None = None, headers: dict | None = None,
             verify: bool = True) -> http.client.HTTPResponse:
     u = urllib.parse.urlsplit(url)
-    ctx = ssl.create_default_context() if verify else ssl._create_unverified_context()
+    ctx = ssl.create_default_context(cafile=CAFILE) if verify else ssl._create_unverified_context()
     conn = (http.client.HTTPSConnection(u.hostname, u.port or 443, timeout=15, context=ctx) if u.scheme == "https"
             else http.client.HTTPConnection(u.hostname, u.port or 80, timeout=15))
     data = json.dumps(body).encode() if body is not None else None
@@ -43,15 +44,15 @@ def request(url: str, method: str = "GET", body: dict | None = None, headers: di
     return resp
 
 
-def tls_checks(host: str, port: int) -> None:
-    ctx = ssl.create_default_context()
+def tls_checks(host: str, port: int, min_days: int = 14) -> None:
+    ctx = ssl.create_default_context(cafile=CAFILE)
     try:
         with socket.create_connection((host, port), timeout=15) as raw, ctx.wrap_socket(raw, server_hostname=host) as s:
             cert, version = s.getpeercert(), s.version()
         ends = dt.datetime.fromtimestamp(ssl.cert_time_to_seconds(cert["notAfter"]), dt.timezone.utc)
         days = (ends - dt.datetime.now(dt.timezone.utc)).days
         check(True, "Certificate is valid and trusted", f"for {host}")
-        check(days >= 14, "Certificate is not about to expire", f"{days} days left")
+        check(days >= min_days, "Certificate is not about to expire", f"{days} days left")
         check(version in ("TLSv1.2", "TLSv1.3"), "Modern TLS", version)
     except ssl.SSLError as exc:
         check(False, "Certificate is valid and trusted", str(exc))
@@ -70,8 +71,12 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("url", help="the site's address, e.g. https://invoices.example.com")
     ap.add_argument("--allow-http", action="store_true", help=argparse.SUPPRESS)  # testing on this computer only
+    ap.add_argument("--cafile", help=argparse.SUPPRESS)                          # trust a test certificate authority
+    ap.add_argument("--min-days", type=int, default=14, help="warn when the certificate expires sooner (default 14)")
     ap.add_argument("--login-limit", action="store_true", help="also check that wrong passwords get locked out")
     args = ap.parse_args()
+    global CAFILE
+    CAFILE = args.cafile
     base = args.url.rstrip("/")
     u = urllib.parse.urlsplit(base)
     if u.scheme != "https" and not args.allow_http:
@@ -80,7 +85,7 @@ def main() -> int:
     host = u.hostname
 
     if u.scheme == "https":
-        tls_checks(host, u.port or 443)
+        tls_checks(host, u.port or 443, args.min_days)
 
     try:
         r = request(f"http://{host}/" if u.scheme == "https" else base + "/")
