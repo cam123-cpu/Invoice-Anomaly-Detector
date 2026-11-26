@@ -1219,9 +1219,12 @@ A reviewed invoice **reopens** only when a new, meaningful flag appears after th
 flag that goes away, or Isolation Forest / round / weekend churn, does not reopen it). A
 standing "hold" or "do not pay" stays until someone changes it.
 
-**Vendor routines.** Round amounts and weekend dates are not flagged for a vendor that usually
-bills that way (at least 4 invoices, 60% of them). A vendor billing on a steady rhythm (e.g.
-every 7 days) is not a near-duplicate; a copy off that rhythm still is.
+**Vendor routines.** Round amounts and weekend dates are not flagged when the vendor's other
+invoices already show that habit (at least 4 invoices, and 60% of the rest). The invoice being
+judged does not count toward that share, so a new pile of round bills cannot excuse itself.
+A vendor billing on a fixed grid (first date, then every 7 days, within a day) is not a
+near-duplicate. A second bill in the same grid slot is: the one closer to the grid date is the
+fee, and the other is the copy. A copy two or more days off the grid is still a near-duplicate.
 
 Weights are **recomputed from stored decisions every time**, never edited in place. The reviews
 table is the single source of truth, so the system can always explain *why* a weight is what it

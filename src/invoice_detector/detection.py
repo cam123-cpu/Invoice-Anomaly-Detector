@@ -170,11 +170,35 @@ def find_near_duplicates(invoices: list[Invoice], cfg: DetectionConfig = DEFAULT
     out = []
     for group in groups.values():
         rhythm = _rhythm(group)
-        anchor = group[0]          # the last invoice that was on the vendor's schedule
-        for prev, cur in zip(group, group[1:]):
-            if rhythm and abs((_day(cur) - _day(anchor)).days - rhythm) <= 1:
-                anchor = cur       # the weekly fee arriving when it always does
+        on_grid: set[int] = set()
+        if rhythm:
+            start = _day(group[0])
+            slots: dict[int, list[tuple[int, int]]] = defaultdict(list)
+            for idx, inv in enumerate(group):
+                delta = (_day(inv) - start).days
+                slot = (delta + rhythm // 2) // rhythm
+                dist = abs(delta - slot * rhythm)
+                if slot >= 0 and dist <= 1:
+                    slots[slot].append((dist, idx))
+                    on_grid.add(idx)
+            for members in slots.values():
+                # The bill closest to the grid date is the scheduled one. Another bill in the
+                # same slot is a copy, even when it arrived a day earlier and would otherwise
+                # become the new "schedule".
+                members.sort(key=lambda t: (t[0], group[t[1]].date, group[t[1]].id))
+                keeper = group[members[0][1]]
+                for _, idx in members[1:]:
+                    cur = group[idx]
+                    if cur.date == keeper.date:
+                        continue
+                    gap = abs((_day(cur) - _day(keeper)).days)
+                    out.append(Anomaly(cur.id, "near_duplicate", "medium",
+                                       f"same vendor and amount as {keeper.id}, {gap} day(s) from the "
+                                       f"regular billing date{_paid_note(keeper)}"))
+        for idx in range(1, len(group)):
+            if idx in on_grid:
                 continue
+            prev, cur = group[idx - 1], group[idx]
             gap = (_day(cur) - _day(prev)).days
             if 0 < gap <= cfg.near_duplicate_days:
                 out.append(Anomaly(cur.id, "near_duplicate", "medium",
@@ -205,13 +229,20 @@ def _rhythm(group: list[Invoice]) -> int | None:
     return None
 
 
-def _habit(invoices: list[Invoice], test, min_count: int = 4, share: float = 0.6) -> set[str]:
-    """Vendors for whom something unusual in general is simply how they work: at least
-    `min_count` invoices, and `share` of them have it (round amounts, weekend dates)."""
+def _usual_ids(invoices: list[Invoice], test, min_count: int = 4, share: float = 0.6) -> set[str]:
+    """Invoice ids whose trait is already this vendor's habit, judged without that invoice.
+
+    The vendor needs at least `min_count` invoices. The share is taken on the others, so one
+    new pile of round bills or Saturday dates cannot tip itself over the line."""
     out = set()
-    for key, group in _by_vendor(invoices).items():
-        if len(group) >= min_count and sum(1 for i in group if test(i)) >= share * len(group):
-            out.add(key)
+    for group in _by_vendor(invoices).values():
+        if len(group) < min_count:
+            continue
+        others_n = len(group) - 1
+        for idx, inv in enumerate(group):
+            hits = sum(1 for j, other in enumerate(group) if j != idx and test(other))
+            if hits >= share * others_n:
+                out.add(inv.id)
     return out
 
 
@@ -407,9 +438,9 @@ def _is_round(inv: Invoice) -> bool:
 def find_round_amounts(invoices: list[Invoice]) -> list[Anomaly]:
     """A round thousand is a weak sign of a made-up amount, except from a vendor that always
     bills round amounts (a fixed retainer): then it is just their price."""
-    usual = _habit(invoices, _is_round)
+    usual = _usual_ids(invoices, _is_round)
     return [Anomaly(i.id, "round_amount", "low", f"suspiciously round amount {i.amount:,.2f}")
-            for i in invoices if _is_round(i) and _vendor_key(i.vendor) not in usual]
+            for i in invoices if _is_round(i) and i.id not in usual]
 
 
 def find_totals_mismatch(invoices: list[Invoice]) -> list[Anomaly]:
@@ -422,9 +453,9 @@ def find_totals_mismatch(invoices: list[Invoice]) -> list[Anomaly]:
 def find_weekend_invoices(invoices: list[Invoice]) -> list[Anomaly]:
     """A weekend date is a weak sign, except from a vendor that usually invoices then."""
     weekend = lambda i: _day(i).weekday() >= 5   # noqa: E731
-    usual = _habit(invoices, weekend)
+    usual = _usual_ids(invoices, weekend)
     return [Anomaly(i.id, "weekend_invoice", "low", f"dated on a weekend ({i.date})")
-            for i in invoices if weekend(i) and _vendor_key(i.vendor) not in usual]
+            for i in invoices if weekend(i) and i.id not in usual]
 
 
 # ---------------------------------------------------------------- machine learning
