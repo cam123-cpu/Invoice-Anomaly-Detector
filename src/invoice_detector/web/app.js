@@ -520,6 +520,7 @@ async function securityView() {
   function setupStep(setup) {
     const err = h("div", { class: "error-box hidden", role: "alert" });
     const code = h("input", { id: "tf-confirm", autocomplete: "one-time-code", inputmode: "numeric", maxlength: "7", placeholder: "123456", autofocus: true });
+    const pw = me.sso_only ? null : h("input", { id: "tf-password", type: "password", autocomplete: "current-password", required: true });
     const qr = h("img", { src: setup.qr, alt: "QR code for your authenticator app", class: "qr", width: "228", height: "228" });
     put(twoFactor, h("h2", {}, "Set up two-factor authentication"),
       h("ol", { class: "steps-list" },
@@ -533,11 +534,12 @@ async function securityView() {
         e.preventDefault();
         err.classList.add("hidden");
         try {
-          const r = await api("POST", "/me/2fa/enable", { code: code.value.trim() });
+          const r = await api("POST", "/me/2fa/enable", { code: code.value.trim(), password: pw ? pw.value : undefined });
           updateSession(false);
           put(twoFactor, recoveryCodesBox(r.recovery_codes, () => { toast("Two-factor authentication is on"); render(); }));
         } catch (ex) { err.textContent = ex.message; err.classList.remove("hidden"); }
-      } }, h("label", { class: "field", for: "tf-confirm" }, "Code from the app", code), err,
+      } }, h("label", { class: "field", for: "tf-confirm" }, "Code from the app", code),
+        pw ? h("label", { class: "field", for: "tf-password" }, "Your password", pw) : null, err,
         h("div", { class: "row" }, h("button", { class: "btn primary", type: "submit" }, "Turn on"),
           h("button", { class: "btn", type: "button", onclick: () => drawTwoFactor(tf) }, "Cancel"))));
   }

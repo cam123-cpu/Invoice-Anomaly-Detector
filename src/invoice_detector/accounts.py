@@ -82,6 +82,12 @@ class Accounts:
         except RateLimitError:
             raise AccountError(429, "Too many attempts. Try again in 15 minutes.") from None
 
+    def _take(self, limiter: RateLimiter, key: str) -> None:
+        try:
+            limiter.take(key)
+        except RateLimitError:
+            raise AccountError(429, "Too many attempts. Try again in 15 minutes.") from None
+
     def _check_code(self, org: str, sec: dict, code: str, allow_recovery: bool = True) -> str | None:
         """'app' or 'recovery' if the code is right (and records its use), else None."""
         if sec["totp_enabled"] and sec["totp_secret"]:
@@ -100,22 +106,23 @@ class Accounts:
     # ------------------------------------------------------------ password sign-in
     def login(self, username: str, password: str, ip: str) -> dict:
         key = f"{ip}:{username.lower()}"
-        self._check_rate(self.address_limiter, ip)
-        self._check_rate(self.login_limiter, key)
-        # Per address alone, a botnet gets five fresh guesses from every address it has. This
-        # second limit counts wrong passwords for the account from everywhere.
-        self._check_rate(self.account_limiter, username.lower())
+        # Each attempt is counted before the password is checked (take), and given back if it
+        # was right, so a burst of parallel guesses can't all get in under the limit.
+        # Per address alone, a botnet gets five fresh guesses from every address it has; the
+        # account limit counts guesses for the account from everywhere.
+        for limiter, k in ((self.address_limiter, ip), (self.login_limiter, key),
+                           (self.account_limiter, username.lower())):
+            self._take(limiter, k)
         user = self.db.auth_lookup(username)
         usable = user is not None and user["password_hash"] != SSO_ONLY and not user["disabled"]
         ok = verify_password(password, user["password_hash"] if usable else DUMMY_HASH)
         if not (usable and ok):
-            self.login_limiter.record_failure(key)
-            self.address_limiter.record_failure(ip)
-            self.account_limiter.record_failure(username.lower())
             if user:
                 self.db.audit(user["org_id"], user["username"], "login_failed", f"from {ip}")
             raise AccountError(401, "Wrong username or password.")
         self.login_limiter.record_success(key)
+        self.address_limiter.refund(ip)
+        self.account_limiter.refund(username.lower())
         if user["totp_enabled"]:
             pending = self.signer.issue({"sub": user["username"], "org": user["org_id"],
                                          "pwf": session_fingerprint(user)},
@@ -131,14 +138,13 @@ class Accounts:
             raise AccountError(401, "Your sign-in timed out. Please start again.") from None
         org, username = pending["org"], pending["sub"]
         key = f"2fa:{username.lower()}"
-        self._check_rate(self.code_limiter, key)
+        self._take(self.code_limiter, key)
         sec = self.db.user_security(org, username)
         if (sec is None or sec["disabled"] or not sec["totp_enabled"]
                 or session_fingerprint(sec) != pending.get("pwf")):
             raise AccountError(401, "Your sign-in timed out. Please start again.")
         method = self._check_code(org, sec, code)
         if method is None:
-            self.code_limiter.record_failure(key)
             self.db.audit(org, username, "login_failed", f"wrong two-factor code, from {ip}")
             raise AccountError(401, "That code isn't right. Codes change every 30 seconds.")
         self.code_limiter.record_success(key)
@@ -190,20 +196,31 @@ class Accounts:
         return {"secret": " ".join(secret[i:i + 4] for i in range(0, len(secret), 4)), "uri": uri,
                 "qr": svg_data_uri(uri)}
 
-    def enable_2fa(self, user: dict, code: str) -> dict:
+    def enable_2fa(self, user: dict, code: str, password: str | None = None) -> dict:
+        """Turn two-factor on. The current password is asked for again: someone holding only a
+        stolen session must not be able to tie the account to their own phone and keep it.
+        Every other session ends, so a session opened before two-factor was on stops working."""
         org = user["org"]
         sec = self.db.user_security(org, user["sub"])
         if sec["totp_enabled"]:
             raise AccountError(409, "Two-factor authentication is already on.")
         if not sec["totp_secret"]:
             raise AccountError(400, "Start the set-up first.")
+        key = f"confirm:{user['sub'].lower()}"
+        self._check_rate(self.code_limiter, key)
+        if sec["password_hash"] != SSO_ONLY and not verify_password(password or "", sec["password_hash"]):
+            self.code_limiter.record_failure(key)
+            raise AccountError(401, "Your password isn't right.")
         step = totp.verify(self._secret(org, user["sub"], sec["totp_secret"]), code)
         if step is None:
+            self.code_limiter.record_failure(key)
             raise AccountError(400, "That code isn't right. Check the time on your phone is set automatically.")
+        self.code_limiter.record_success(key)
         codes = totp.new_recovery_codes()
         self.db.update_user_security(org, user["sub"], totp_enabled=True, totp_last_step=step,
                                      recovery_codes=[totp.hash_recovery_code(c, self._pepper) for c in codes])
-        self.db.audit(org, user["sub"], "two_factor_enabled", "")
+        self.db.end_sessions(org, user["sub"])
+        self.db.audit(org, user["sub"], "two_factor_enabled", "other sessions ended")
         sec = self.db.user_security(org, user["sub"])
         return {"recovery_codes": codes, "access_token": self._token(sec, org, mfa=True)}
 
@@ -318,6 +335,13 @@ class Accounts:
 
     # ------------------------------------------------------------ admin actions
     def admin_set_password(self, admin: dict, username: str, new: str) -> None:
+        target = self.db.user_security(admin["org"], username)
+        if target is None:
+            raise AccountError(404, "No such person in your company.")
+        if target["password_hash"] == SSO_ONLY:
+            # Round 4: giving a single-sign-on account a password would open a second way in
+            # that skips the company's sign-in provider (and its two-factor and offboarding).
+            raise AccountError(409, "This person signs in with single sign-on, so they have no password to set.")
         self._check_password(new, username)
         if not self.db.set_password(username, new, admin["org"]):
             raise AccountError(404, "No such person in your company.")

@@ -7,6 +7,7 @@ Run:  uvicorn invoice_detector.api:create_app --factory
 import base64
 import binascii
 import logging
+import os
 import re
 from dataclasses import replace
 from urllib.parse import quote
@@ -21,7 +22,7 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, ConfigDict, Field
 
 from .config import Settings
-from .db import Conflict, Database
+from .db import Conflict, Database, FlagsChanged
 from .detection import (DEFAULT_CONFIG, RULE_WEIGHT, Anomaly, credit_links, detect, learned_weights,
                         review_queue)
 from .controls import ControlError, check_approver, check_reviewer, needs_second_approval
@@ -123,6 +124,10 @@ class CodeIn(StrictModel):
     code: str = Field(min_length=6, max_length=40)
 
 
+class EnableIn(CodeIn):
+    password: str | None = Field(default=None, max_length=200)
+
+
 class DisableTwoFactorIn(StrictModel):
     password: str | None = Field(default=None, max_length=256)
     code: str = Field(min_length=6, max_length=40)
@@ -220,7 +225,13 @@ class DocumentsImportIn(StrictModel):
 def create_app(settings: Settings | None = None, db: Database | None = None,
                accounts: Accounts | None = None, intake: DocumentIntake | None = None) -> FastAPI:
     settings = settings or Settings.from_env()
-    db = db or Database.from_settings(settings)
+    if db is None:
+        db = Database.from_settings(settings)
+        problem = db.privilege_problem()
+        if problem and os.environ.get("ALLOW_PRIVILEGED_DATABASE") != "1":
+            raise RuntimeError(f"The web server's DATABASE_URL connects with a role that {problem}, so the "
+                               "database could not keep companies apart. Use the limited app role "
+                               "(invoice_app); DATABASE_ADMIN_URL is only for the command line.")
     db.check_keys()  # refuse to start with encryption keys that don't match the data
     signer = TokenSigner(settings.secret_key)
     accounts = accounts or Accounts(db, signer, settings, mailer_from_settings(settings))
@@ -529,11 +540,11 @@ def create_app(settings: Settings | None = None, db: Database | None = None,
         return run(lambda: accounts.setup_2fa(user))
 
     @app.post("/me/2fa/enable")
-    def two_factor_enable(body: CodeIn, request: Request, response: Response,
+    def two_factor_enable(body: EnableIn, request: Request, response: Response,
                           user: dict = Depends(account_user)) -> dict:
         """Confirm with a code from the app. Returns ten recovery codes (shown once) and a new
         access token for a session that counts as two-factor."""
-        return start_session(request, response, run(lambda: accounts.enable_2fa(user, body.code)))
+        return start_session(request, response, run(lambda: accounts.enable_2fa(user, body.code, body.password)))
 
     @app.post("/me/2fa/disable")
     def two_factor_disable(body: DisableTwoFactorIn, request: Request, response: Response,
@@ -952,6 +963,11 @@ def create_app(settings: Settings | None = None, db: Database | None = None,
         """Record that invoices were paid (or credit notes applied). Only invoices whose decision
         is Pay can be marked; paid invoices leave the payment file."""
         org = user["org"]
+        # The flags as they are now, read before the decisions: if detection changes them at
+        # any point from here until the payment is written, mark_paid sees it and refuses.
+        seen: dict[str, set] = {}
+        for a in db.list_anomalies(org, None):
+            seen.setdefault(a["invoice_id"], set()).add(a["rule"])
         decisions = {i["invoice_id"]: i["decision"] for i in full_queue(org)}
         known = {i["id"] for i in db.all_invoices(org)}
         missing = [i for i in body.invoice_ids if i not in known]
@@ -960,7 +976,13 @@ def create_app(settings: Settings | None = None, db: Database | None = None,
         blocked = [i for i in body.invoice_ids if decisions.get(i, "pay") != "pay"]
         if blocked:
             raise HTTPException(409, "Not ready to pay (review, hold or do not pay): " + ", ".join(blocked[:10]))
-        marked = db.mark_paid(org, list(dict.fromkeys(body.invoice_ids)), user["sub"], body.reference)
+        wanted = list(dict.fromkeys(body.invoice_ids))
+        try:
+            marked = db.mark_paid(org, wanted, user["sub"], body.reference,
+                                  expected_flags={i: frozenset(seen.get(i, ())) for i in wanted})
+        except FlagsChanged as exc:
+            raise HTTPException(409, "Detection found something new on " + ", ".join(exc.invoice_ids[:10])
+                                + " while you were marking it. Review it again; nothing was marked.") from None
         if marked:
             db.audit(org, user["sub"], "invoices_paid",
                      f"{len(marked)} marked paid" + (f" ({body.reference.strip()[:60]})" if body.reference else ""))

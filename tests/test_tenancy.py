@@ -129,6 +129,12 @@ class PostgresRowLevelSecurityTests(TenantSeedMixin, DbTestCase):
                                "WHERE rolname = current_user").fetchone()
         self.assertEqual(row, ("invoice_app", False, False))
 
+    def test_the_server_refuses_a_powerful_connection(self):
+        """Round 4: row-level security isn't forced, so a server started with the owner's
+        address would lose the database-level separation. It refuses to start instead."""
+        self.assertIsNone(self.app.privilege_problem())
+        self.assertEqual(self.admin.privilege_problem(), "it is a superuser")
+
     def test_with_no_company_set_every_table_looks_empty(self):
         self.assertEqual(self.count_as_owner("invoices", self.b), 3)  # the data is there
         for table in TABLES:

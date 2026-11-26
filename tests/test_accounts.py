@@ -37,9 +37,9 @@ class AccountsTestCase(DbTestCase):
     def sign_in(self, username="alice@acme.example", password=PW):
         return self.acc.authenticate(self.acc.login(username, password, "1.2.3.4")["access_token"])
 
-    def turn_on_2fa(self, user):
+    def turn_on_2fa(self, user, password=PW):
         secret = self.acc.setup_2fa(user)["secret"]
-        enabled = self.acc.enable_2fa(user, now_code(secret))
+        enabled = self.acc.enable_2fa(user, now_code(secret), password)
         return secret.replace(" ", ""), enabled
 
     def emails(self):
@@ -114,8 +114,8 @@ class TwoFactorTests(AccountsTestCase):
         self.assertTrue(setup["uri"].startswith("otpauth://totp/Invoice%20Review%3Aalice%40acme.example"))
         self.assertTrue(setup["qr"].startswith("data:image/svg+xml;base64,"))
         with self.assertRaises(AccountError):
-            self.acc.enable_2fa(user, "000000")
-        enabled = self.acc.enable_2fa(user, now_code(setup["secret"]))
+            self.acc.enable_2fa(user, "000000", PW)
+        enabled = self.acc.enable_2fa(user, now_code(setup["secret"]), PW)
         self.assertEqual(len(enabled["recovery_codes"]), 10)
         self.assertTrue(self.acc.authenticate(enabled["access_token"])["mfa"])
         stored = self.app.user_security(self.a, "alice@acme.example")
@@ -186,7 +186,7 @@ class TwoFactorTests(AccountsTestCase):
             self.acc.authenticate(token)
         self.assertEqual((cm.exception.status, cm.exception.requires_2fa), (403, True))
         user = self.acc.authenticate(token, enforce_2fa=False)  # can still reach set-up
-        secret, enabled = self.turn_on_2fa(user)
+        secret, enabled = self.turn_on_2fa(user, "bob-password-12345")
         self.assertEqual(self.acc.authenticate(enabled["access_token"])["sub"], "bob")
         strong = self.acc.authenticate(enabled["access_token"])
         with self.assertRaises(AccountError) as cm:
@@ -262,7 +262,7 @@ class ResetTests(AccountsTestCase):
         self.acc.admin_set_password(admin, "bob", "temporary-password-1")
         self.assertTrue(self.acc.login("bob", "temporary-password-1", "1.2.3.4")["access_token"])
         bob = self.acc.authenticate(self.acc.login("bob", "temporary-password-1", "1.2.3.4")["access_token"])
-        self.turn_on_2fa(bob)
+        self.turn_on_2fa(bob, "temporary-password-1")
         self.acc.admin_reset_2fa(admin, "bob")
         self.assertIn("access_token", self.acc.login("bob", "temporary-password-1", "1.2.3.4"))
         for action in (lambda: self.acc.admin_set_password(admin, "carol@globex.example", "temporary-password-1"),

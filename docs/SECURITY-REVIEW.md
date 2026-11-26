@@ -53,6 +53,28 @@ Checked in this round and found sound: every route's sign-in and role requiremen
 
 Checked in the second round and found sound: XML in e-invoices (DTDs and entities refused, 2 MB cap, 140,000-level nesting, 380,000 elements and 140,000 attributes each parse in under a second); a 100 MB attachment compressed into a small PDF (refused by pypdf's limit, the page is read instead); a credit note's reference (validated like an invoice number, shown as text, scoped to the company); lessons (signed in the draft, reduced to letters, isolated per company by row-level security).
 
+### Fourth round (25 Nov 2026: every item left open by the follow-up pass)
+
+Each open item was attacked. Nine were real and are fixed, one held, one is a product decision.
+
+| # | Severity | What an attacker could do | Fix |
+|---|---|---|---|
+| 22 | High | **Take over an account through single sign-on.** With a generic provider (Okta, Auth0, Keycloak…), an address marked *unverified* was skipped and the code fell back to `preferred_username`, which many providers let the person type. Calling yourself `admin@yourcompany.com` was enough. | Never falls back when the address is unverified, and the generic provider requires `email_verified: true` by default (`OIDC_REQUIRE_VERIFIED_EMAIL=0` to opt out). |
+| 23 | Medium | **Get eight times the password guesses.** The limit was checked, and the failure counted afterwards. Forty guesses sent at the same instant were all checked (measured: 40 of 40). | Every attempt is counted first, in one atomic statement, and given back only if it was right: 5 of 40 are checked. |
+| 24 | Medium | **Keep a stolen session for good.** Someone holding only a session could turn on two-factor with their own phone, and the victim's other sessions stayed open. | Turning on two-factor asks for the current password, and ends every other session. |
+| 25 | Medium | **Release a large flagged credit note alone**, the first half of the "cancel and re-issue, get paid twice" scheme. | Credit notes at or above the approval threshold need a second person, like invoices. |
+| 26 | Medium | **Lose company separation through a setup mistake.** Row-level security isn't applied to a superuser or the table owner, so a server started with the owner's address quietly lost it. Forcing it on the owner would break the deliberate cross-company sign-in lookup. | The web server refuses to start with a superuser, a BYPASSRLS role, or the table owner. |
+| 27 | Low | **Pay an invoice just flagged.** Mark-paid read the decision, then wrote the payment in a later transaction; a detection run in between went unseen. | The flags are read first and checked again inside the payment transaction, under the detection lock. If they changed, nothing is marked. |
+| 28 | Low | **Run code in the server from a taken-over document reader.** The sandboxed reader answered with an ordinary pickle. | Answers are read with an allow-list: only plain data and the two result types can be rebuilt. |
+| 29 | Low | **Create two accounts as "Alice" and "alice"** from the command line; sign-in then picked one. | The database enforces unique usernames in any capitals. |
+| 30 | Low | **Open a second way into a single-sign-on account.** An admin could set it a password, which skips the company's provider and its two-factor and offboarding. | Refused. |
+
+Held: a workbook zip that declares 1 KB and holds 100 MB can't expand, because Python stops at the declared size and rejects the file. It is now a test.
+
+Still a product decision: an e-invoice that is partly prepaid is stored for the grand total and warns about the lower amount due.
+
+Infrastructure added alongside: admins must use two-factor in production (`ADMIN_REQUIRE_2FA=1`), weekly patched images and daily OS updates (`deploy/auto-update.sh`), and an outside check of the live server (`scripts/check_live.py`), which runs in CI against the full HTTPS stack.
+
 ## Checked and found sound
 
 These were attacked and held, so nothing was changed:
@@ -79,19 +101,7 @@ Fixed in this change:
 - A credit note whose reference normalized to more than one invoice was linked to whichever row came back first, and the other invoice stayed payable. Neither invoice is linked, and each is flagged.
 - The payment file and mark-paid path already load every flag (`list_anomalies` with no limit). The public flag list stays capped. An open flag that is past the review screen's 500 rows is still not payable.
 
-Still open, and not changed in this pass:
-
-- A flagged credit note of any amount can be released by one reviewer. `needs_second_approval` returns false for `kind == "credit"`, and the tests lock that exemption in.
-- The generic single sign-on provider can accept `preferred_username` when `email_verified` is missing or false, because `OIDC_REQUIRE_VERIFIED_EMAIL` defaults off. Microsoft's directory sign-in name is a separate, deliberate claim order.
-- Turning on two-factor does not ask for the current password and does not end other sessions.
-- The annotated-workbook download parses the upload again inside the API process, and the zip check trusts the declared uncompressed size.
-- The document-parser boundary unpickles the child result in the API process.
-- Row-level security is not forced, so a connection as the table owner bypasses the company policies.
-- Sign-in limits can be overshot by one wave of parallel requests, because the check and the failure count are separate transactions.
-- The CLI can create a second casing of a username, and login then returns one of them. The API blocks that second casing.
-- An admin can replace an SSO-only account's password marker, which lets that person sign in with a password.
-- Mark-paid reads the decision, then inserts the payment in a later transaction. A detection run in between is not seen.
-- An e-invoice that is partly prepaid is stored for the grand total. The lower amount due is only a warning.
+Every item this pass left open was taken up in the fourth round above.
 
 ## Known limits that remain
 

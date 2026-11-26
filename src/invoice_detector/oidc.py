@@ -73,7 +73,7 @@ def providers_from_env(env=os.environ) -> dict[str, Provider]:
         found["sso"] = Provider("sso", env.get("OIDC_LABEL", "single sign-on"), env["OIDC_ISSUER"].rstrip("/"),
                                 env.get("OIDC_CLIENT_ID", ""), env.get("OIDC_CLIENT_SECRET", ""),
                                 email_claims=("email", "preferred_username"),
-                                require_verified_email=env.get("OIDC_REQUIRE_VERIFIED_EMAIL", "0") == "1")
+                                require_verified_email=env.get("OIDC_REQUIRE_VERIFIED_EMAIL", "1") != "0")
     return found
 
 
@@ -245,6 +245,10 @@ class OIDCClient:
         unverified = claims.get("email_verified") is False or (
             self.provider.name == "microsoft" and claims.get("xms_edov") is not True)
         if self.provider.require_verified_email and claims.get("email_verified") is not True:
+            raise SSOError("Your email address isn't verified with the sign-in provider.")
+        if unverified and self.provider.name != "microsoft":
+            # Don't fall back to another claim: outside Microsoft's directory, a username such as
+            # preferred_username is often chosen by the person, so "alice@yourco.com" proves nothing.
             raise SSOError("Your email address isn't verified with the sign-in provider.")
         for name in self.provider.email_claims:
             value = claims.get(name)

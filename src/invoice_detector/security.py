@@ -5,6 +5,7 @@ import hmac
 import json
 import re
 import secrets
+import threading
 import time
 from collections import defaultdict, deque
 
@@ -48,6 +49,7 @@ class RateLimiter:
         self.max, self.window, self.lockout = max_attempts, window, lockout
         self._failures: dict[str, deque] = defaultdict(deque)
         self._locked_until: dict[str, float] = {}
+        self._mutex = threading.Lock()
 
     def check(self, key: str, now: float | None = None) -> None:
         now = time.time() if now is None else now
@@ -78,6 +80,31 @@ class RateLimiter:
 
     def record_success(self, key: str) -> None:
         self._failures.pop(key, None)
+
+    # Charge-first use, so parallel requests can't all pass the check before any is counted:
+    # take() counts the attempt and refuses once more than max_attempts are in the window
+    # (locking the key); refund() gives one back when the attempt turned out to be right.
+    def take(self, key: str, now: float | None = None) -> None:
+        now = time.time() if now is None else now
+        with self._mutex:
+            if self._locked_until.get(key, 0) > now:
+                raise RateLimitError("Too many attempts")
+            if len(self._failures) > self.MAX_KEYS:
+                self._prune(now)
+            q = self._failures[key]
+            while q and q[0] < now - self.window:
+                q.popleft()
+            q.append(now)
+            if len(q) > self.max:
+                self._locked_until[key] = now + self.lockout
+                q.clear()
+                raise RateLimitError("Too many attempts")
+
+    def refund(self, key: str) -> None:
+        with self._mutex:
+            q = self._failures.get(key)
+            if q:
+                q.pop()
 
 
 # ---------- signed, expiring tokens ----------

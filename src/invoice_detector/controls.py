@@ -7,7 +7,7 @@ easy to read and to test:
   Otherwise one person could enter a fake invoice and wave it through. It applies whenever
   the company has at least two people who can review (a company of one can't separate
   anything; their reviews are still in the activity log).
-- **Second approval.** Releasing a flagged invoice for payment (dismissing its flags, or
+- **Second approval.** Releasing a flagged invoice or credit note for payment (dismissing its flags, or
   confirming them but choosing "pay") at or above the company's approval threshold needs a
   second, different person: not the reviewer, and not whoever added the invoice.
 - **Paid.** Only an invoice whose decision is "pay" can be marked paid. A paid invoice
@@ -41,9 +41,13 @@ def releases_payment(verdict: str, action: str | None) -> bool:
 
 def needs_second_approval(amount: float, kind: str, threshold: float, verdict: str, action: str | None,
                           reviewers: int) -> bool:
-    """Does releasing this flagged invoice need a second person?"""
-    return (kind != "credit" and releases_payment(verdict, action) and abs(amount) >= threshold
-            and can_separate(reviewers))
+    """Does releasing this flagged invoice (or credit note) need a second person?
+
+    Credit notes are included: a credit cancels an invoice, so one reviewer accepting a large
+    flagged credit could clear the way for the "cancel, then re-issue and get paid twice"
+    scheme. The size that counts is the credit's absolute value."""
+    del kind
+    return releases_payment(verdict, action) and abs(amount) >= threshold and can_separate(reviewers)
 
 
 def check_approver(approver: str, reviewer: str | None, added_by: str | None) -> None:

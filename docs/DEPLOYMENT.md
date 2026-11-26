@@ -336,7 +336,9 @@ Microsoft doesn't guarantee is theirs.
 
 Set `OIDC_ISSUER` (e.g. `https://yourcompany.okta.com`), `OIDC_CLIENT_ID`,
 `OIDC_CLIENT_SECRET`, and optionally `OIDC_LABEL` (button text). Redirect URI:
-`https://invoices.yourcompany.com/auth/sso/callback`.
+`https://invoices.yourcompany.com/auth/sso/callback`. The provider must say the email address
+is verified (`email_verified: true`); only if yours never sends that claim, and its users
+can't change their own address, set `OIDC_REQUIRE_VERIFIED_EMAIL=0`.
 
 ### When someone leaves
 

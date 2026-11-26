@@ -153,6 +153,12 @@ ADDED_COLUMNS = [
     ("reviews", "approved_at", "TEXT"),
 ]
 
+# Usernames are unique whatever their capitals: sign-in matches them that way, so "Alice" and
+# "alice" as two accounts would let sign-in pick either. Applied after the tables exist; a
+# database that already holds such a pair keeps working (the app refuses new pairs) and the
+# start-up log says which name to fix.
+USERNAME_INDEX = "CREATE UNIQUE INDEX IF NOT EXISTS users_username_any_case ON users (lower(username))"
+
 # Idempotent: safe to run on every deploy.
 POSTGRES_SECURITY = """
 DO $$ BEGIN

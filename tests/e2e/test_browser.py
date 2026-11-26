@@ -455,6 +455,7 @@ class BrowserTest(unittest.TestCase):
         self.assertTrue(p.get_attribute("img.qr", "src").startswith("data:image/svg+xml;base64,"))
         secret = p.inner_text("#tf-secret").replace(" ", "")
         self.shot("12-two-factor-setup")
+        p.fill("#tf-password", USERS["erin@acme.example"][2])
         p.fill("#tf-confirm", "000000")
         p.click("button:text('Turn on')")
         p.wait_for_selector("text=That code isn't right")

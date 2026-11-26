@@ -27,7 +27,8 @@ class RulesTests(unittest.TestCase):
         self.assertTrue(needs_second_approval(10_000, "invoice", 10_000, "dismissed", "pay", 2))
         self.assertFalse(needs_second_approval(9_999.99, "invoice", 10_000, "dismissed", "pay", 2))
         self.assertFalse(needs_second_approval(50_000, "invoice", 10_000, "confirmed", "do_not_pay", 2))
-        self.assertFalse(needs_second_approval(50_000, "credit", 10_000, "dismissed", "pay", 2))
+        self.assertTrue(needs_second_approval(-50_000, "credit", 10_000, "dismissed", "pay", 2))   # round 4
+        self.assertFalse(needs_second_approval(-500, "credit", 10_000, "dismissed", "pay", 2))
         self.assertFalse(needs_second_approval(50_000, "invoice", 10_000, "dismissed", "pay", 1))
 
     def test_the_second_person_is_really_someone_else(self):
@@ -107,6 +108,19 @@ class StoredPaymentsTests(DbTestCase):
         self.assertFalse(self.app.unmark_paid(self.a, "I1"))
         self.assertIsNone(self.app.list_invoices(self.a)[0]["paid_at"])
         self.assertEqual(self.app.payments(self.b), {})                     # the other company sees nothing
+
+    def test_a_flag_that_lands_before_the_payment_is_written_stops_it(self):
+        """Round 4: the decision was read, then the payment written later; a detection run in
+        between (here, a new duplicate) went unseen and the invoice was marked paid."""
+        from invoice_detector.db import FlagsChanged
+        from invoice_detector.detection import Anomaly
+        self.app.add_invoice(self.a, "I1", "Acme", 100.0, "2026-01-05", None, "alice")
+        self.app.save_flags(self.a, [Anomaly("I1", "duplicate", "high", "x")])   # after the decision
+        with self.assertRaises(FlagsChanged):
+            self.app.mark_paid(self.a, ["I1"], "bob", expected_flags={"I1": frozenset()})
+        self.assertEqual(self.app.payments(self.a), {})
+        self.assertEqual(self.app.mark_paid(self.a, ["I1"], "bob", expected_flags={"I1": frozenset({"duplicate"})}),
+                         ["I1"])
 
     def test_a_new_review_clears_the_second_approval(self):
         from invoice_detector.detection import Anomaly

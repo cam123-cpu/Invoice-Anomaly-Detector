@@ -23,12 +23,20 @@ from .config import Settings
 from .crypto import Vault
 from .detection import Anomaly, Invoice
 from .decisions import ACTIONS, deciding_rule, suggested_action
-from .schema import ADDED_COLUMNS, POSTGRES_SECURITY, POSTGRES_TABLES, SQLITE_SCHEMA
+from .schema import ADDED_COLUMNS, POSTGRES_SECURITY, POSTGRES_TABLES, SQLITE_SCHEMA, USERNAME_INDEX
 from .security import RateLimitError, hash_password
 
 SORTABLE = {"id", "vendor", "amount", "invoice_date"}  # column names can't be parameters
 ROLES = ("admin", "accountant", "auditor")
 VERDICTS = ("confirmed", "dismissed")
+
+
+class FlagsChanged(Exception):
+    """Detection changed these invoices' flags after their payment decision was read."""
+
+    def __init__(self, invoice_ids: list[str]):
+        super().__init__(", ".join(invoice_ids))
+        self.invoice_ids = invoice_ids
 
 
 class Conflict(Exception):
@@ -56,6 +64,14 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
+def _log_same_name_twice() -> None:
+    import logging
+    logging.getLogger("invoice_detector").warning(
+        "Two accounts have the same username in different capitals. Rename one "
+        "(create the right one and remove access from the other); "
+        "new accounts like that are refused.")
+
+
 class Database:
     def __init__(self, url: str, keys: dict[int, bytes], index_key: bytes):
         self._keys, self._index_key = keys, index_key
@@ -75,6 +91,10 @@ class Database:
             self._check_not_old_format()
             self.conn.executescript(SQLITE_SCHEMA)
             self._add_missing_columns()
+            try:
+                self.conn.execute(USERNAME_INDEX)
+            except sqlite3.IntegrityError:
+                _log_same_name_twice()
 
     @classmethod
     def from_settings(cls, settings: Settings, admin: bool = False) -> "Database":
@@ -116,6 +136,13 @@ class Database:
             self.conn.execute(POSTGRES_TABLES)
             for table, column, definition in ADDED_COLUMNS:
                 self.conn.execute(f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {column} {definition}")
+            self.conn.execute("SAVEPOINT username_index")
+            try:
+                self.conn.execute(USERNAME_INDEX)
+                self.conn.execute("RELEASE SAVEPOINT username_index")
+            except self._integrity_error:
+                self.conn.execute("ROLLBACK TO SAVEPOINT username_index")
+                _log_same_name_twice()
             self.conn.execute(POSTGRES_SECURITY)
             from .config import env
             password = env("APP_DB_PASSWORD")
@@ -185,6 +212,27 @@ class Database:
                             "idx": master.blind_index("index-check")})
         with self._tx() as run:
             run("INSERT INTO meta (key, value) VALUES (?, ?) ON CONFLICT (key) DO NOTHING", ("key_check", value))
+
+    def privilege_problem(self) -> str | None:
+        """On PostgreSQL, why this connection is too powerful for the web server, or None.
+
+        Company separation in the database (row-level security) does not apply to a superuser,
+        a role with BYPASSRLS, or the role that owns the tables. A server started with the
+        owner's address by mistake would quietly lose that protection, so it refuses instead."""
+        if not self.is_postgres:
+            return None
+        row = self.conn.execute(
+            "SELECT r.rolsuper AS sup, r.rolbypassrls AS bypass, "
+            "       EXISTS (SELECT 1 FROM pg_tables t WHERE t.tablename = 'invoices' "
+            "               AND t.tableowner = current_user) AS owns "
+            "FROM pg_roles r WHERE r.rolname = current_user").fetchone()
+        if row["sup"]:
+            return "it is a superuser"
+        if row["bypass"]:
+            return "it can bypass row-level security"
+        if row["owns"]:
+            return "it owns the tables"
+        return None
 
     def ping(self) -> bool:
         with self._tx() as run:
@@ -587,12 +635,28 @@ class Database:
         return int(rows[0]["n"])
 
     # ----- payments -----
-    def mark_paid(self, org_id: str, invoice_ids: list[str], paid_by: str, reference: str | None = None) -> list[str]:
-        """Record payment of these invoices. Returns the ids newly marked (already paid ones are skipped)."""
+    def mark_paid(self, org_id: str, invoice_ids: list[str], paid_by: str, reference: str | None = None,
+                  expected_flags: dict[str, frozenset] | None = None) -> list[str]:
+        """Record payment of these invoices. Returns the ids newly marked (already paid ones are skipped).
+
+        expected_flags is what the "pay" decision was based on: {invoice id: its flagged rules}.
+        They are read again inside this transaction (holding the same lock a detection run
+        takes) and, if any differs, nothing is recorded and FlagsChanged is raised. Otherwise a
+        detection run landing between the decision and the payment would go unseen."""
         # One statement per invoice that does nothing if it is already paid, so two people
         # marking the same invoice at the same moment can't both succeed (or cause an error).
         marked = []
         with self._tx(org_id) as run:
+            if expected_flags is not None:
+                if self.is_postgres:
+                    run("SELECT pg_advisory_xact_lock(hashtext(?))", ("flags:" + org_id,))
+                now: dict[str, set] = {i: set() for i in invoice_ids}
+                for r in run("SELECT invoice_id, rule FROM anomalies WHERE org_id = ?", (org_id,)):
+                    if r["invoice_id"] in now:
+                        now[r["invoice_id"]].add(r["rule"])
+                changed = [i for i in now if now[i] != set(expected_flags.get(i, ()))]
+                if changed:
+                    raise FlagsChanged(changed)
             for inv_id in dict.fromkeys(invoice_ids):
                 done = run("INSERT INTO payments (org_id, invoice_id, paid_at, paid_by, reference) "
                            "VALUES (?, ?, ?, ?, ?) ON CONFLICT (org_id, invoice_id) DO NOTHING RETURNING invoice_id",
@@ -710,3 +774,34 @@ class DbRateLimiter:
     def record_success(self, key: str) -> None:
         with self.db._tx() as run:
             run("DELETE FROM rate_limits WHERE key = ? AND locked_until <= ?", (self._key(key), int(time.time())))
+
+    def take(self, key: str, now: float | None = None) -> None:
+        """Count this attempt before it is checked, in one statement: a burst of parallel
+        requests can't all slip past a check that runs before any of them is counted. The
+        attempt that would be one more than max_attempts is refused and locks the key."""
+        now = int(time.time() if now is None else now)
+        expired = now - self.window
+        fresh = "CASE WHEN rate_limits.window_start < ? THEN 1 ELSE rate_limits.failures + 1 END"
+        with self.db._tx() as run:
+            rows = run("INSERT INTO rate_limits (key, failures, window_start, locked_until) VALUES (?, 1, ?, ?) "
+                       f"ON CONFLICT (key) DO UPDATE SET failures = {fresh}, "
+                       # locking also ends the window, so the count starts again after the lock
+                       f"window_start = CASE WHEN {fresh} > ? THEN 0 "
+                       "WHEN rate_limits.window_start < ? THEN ? ELSE rate_limits.window_start END, "
+                       f"locked_until = CASE WHEN {fresh} > ? THEN ? ELSE rate_limits.locked_until END "
+                       "WHERE rate_limits.locked_until <= ? RETURNING failures, locked_until",
+                       (self._key(key), now, now + self.lockout if self.max < 1 else 0,
+                        expired, expired, self.max, expired, now, expired, self.max, now + self.lockout, now))
+        if not rows or rows[0]["failures"] > self.max:
+            locked = rows[0]["locked_until"] if rows else self._locked_until_now(key)
+            raise RateLimitError(max(int(locked - now), 0) + 1)
+
+    def _locked_until_now(self, key: str) -> int:
+        with self.db._tx() as run:
+            rows = run("SELECT locked_until FROM rate_limits WHERE key = ?", (self._key(key),))
+        return int(rows[0]["locked_until"]) if rows else 0
+
+    def refund(self, key: str) -> None:
+        """Give back the attempt take() counted: it was the right password."""
+        with self.db._tx() as run:
+            run("UPDATE rate_limits SET failures = failures - 1 WHERE key = ? AND failures > 0", (self._key(key),))

@@ -10,13 +10,42 @@ the parsing in a child process means:
 
 The child is started fresh ("spawn"), so it shares nothing with the server but the
 arguments it is given, and it returns only plain data.
+
+The answer comes back as a pickle, read with an allow-list: only the few result types below
+can be rebuilt. If a hostile file ever took over the child, an ordinary pickle would let it
+run code in the server when the answer is read; with the allow-list it can only send data.
 """
 from __future__ import annotations
 
 import importlib
+import io
 import multiprocessing as mp
+import pickle
 
 from .importer import FileProblem
+
+ALLOWED_RESULT_TYPES = {
+    ("builtins", "set"), ("builtins", "frozenset"),
+    ("datetime", "date"), ("datetime", "datetime"), ("datetime", "time"), ("datetime", "timedelta"),
+    ("datetime", "timezone"), ("decimal", "Decimal"),
+    ("invoice_detector.documents", "Extraction"), ("invoice_detector.importer", "Table"),
+}
+
+
+class _ResultUnpickler(pickle.Unpickler):
+    def find_class(self, module: str, name: str):
+        if (module, name) not in ALLOWED_RESULT_TYPES:
+            raise pickle.UnpicklingError(f"refused type {module}.{name}")
+        return super().find_class(module, name)
+
+
+def read_result(data: bytes):
+    """Rebuild the child's answer, allowing only plain data and the known result types."""
+    return _ResultUnpickler(io.BytesIO(data)).load()
+
+
+def _send(conn, message) -> None:
+    conn.send_bytes(pickle.dumps(message, protocol=pickle.HIGHEST_PROTOCOL))
 
 
 def _child(conn, target: str, args: tuple, memory_mb: int) -> None:
@@ -30,13 +59,13 @@ def _child(conn, target: str, args: tuple, memory_mb: int) -> None:
                 pass   # not on this platform (Windows, macOS): the time limit still applies
         module, name = target.split(":")
         result = getattr(importlib.import_module(module), name)(*args)
-        conn.send(("ok", result))
+        _send(conn, ("ok", result))
     except FileProblem as exc:
-        conn.send(("problem", str(exc)))
+        _send(conn, ("problem", str(exc)))
     except MemoryError:
-        conn.send(("problem", "This file needs too much memory to read. Try a smaller or simpler file."))
+        _send(conn, ("problem", "This file needs too much memory to read. Try a smaller or simpler file."))
     except BaseException as exc:  # never let the details of a parser crash reach the user
-        conn.send(("error", type(exc).__name__))
+        _send(conn, ("error", type(exc).__name__))
     finally:
         conn.close()
 
@@ -54,8 +83,8 @@ def run_isolated(target: str, *args, timeout: float = 45, memory_mb: int = 2048)
             raise FileProblem(f"Reading this file took longer than {int(timeout)} seconds, so it was stopped. "
                               "It may be damaged, or far larger than an invoice.")
         try:
-            kind, value = receive.recv()
-        except EOFError:
+            kind, value = read_result(receive.recv_bytes(256 * 1024 * 1024))
+        except (EOFError, OSError, pickle.UnpicklingError, ValueError, TypeError):
             raise FileProblem("This file could not be read (the reader stopped unexpectedly).") from None
     finally:
         if proc.is_alive():

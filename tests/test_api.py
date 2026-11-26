@@ -492,7 +492,8 @@ class SignInApiTests(DbTestCase):
 
     def enable(self, token):
         setup = self.client.post("/me/2fa/setup", headers=self.h(token)).json()
-        done = self.client.post("/me/2fa/enable", json={"code": self.code(setup["secret"])}, headers=self.h(token)).json()
+        done = self.client.post("/me/2fa/enable", json={"code": self.code(setup["secret"]), "password": PW_A},
+                                headers=self.h(token)).json()
         return setup["secret"], done
 
     def test_two_factor(self):
@@ -500,9 +501,14 @@ class SignInApiTests(DbTestCase):
         self.assertFalse(self.client.get("/me", headers=self.h(token)).json()["two_factor_enabled"])
         setup = self.client.post("/me/2fa/setup", headers=self.h(token)).json()
         self.assertTrue(setup["qr"].startswith("data:image/svg+xml;base64,"))
-        bad = self.client.post("/me/2fa/enable", json={"code": "000000"}, headers=self.h(token))
+        bad = self.client.post("/me/2fa/enable", json={"code": "000000", "password": PW_A}, headers=self.h(token))
         self.assertEqual(bad.status_code, 400)
-        done = self.client.post("/me/2fa/enable", json={"code": self.code(setup["secret"])}, headers=self.h(token)).json()
+        # a stolen session alone can't tie the account to the thief's phone
+        stolen = self.client.post("/me/2fa/enable", json={"code": self.code(setup["secret"])}, headers=self.h(token))
+        self.assertEqual(stolen.status_code, 401)
+        done = self.client.post("/me/2fa/enable", json={"code": self.code(setup["secret"]), "password": PW_A},
+                                headers=self.h(token)).json()
+        self.assertEqual(self.client.get("/me", headers=self.h(token)).status_code, 401)   # the old session ended
         self.assertEqual(len(done["recovery_codes"]), 10)
         first = self.client.post("/login", json={"username": "alice@acme.example", "password": PW_A}).json()
         self.assertEqual(set(first), {"mfa_required", "mfa_token"})

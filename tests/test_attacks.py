@@ -137,6 +137,27 @@ class TwoFactorAttackTests(base.AccountsTestCase):
         self.assertEqual(len(self.app.user_security(self.a, "alice@acme.example")["recovery_codes"]), len(before) - 1)
 
 
+class AccountIdentityTests(base.AccountsTestCase):
+    def test_a_second_casing_of_a_username_is_refused_everywhere(self):
+        """Round 4: the API refused "ALICE@..." beside "alice@...", but the command line (owner
+        connection) didn't, and sign-in then picked one of the two. The database refuses now."""
+        from invoice_detector.db import Conflict
+        with self.assertRaises(Conflict):
+            self.admin.create_user(self.b, "ALICE@acme.example", "another-password-1", "admin")
+        self.assertEqual(self.acc.authenticate(self.acc.login("Alice@ACME.example", PW, "1.2.3.4")
+                                               ["access_token"])["org"], self.a)
+
+    def test_an_admin_cannot_give_a_single_sign_on_account_a_password(self):
+        """Round 4: that would be a way in around the company's sign-in provider."""
+        self.app.create_user(self.a, "sso-person@acme.example", None, "accountant")
+        admin = self.sign_in()
+        with self.assertRaises(AccountError) as cm:
+            self.acc.admin_set_password(admin, "sso-person@acme.example", "a-new-password-123")
+        self.assertEqual(cm.exception.status, 409)
+        with self.assertRaises(AccountError):
+            self.acc.login("sso-person@acme.example", "a-new-password-123", "1.2.3.4")
+
+
 class EnumerationAndSpoofingTests(base.AccountsTestCase):
     def test_forgot_password_takes_the_same_time_for_everyone(self):
         """Sending an email takes a moment. If the server waits for it, a slow answer means
@@ -203,6 +224,67 @@ class SingleSignOnIdentityTests(unittest.TestCase):
         with self.assertRaises(SSOError):
             client.email_from({"email": "admin@acme.example", "email_verified": False})
         self.assertEqual(client.email_from({"email": "a@acme.example", "email_verified": True}), "a@acme.example")
+
+    def test_a_chosen_username_does_not_stand_in_for_an_unverified_address(self):
+        """Round 4: with the address marked unverified, the generic provider used to fall back
+        to preferred_username, which on many providers the person types in themselves."""
+        client = self.client("sso", email_claims=("email", "preferred_username"))
+        with self.assertRaises(SSOError):
+            client.email_from({"email": "mallory@evil.example", "email_verified": False,
+                               "preferred_username": "admin@acme.example"})
+
+    def test_generic_provider_requires_verified_by_default(self):
+        from invoice_detector.oidc import providers_from_env
+        env = {"OIDC_ISSUER": "https://idp.example", "OIDC_CLIENT_ID": "x", "OIDC_CLIENT_SECRET": "y"}
+        self.assertTrue(providers_from_env(env)["sso"].require_verified_email)
+        self.assertFalse(providers_from_env({**env, "OIDC_REQUIRE_VERIFIED_EMAIL": "0"})["sso"].require_verified_email)
+
+
+class SandboxAnswerTests(unittest.TestCase):
+    def test_a_taken_over_reader_cannot_run_code_in_the_server(self):
+        """Round 4: the reader's answer was an ordinary pickle. A child process taken over by a
+        hostile file could have answered with one that runs a command when the server reads it."""
+        import pickle
+        from invoice_detector.isolation import read_result
+
+        class Evil:
+            def __reduce__(self):
+                import os
+                return (os.system, ("echo pwned",))
+        with self.assertRaises(pickle.UnpicklingError):
+            read_result(pickle.dumps(("ok", Evil())))
+
+    def test_real_answers_still_come_back(self):
+        import datetime
+        from invoice_detector.isolation import run_isolated
+        table = run_isolated("invoice_detector.importer:read_table", "a.csv",
+                             b"id,vendor,amount,date\nA,V,1,2026-01-01\nB,W,2,2026-01-02\n")
+        self.assertEqual(len(table.rows), 2)
+        from invoice_detector.isolation import read_result
+        import pickle
+        self.assertEqual(read_result(pickle.dumps(("ok", {"d": datetime.date(2026, 1, 2), "s": {1}}))),
+                         ("ok", {"d": datetime.date(2026, 1, 2), "s": {1}}))
+
+    def test_a_zip_that_lies_about_its_size_cannot_expand(self):
+        """Round 4: the workbook check adds up the sizes the zip declares. A zip that declares
+        1 KB and holds 100 MB is still safe: Python stops at the declared size and rejects it."""
+        import struct
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+            z.writestr("xl/workbook.xml", "<workbook/>")
+            z.writestr("xl/worksheets/sheet1.xml", b"<x/>" * 25_000_000)
+        data = bytearray(buf.getvalue())
+        for sig, name_at, size_at in ((b"PK\x03\x04", 30, 22), (b"PK\x01\x02", 46, 24)):
+            i = 0
+            while (i := data.find(sig, i)) != -1:
+                if data[i + name_at:].startswith(b"xl/worksheets/sheet1.xml"):
+                    struct.pack_into("<I", data, i + size_at, 1000)
+                i += 4
+        with zipfile.ZipFile(io.BytesIO(bytes(data))) as z:
+            with self.assertRaises(zipfile.BadZipFile):
+                z.read("xl/worksheets/sheet1.xml")
+        with self.assertRaises(FileProblem):
+            read_table("bomb.xlsx", bytes(data))
 
 
 class DenialOfServiceTests(unittest.TestCase):
@@ -344,6 +426,47 @@ class RateLimitStorageTests(base.AccountsTestCase):
 
 class SeveralServersTests(base.AccountsTestCase):
     """Two copies of the app behind a load balancer, sharing one database."""
+
+    def test_a_burst_of_parallel_guesses_gets_no_extra_tries(self):
+        """Round 4: the limit was checked, then the failure counted later. Forty guesses sent
+        at the same instant all passed the check before any was counted. Each attempt is now
+        counted first, in one statement, so only five passwords are ever checked."""
+        import threading
+        from invoice_detector import accounts as accounts_module
+        checked, real = [], accounts_module.verify_password
+
+        def slow_verify(password, stored):
+            checked.append(password)
+            time.sleep(0.02)                 # widen the gap an attacker would race through
+            return real(password, stored)
+
+        servers = [self.acc, self.second_server(), self.second_server()]
+        start, answers = threading.Barrier(40), []
+
+        def guess(i):
+            start.wait()
+            try:
+                servers[i % 3].login("alice@acme.example", f"guess-number-{i}", "6.6.6.6")
+            except AccountError as exc:
+                answers.append(exc.status)
+
+        with mock.patch.object(accounts_module, "verify_password", slow_verify):
+            threads = [threading.Thread(target=guess, args=(i,)) for i in range(40)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+        self.assertLessEqual(len(checked), 5)
+        self.assertEqual(answers.count(401), len(checked))
+        self.assertEqual(answers.count(429), 40 - len(checked))
+        with self.assertRaises(AccountError) as cm:      # still locked, even with the right password
+            self.acc.login("alice@acme.example", PW, "6.6.6.6")
+        self.assertEqual(cm.exception.status, 429)
+
+    def test_right_passwords_do_not_use_up_the_limits(self):
+        for _ in range(30):                              # a busy office behind one address
+            self.acc.login("alice@acme.example", PW, "10.0.0.1")
+        self.acc.login("bob", "bob-password-12345", "10.0.0.1")
 
     def second_server(self):
         from invoice_detector.accounts import Accounts
