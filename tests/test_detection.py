@@ -357,6 +357,10 @@ class VendorRoutineTests(unittest.TestCase):
         self.assertEqual(find_near_duplicates(weekly), [])
         extra = weekly + [inv("RT-X", "RetainCo", 1500.0, "2026-01-21")]          # two days after the 19th
         self.assertEqual([a.invoice_id for a in find_near_duplicates(extra)], ["RT-X"])
+        # A copy one day before the real Monday used to become the new schedule, and the real
+        # bill was the one that got flagged. The grid date keeps the Monday; the early copy is the flag.
+        early = weekly + [inv("RT-EARLY", "RetainCo", 1500.0, "2026-01-25")]
+        self.assertEqual([a.invoice_id for a in find_near_duplicates(early)], ["RT-EARLY"])
         # Three weekly invoices aren't a schedule yet: a new weekly vendor is flagged until its
         # fourth invoice shows the pattern.
         self.assertEqual([a.invoice_id for a in find_near_duplicates(weekly[:3])], ["RT-1", "RT-2"])
@@ -372,3 +376,9 @@ class VendorRoutineTests(unittest.TestCase):
         weekday = [inv(f"W{k}", "WeekCo", 300.0 + k, f"2026-01-{5 + k:02d}") for k in range(4)] + \
             [inv("W9", "WeekCo", 305.0, "2026-01-17")]
         self.assertEqual([a.invoice_id for a in find_weekend_invoices(saturdays + weekday)], ["W9"])
+        # Four ordinary bills, then six different round thousands. They are most of the file,
+        # and they still have to flag: the ordinary bills are the habit, not the pile.
+        ordinary = [inv(f"N{k}", "MixCo", 410.0 + 37 * k, f"2026-01-{5 + k:02d}") for k in range(4)]
+        pile = [inv(f"P{k}", "MixCo", 1000.0 * (k + 1), f"2026-03-{2 + k:02d}") for k in range(6)]
+        self.assertEqual([a.invoice_id for a in find_round_amounts(ordinary + pile)],
+                         [f"P{k}" for k in range(6)])
