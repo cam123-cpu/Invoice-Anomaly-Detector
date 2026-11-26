@@ -490,9 +490,9 @@ class SignInApiTests(DbTestCase):
         from invoice_detector import totp
         return totp.code_at(secret.replace(" ", ""), totp.current_step() + ahead)
 
-    def enable(self, token):
+    def enable(self, token, password=PW_A):
         setup = self.client.post("/me/2fa/setup", headers=self.h(token)).json()
-        done = self.client.post("/me/2fa/enable", json={"code": self.code(setup["secret"]), "password": PW_A},
+        done = self.client.post("/me/2fa/enable", json={"code": self.code(setup["secret"]), "password": password},
                                 headers=self.h(token)).json()
         return setup["secret"], done
 
@@ -530,7 +530,7 @@ class SignInApiTests(DbTestCase):
         blocked = self.client.get("/invoices", headers=self.h(dana))
         self.assertEqual((blocked.status_code, blocked.headers.get("x-requires-2fa")), (403, "1"))
         self.assertTrue(self.client.get("/me", headers=self.h(dana)).json()["two_factor_required"])
-        _, dana_done = self.enable(dana)
+        _, dana_done = self.enable(dana, "dana-password-1234")
         self.assertEqual(self.client.get("/invoices", headers=self.h(dana_done["access_token"])).status_code, 200)
         users = {u["username"]: u for u in self.client.get("/users", headers=self.h(admin)).json()}
         self.assertTrue(users["dana@acme.example"]["two_factor"])
