@@ -39,6 +39,16 @@ class DemoDataTests(unittest.TestCase):
         self.assertTrue(flagged)
         self.assertGreaterEqual(len(flagged & self.injected.keys()) / len(flagged), 0.8)
 
+    def test_ml_treats_capitalization_and_spacing_as_one_vendor(self):
+        from invoice_detector.detection import ml_features
+        rows = [inv(i, "Acme Supplies" if i % 2 == 0 else "ACME  SUPPLIES",
+                    100.0 + (i % 5), f"2026-01-{(i % 27) + 1:02d}") for i in range(60)]
+        rows.append(inv("odd", "acme supplies", 50_000.0, "2026-03-15"))
+        features = ml_features(rows)
+        # Every row sees the whole vendor, not a KeyError on the raw spelling.
+        self.assertTrue(all(feat[5] == features[0][5] and feat[5] > 4 for feat in features))
+        self.assertIn("odd", {a.invoice_id for a in find_ml_outliers(rows)})
+
     def test_deterministic(self):
         self.assertEqual(detect(self.invoices), detect(self.invoices))
 
